@@ -40,6 +40,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     replicate_tensor_2d_mesh_mapper,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
+from models.demos.blackhole.qwen38_flash_next.ttnn import fused
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_matmul_configs,
     dram_sharded_row_tiles,
@@ -460,6 +461,11 @@ class Qwen38TTNNMoE:
                 f"for a slab, got {routed_tokens_per_call!r}"
             )
         self.routed_calls = self.rows // self.routed_tokens
+        # The one-tile router tail (rows <= 32): the composed chain, or the fused program under QWEN38_FUSED=router_tail
+        # (ttnn/fused/router_tail); the long chunk and the slab keep their inline chain until the four-tile form is proven.
+        self._route_tail = fused.resolve("router_tail") if self.row_contract.row_tiles == 1 else None
+        if self._route_tail is fused.kernel("router_tail").fused:
+            fused.router_tail.router_tail_prepare(mesh_device)  # the constant index tiles, before any trace capture
         # The slab's routed stream: the 128-row instance's call (moe_compute, tilize, weighted reduce) once per
         # 128-row block, through a worker instance sharing the combine buffer.
         self.block_instance: Qwen38TTNNMoE | None = None
@@ -709,6 +715,18 @@ class Qwen38TTNNMoE:
         phase_observer("after-router-logits")
 
         phase_observer("before-router-topk")
+        if self._route_tail is not None:
+            scores_rm, indices_rm = self._route_tail(logits, top_k=TOP_K, compute_kernel_config=self.compute_config)
+            _deallocate(logits)
+            if _shape(scores_rm) != self.row_contract.routing or _shape(indices_rm) != self.row_contract.routing:
+                raise RuntimeError(
+                    f"router tail shapes must be {self.row_contract.routing}, got scores={_shape(scores_rm)} "
+                    f"indices={_shape(indices_rm)}"
+                )
+            self.mesh_contract.validate_tensor(scores_rm, placement=TensorPlacement.REPLICATED)
+            self.mesh_contract.validate_tensor(indices_rm, placement=TensorPlacement.REPLICATED)
+            phase_observer("after-router-topk")
+            return Qwen38TTNNRouting(scores_rm, indices_rm, None)
         probabilities = ttnn.softmax(
             logits,
             dim=-1,
