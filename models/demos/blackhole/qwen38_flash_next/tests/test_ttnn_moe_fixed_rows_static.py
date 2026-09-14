@@ -266,6 +266,7 @@ def test_five_row_clone_borrows_resident_weights_and_allocates_only_private_buff
             return_value=object(),
         ) as replicate_mapper,
         mock.patch.object(ttnn, "from_torch", side_effect=(mapping_tensor, local_tensor)) as from_torch,
+        mock.patch.object(moe_module.fused.router_tail, "router_tail_prepare", return_value=object()) as prepare,
     ):
         clone = Qwen38TTNNMoE(
             mesh_device,
@@ -277,6 +278,9 @@ def test_five_row_clone_borrows_resident_weights_and_allocates_only_private_buff
 
     assert clone.weights is borrowed_weights
     assert clone.rows == TARGET_VERIFIER_ROWS
+    # the default tail is the fused program (QWEN38_FUSED_OFF=router_tail keeps the chain); its constants upload once
+    assert clone._route_tail is moe_module.fused.kernel("router_tail").fused
+    prepare.assert_called_once_with(mesh_device)
     assert clone.expert_mapping is mapping_tensor
     assert clone.local_combine_output is local_tensor
     assert clone.routing_l1_memory_config.memory_layout == ttnn.TensorMemoryLayout.HEIGHT_SHARDED

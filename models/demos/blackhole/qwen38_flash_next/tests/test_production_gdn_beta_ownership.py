@@ -57,12 +57,21 @@ def test_beta_producers_are_released_only_after_their_recurrent_consumers() -> N
     ]
 
 
-def test_forward_decode_transfers_beta_producer_ownership_explicitly() -> None:
-    source = _method_source("forward_decode")
-    make = source.index("q, k, v, beta, log_decay, beta_producers = self._make_recurrent_inputs")
-    consume = source.index("self._recurrent_decode(q, k, v, beta, log_decay, beta_producers, state)")
-    project = source.index("self._gate_and_project(recurrent_output, z, full_hidden)")
-    assert make < consume < project
+def test_composed_step_transfers_beta_producer_ownership_explicitly() -> None:
+    """The composed chain (the default of the gdn_step switch) hands every beta producer to the recurrent step."""
+
+    import inspect
+
+    from models.demos.blackhole.qwen38_flash_next.ttnn.fused.gdn_step import gdn_step_composed
+
+    source = inspect.getsource(gdn_step_composed)
+    make = source.index("q, k, v, beta, log_decay, producers = gdn._make_recurrent_inputs(conv, a, b)")
+    consume = source.index("gdn._recurrent_decode(q, k, v, beta, log_decay, producers, state)")
+    gate = source.index("gdn._gate(")
+    assert make < consume and gate < consume  # _gate(...) wraps the recurrent call: the read-out feeds the gate
+    forward = _method_source("forward_decode")
+    assert "step = self._gdn_step()" in forward and "gated = step(self, projected, window, state)" in forward
+    assert "_make_recurrent_inputs" not in forward
 
 
 def test_beta_contract_keeps_head_sharded_topology_and_exact_shape() -> None:

@@ -31,6 +31,7 @@ import torch
 import ttnn
 from models.demos.blackhole.qwen38_flash_next.checkpoint import INDEX_SHA256, Qwen38Checkpoint
 from models.demos.blackhole.qwen38_flash_next.tt.gdn import Qwen38GDNWeights
+from models.demos.blackhole.qwen38_flash_next.ttnn import fused
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     LONG_CHUNK_ROWS,
     MESH_SHAPE,
@@ -1142,6 +1143,8 @@ class Qwen38TTNNGDN:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
+        # projection -> gated output: the composed chain, or the fused kernel when QWEN38_FUSED names gdn_step
+        self._step = fused.resolve("gdn_step")
 
     def allocate_state(self) -> Qwen38TTNNGDNState:
         return Qwen38TTNNGDNState.allocate(
@@ -1150,6 +1153,15 @@ class Qwen38TTNNGDN:
             layer_index=self.weights.layer_index,
             batch_size=1,
         )
+
+    def _gdn_step(self):
+        """The projection -> gated-output step: the composed chain, or the fused kernel when QWEN38_FUSED names
+        gdn_step; resolved once (fakes that skip ``__init__`` resolve here)."""
+
+        step = self.__dict__.get("_step")
+        if step is None:
+            step = self._step = fused.resolve("gdn_step")
+        return step
 
     def _validate_state(self, state: Qwen38TTNNGDNState) -> None:
         if state.layer_index != self.weights.layer_index:
@@ -1173,8 +1185,8 @@ class Qwen38TTNNGDN:
         _require_shape(full_hidden, (1, 1, 1, HIDDEN_SIZE), label="GDN gathered hidden")
         return full_hidden
 
-    def _project(self, full_hidden, newest):
-        """Project the gathered hidden row; the q/k/v columns land in ``newest``, the ring slot for this token."""
+    def _project(self, full_hidden):
+        """Project the gathered hidden row into one L1 row tile ``[1,1,1,4160]`` = q|k|v|z|a|b, a and b tile-aligned."""
 
         projected_ws = ttnn.linear(
             full_hidden,
@@ -1187,6 +1199,10 @@ class Qwen38TTNNGDN:
         _deallocate(projected_ws)
         self.mesh_contract.validate_tensor(projected, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
         _require_shape(projected, (1, 1, 1, PROJECTION_WIDTH_PER_DEVICE), label="GDN fused projection")
+        return projected
+
+    def _split_projection(self, projected, newest):
+        """The q/k/v columns land in ``newest``, the ring slot for this token; z, a, b are returned."""
 
         # Every slice starts on a tile boundary, so each is one device op; the
         # newest-token slice writes the persistent slot (no staging copy).
@@ -1378,7 +1394,7 @@ class Qwen38TTNNGDN:
         _require_shape(output, (1, VALUE_HEADS_PER_DEVICE, 1, HEAD_DIM), label="GDN recurrent output")
         return output
 
-    def _gate_and_project(self, recurrent_output, z, full_hidden):
+    def _gate(self, recurrent_output, z):
         # The serial reference returns a BF16 per-token recurrent output while
         # retaining the carried state in FP32.  Match that boundary explicitly.
         # The per-head RMSNorm runs on the [1,H,1,128] step output directly.
@@ -1415,7 +1431,9 @@ class Qwen38TTNNGDN:
         _deallocate(normalized, sigmoid_bf16)
         self.mesh_contract.validate_tensor(gated, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
         _require_shape(gated, (1, 1, 1, VALUE_WIDTH_PER_DEVICE), label="GDN sigmoid-gated output")
+        return gated
 
+    def _out_project(self, gated, full_hidden):
         partial_ws = ttnn.linear(
             gated,
             self.weights.out,
@@ -1453,12 +1471,11 @@ class Qwen38TTNNGDN:
         self._validate_state(state)
         full_hidden = self._all_gather_hidden(hidden_sharded)
         window = state.conv_window()
-        z, a, b = self._project(full_hidden, window[-1])
+        projected = self._project(full_hidden)
+        step = self._gdn_step()
+        gated = step(self, projected, window, state)
         state.advance_conv_window()
-        conv = self._causal_conv_decode(window)
-        q, k, v, beta, log_decay, beta_producers = self._make_recurrent_inputs(conv, a, b)
-        recurrent_output = self._recurrent_decode(q, k, v, beta, log_decay, beta_producers, state)
-        output = self._gate_and_project(recurrent_output, z, full_hidden)
+        output = self._out_project(gated, full_hidden)
         return Qwen38TTNNGDNResult(output, state)
 
     def forward_prefill(self, hidden_sharded, state: Qwen38TTNNGDNState) -> Qwen38TTNNGDNResult:

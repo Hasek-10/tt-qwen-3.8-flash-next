@@ -74,6 +74,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.live_decode_diagnostic impor
     construct_live_decode_diagnostic,
     missing_bf4_layers,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn import fused
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     DEFAULT_PREFILL_MODE,
@@ -1925,6 +1926,7 @@ def main() -> int:
                 "free_bytes_per_bank": report["chain"]["dram_after_captures"]["free_bytes_per_bank"],
                 "acceptance_gate_pass": None if not records else report["acceptance"]["gate_pass"],
                 "mtp": report["chain"]["mtp"],
+                "fused_kernels": sorted(fused.enabled_names()),
             }
             ready_marker.write_text(json.dumps(ready, sort_keys=True) + "\n", encoding="utf-8")
             marker("chat-server-ready")

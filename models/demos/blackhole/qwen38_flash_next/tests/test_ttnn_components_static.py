@@ -747,10 +747,12 @@ def test_qsa_projections_read_the_width_sharded_hidden_the_gather_writes() -> No
 
 
 def test_gdn_gate_product_is_written_in_the_out_projection_layout() -> None:
-    source = inspect.getsource(gdn_module.Qwen38TTNNGDN._gate_and_project)
+    source = inspect.getsource(gdn_module.Qwen38TTNNGDN._gate)
     assert "gated = ttnn.multiply(normalized, sigmoid_bf16, memory_config=self.out_proj_act_memory_config)" in source
     assert "to_memory_config(gated" not in source
-    assert source.index("gated = ttnn.multiply(") < source.index("partial_ws = ttnn.linear(\n            gated,")
+    out_project = inspect.getsource(gdn_module.Qwen38TTNNGDN._out_project)
+    assert "to_memory_config(gated" not in out_project
+    assert "partial_ws = ttnn.linear(\n            gated," in out_project
 
 
 # --- resident RoPE tables for the position-generic body -------------------------

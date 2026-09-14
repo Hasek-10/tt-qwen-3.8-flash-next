@@ -38,6 +38,7 @@ rank-320 down row and are sliced back out after the reduce.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -275,6 +276,9 @@ class Qwen38TTNNGatedResidualWeights:
     layer_index: int
     block: Literal["attn", "mlp"]
     namespace: Literal["backbone", "mtp"]
+    # norm_scale with its one row repeated over the 32 tile rows, [1, 4, 32, local] fp32: the fused read's gamma
+    # operand (its reader streams tiles as they are; copying the row on the RISC cost 175 us per read).
+    norm_scale_rows: Any = None
 
     @classmethod
     def from_checkpoint(
@@ -337,6 +341,13 @@ class Qwen38TTNNGatedResidualWeights:
         norm_scale = upload(
             prepared["norm_scale"], "norm_scale_q_bm", ttnn.float32, hidden_output_mapper, ttnn.DRAM_MEMORY_CONFIG
         )
+        norm_scale_rows = upload(
+            prepared["norm_scale"].expand(-1, -1, ttnn.TILE_SIZE, -1),
+            "norm_scale_rows_q_bm",
+            ttnn.float32,
+            hidden_output_mapper,
+            ttnn.DRAM_MEMORY_CONFIG,
+        )
         # The matmul weights are DRAM width-sharded for the decode program.
         down_inject = upload(
             prepared["down_inject"],
@@ -369,6 +380,7 @@ class Qwen38TTNNGatedResidualWeights:
             layer_index=layer_index,
             block=block,
             namespace=namespace,
+            norm_scale_rows=norm_scale_rows,
         )
         weights.validate(mesh_contract)
         return weights
@@ -439,6 +451,15 @@ class Qwen38TTNNGatedResidual:
         # The gamma multiply runs on the flat row (see _normalize); this view
         # shares the resident weight's buffer.
         self.norm_scale_flat = ttnn.experimental.view(weights.norm_scale, FLAT_LOCAL_SHAPE)
+        # The read resolves through the fused registry at construction (ttnn/fused/gr_read when it is on: default_on,
+        # QWEN38_FUSED=gr_read; QWEN38_FUSED_OFF keeps the chain) and stays so through trace capture; the class body of
+        # read() is the composed chain the fused kernel is gated against.
+        from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_kernels
+
+        self._read_fused = None
+        if fused_kernels.enabled("gr_read"):
+            self._read_fused = fused_kernels.kernel("gr_read").fused
+            self.read = functools.partial(self._read_fused, self)
 
     def _validate_residual(self, residual) -> None:
         if _shape(residual) != RESIDUAL_LOCAL_SHAPE:
@@ -594,7 +615,7 @@ class Qwen38TTNNGatedResidual:
         return normalized_ws
 
     def read(self, residual) -> tuple[Any, Qwen38TTNNGatedResidualState]:
-        """Read the H-wide block input and retain the exact write state."""
+        """Read the H-wide block input and retain the exact write state (the composed chain; see __init__)."""
 
         self._validate_residual(residual)
         # The flat (branch, local hidden) row, already scaled by 1/4, in the
@@ -754,6 +775,8 @@ class Qwen38TTNNGatedResidual:
 
         rows = _shape(residual_rows)[2]  # the chunk form: residual_rows_shape admits 32 or 128
         self._validate_rows(residual_rows, residual_rows_shape(rows), label="GR residual rows")
+        if flat_views and getattr(self, "_read_fused", None) is not None:
+            return self._read_fused(self, residual_rows)
         flat_rows_shape = (1, 1, rows, FLAT_LOCAL_WIDTH)
         dram = ttnn.DRAM_MEMORY_CONFIG
         stats = ttnn.rms_norm_pre_all_gather(

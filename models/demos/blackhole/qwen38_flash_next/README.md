@@ -25,7 +25,7 @@ This was implemented with the intention of the n-gram model residing in system m
 | path | measured | notes |
 |---|---|---|
 | prompt prefill | 300 tok/s (and climbing); 650 tok/s with `--long-chunks`; 1,150 tok/s with `--prefill-slab 2048` | 32-token chunk trace, 3.0-3.5 ms per prompt token, flat from 2k to 261k tokens; 128-token chunks at 1.45-1.56 ms per prompt token (`--long-chunks`); 2,048-row slabs at 0.87-1.08 ms per prompt token (`--prefill-slab 2048`, 2026-09-09, tolerance class: see `docs/PREFILL.md`) |
-| decode, one stream | 19.9 tok/s | position-generic traced decode, 50 ms per token, flat with depth |
+| decode, one stream | 21.1 tok/s | position-generic traced decode, 47.4 ms per token, flat with depth; the MoE router tail runs as one fused program by default (2026-09-14, bitwise: `docs/NUMERICS.md`) |
 | decode with MTP (`--mtp 4`) | 37 tok/s aggregate, 55 tok/s on structured output | speculative drafting with exact acceptance: the committed stream leaves the CPU reference at the same token as greedy decode on 8 of the 12 acceptance prompts and at a different token on the other 4 (section 6, `docs/NUMERICS.md`) |
 | contexts | 32k, 64k, 128k, 256k | 256k is single-user; MTP fits at 32k, 64k and 128k |
 | correctness | bitwise repeatable; 96/96 greedy token match against the CPU reference on the acceptance prompt | chunked prefill is tolerance-class against the CPU reference on all 48 layers |
@@ -113,9 +113,8 @@ Then the server:
     models/demos/blackhole/qwen38_flash_next/tools/run_qwen38_chat_server.sh --profile bh-loudbox \
         --checkpoint /data/Qwen3.8-Flash-Next --cache-root /data/qwen38-cache --acceptance
 
-(`tools/` is `models/demos/blackhole/qwen38_flash_next/tools/`.)  The launcher prints the checkout it runs from (its
-commit, whether the tree is modified), the interpreter and the `ttnn` extension, then the profile, the device set,
-the context and the run directory, and starts the server.
+(`tools/` is `models/demos/blackhole/qwen38_flash_next/tools/`.)  The launcher prints the checkout it runs from (commit,
+modified or not), the interpreter and the `ttnn` extension, the profile, the device set, the context and the run directory.
 
 **The first start** converts the routed experts of all 49 MoE layers into the BF4 cache
 (`<cache-root>/caches/bf4-experts/`, 107 GB; a `bf4-stage-backbone-NN` phase per layer in the log), then builds the
@@ -152,8 +151,6 @@ The run directory (`<cache-root>/runs/<stamp>/`) holds `READY`, `phase-markers.j
 | `--validate-only` | run the checks and the CPU preparation without opening the mesh (a profile whose route is derived at start, the LoudBox, still needs the chips present) |
 | `--devices A,B,C,D` | run `bh-loudbox` on four other KMD device nodes (four chips of a larger host) |
 | `--python` | another interpreter of this checkout |
-
-What the launcher exports, how the runtime is admitted and what `result.json` and `/health` record: `docs/SERVER.md`.
 
 ## 5. Talk to it
 

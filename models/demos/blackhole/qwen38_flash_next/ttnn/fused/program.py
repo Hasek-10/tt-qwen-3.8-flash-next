@@ -28,6 +28,11 @@ CB_COUNT = (
 )
 REPO_ROOT = Path(__file__).resolve().parents[6]
 KERNEL_ROOT = "models/demos/blackhole/qwen38_flash_next/ttnn/fused"
+# The data-movement descriptors' processors and NoCs (tt_metal/impl/kernels/kernel_types.cpp: Reader = RISCV_1 +
+# preferred_noc_for_dram_read = NOC_0, Writer = RISCV_0 + preferred_noc_for_dram_write = NOC_1, on every arch per
+# tt_metal/api/tt-metalium/kernel_types.hpp).  A NOC_1 multicast takes the bottom-right corner as its start.
+READER_NOC = 0
+WRITER_NOC = 1
 ELEMENT_BYTES = {ttnn.bfloat16: 2, ttnn.uint16: 2, ttnn.float32: 4, ttnn.uint32: 4, ttnn.int32: 4}
 TILE_BYTES = {
     ttnn.bfloat16: 2048,
@@ -38,6 +43,19 @@ TILE_BYTES = {
     ttnn.bfloat8_b: 1088,
     ttnn.bfloat4_b: 576,
 }
+
+
+def multicast_corners(x0: int, y0: int, x1: int, y1: int, *, noc: int) -> tuple[int, int, int, int]:
+    """The (start_x, start_y, end_x, end_y) a multicast on ``noc`` needs for the NoC rectangle whose top-left is
+    (x0, y0) and bottom-right (x1, y1) in NoC-0 coordinates: NOC_0 starts top-left, NOC_1 bottom-right (the
+    DRAM-sharded matmul factory swaps the corners the same way).  A kernel that swaps on ``noc_index`` itself
+    (gr_read/kernels/mcast_writer.cpp) must be given the top-left-first rectangle instead, never both."""
+
+    if noc not in (READER_NOC, WRITER_NOC):
+        raise ValueError(f"noc must be 0 or 1, got {noc}")
+    if x0 > x1 or y0 > y1:
+        raise ValueError(f"rectangle corners out of order: ({x0}, {y0}) .. ({x1}, {y1})")
+    return (x0, y0, x1, y1) if noc == READER_NOC else (x1, y1, x0, y0)
 
 
 def kernel_source(name: str, file: str) -> str:

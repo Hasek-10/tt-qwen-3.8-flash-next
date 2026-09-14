@@ -4,7 +4,8 @@
 """Fused decode kernels over ``ttnn.generic_op``.
 
 ``program`` builds and runs one program from Python (kernels, CBs, semaphores, the rows contract); ``registry`` names
-each fused kernel with the composed ttnn chain it replaces and switches it on through ``QWEN38_FUSED``.  Each kernel
+each fused kernel with the composed ttnn chain it replaces; the proven kernels serve by default (``QWEN38_FUSED_OFF``
+falls back to the chains, ``QWEN38_FUSED`` switches an opt-in kernel on).  Each kernel
 is a sub-package ``<name>/`` with its ``kernels/*.cpp`` and registers itself on import; add new ones to the import
 list below.  Gate and accounting: FUSED-KERNEL-HOWTO.md under the dev tools.
 """
@@ -15,10 +16,12 @@ from .registry import (
     BITWISE,
     COMPONENT,
     ENV,
+    OFF_ENV,
     TOLERANCE_CLASSES,
     ULP,
     FusedKernel,
     GateSpec,
+    default_names,
     enabled,
     enabled_names,
     kernel,
@@ -26,19 +29,23 @@ from .registry import (
     register,
     resolve,
 )
-from . import router_tail, untilize_rows
+from . import gdn_step, gr_read, router_tail, untilize_rows
 
 __all__ = [
     "ALL",
     "BITWISE",
     "COMPONENT",
     "ENV",
+    "OFF_ENV",
     "TOLERANCE_CLASSES",
     "ULP",
     "FusedKernel",
     "GateSpec",
+    "default_names",
     "enabled",
     "enabled_names",
+    "gdn_step",
+    "gr_read",
     "kernel",
     "kernels",
     "program",

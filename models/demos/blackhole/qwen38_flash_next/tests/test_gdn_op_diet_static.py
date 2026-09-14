@@ -57,7 +57,8 @@ DEVICE_HELPERS = {"softplus_gate"}
 
 EXPECTED_DEVICE_OPS = {
     "_all_gather_hidden": ["all_gather"],
-    "_project": ["linear", "to_memory_config", "slice", "slice", "slice", "slice"],
+    "_project": ["linear", "to_memory_config"],
+    "_split_projection": ["slice", "slice", "slice", "slice"],
     "_causal_conv_decode": ["multiply", "mac", "mac", "mac", "silu"],
     "_make_recurrent_inputs": [
         "slice",
@@ -95,7 +96,7 @@ EXPECTED_DEVICE_OPS = {
         "add",
         "matmul",
     ],
-    "_gate_and_project": [
+    "_gate": [
         "typecast",
         "rms_norm",
         "reshape",
@@ -103,10 +104,11 @@ EXPECTED_DEVICE_OPS = {
         "sigmoid",
         "typecast",
         "multiply",
-        "linear",
-        "reduce_scatter",
     ],
+    "_out_project": ["linear", "reduce_scatter"],
 }
+# forward_decode calls these directly; the rest run inside the composed gdn_step chain (ttnn/fused/gdn_step)
+FORWARD_METHODS = ["_validate_state", "_all_gather_hidden", "_project", "_gdn_step", "_out_project"]
 EXPECTED_DEVICE_OPS_PER_LAYER = 53
 
 
@@ -202,7 +204,18 @@ def test_forward_decode_calls_exactly_the_walked_methods_in_order() -> None:
     )
     names = [ast.unparse(node.func) for node in calls]
     called = [name.removeprefix("self.") for name in names if name.startswith("self._")]
-    assert called == ["_validate_state", *EXPECTED_DEVICE_OPS]
+    assert called == FORWARD_METHODS
+    import inspect
+
+    from models.demos.blackhole.qwen38_flash_next.ttnn.fused.gdn_step import gdn_step_composed
+
+    composed = ast.parse(inspect.getsource(gdn_step_composed))
+    chain = sorted(
+        (node for node in ast.walk(composed) if isinstance(node, ast.Call)), key=lambda node: (node.lineno, node.col_offset)
+    )
+    chained = [ast.unparse(node.func).removeprefix("gdn.") for node in chain if ast.unparse(node.func).startswith("gdn._")]
+    assert chained == ["_split_projection", "_causal_conv_decode", "_make_recurrent_inputs", "_gate", "_recurrent_decode"]
+    assert sorted(set(called + chained) - {"_validate_state", "_gdn_step"}) == sorted(EXPECTED_DEVICE_OPS)
 
 
 def test_device_op_sequence_per_method_is_pinned() -> None:
@@ -220,7 +233,7 @@ def test_decode_path_has_no_copies_and_writes_persistent_buffers_in_place() -> N
     cls_source = "\n".join(_method_source(name) for name in EXPECTED_DEVICE_OPS)
     assert "ttnn.copy(" not in cls_source
     assert "_copy_inplace(" not in cls_source
-    project = _method_source("_project")
+    project = _method_source("_split_projection")
     assert "output_tensor=newest" in project
     assert "ab = ttnn.slice(" not in project
     recurrent = _method_source("_recurrent_decode")
@@ -239,12 +252,27 @@ def test_decode_path_has_no_copies_and_writes_persistent_buffers_in_place() -> N
     forward = _method_source("forward_decode")
     order = (
         "window = state.conv_window()",
-        "z, a, b = self._project(full_hidden, window[-1])",
+        "projected = self._project(full_hidden)",
+        "step = self._gdn_step()",
+        "gated = step(self, projected, window, state)",
         "state.advance_conv_window()",
-        "conv = self._causal_conv_decode(window)",
     )
     offsets = [forward.index(fragment) for fragment in order]
     assert offsets == sorted(offsets)
+    # the composed chain (ttnn/fused/gdn_step.gdn_step_composed) slices into the ring slot before the conv reads it
+    import inspect
+
+    from models.demos.blackhole.qwen38_flash_next.ttnn.fused.gdn_step import gdn_step_composed
+
+    composed = inspect.getsource(gdn_step_composed)
+    chain = (
+        "z, a, b = gdn._split_projection(projected, window[3])",
+        "conv = gdn._causal_conv_decode(window)",
+        "gdn._make_recurrent_inputs(conv, a, b)",
+        "gdn._recurrent_decode(q, k, v, beta, log_decay, producers, state)",
+    )
+    chain_offsets = [composed.index(fragment) for fragment in chain]
+    assert chain_offsets == sorted(chain_offsets)
 
 
 def test_collectives_read_and_write_the_matmul_shard_layouts_directly() -> None:
@@ -258,7 +286,7 @@ def test_collectives_read_and_write_the_matmul_shard_layouts_directly() -> None:
     assert "to_memory_config(full_hidden" not in project
     assert "hidden_ws" not in project
     assert "projected_ws = ttnn.linear(\n            full_hidden," in project
-    gate = _method_source("_gate_and_project")
+    gate = _method_source("_out_project")
     assert "to_memory_config(partial_ws" not in gate
     assert "mark_local_partial(\n            partial_ws," in gate
     reduce = gate.split("output = ttnn.reduce_scatter(", 1)[1].split("\n        )", 1)[0]

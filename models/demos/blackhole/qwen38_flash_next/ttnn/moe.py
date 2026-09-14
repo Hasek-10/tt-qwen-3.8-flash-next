@@ -461,8 +461,9 @@ class Qwen38TTNNMoE:
                 f"for a slab, got {routed_tokens_per_call!r}"
             )
         self.routed_calls = self.rows // self.routed_tokens
-        # The one-tile router tail (rows <= 32): the composed chain, or the fused program under QWEN38_FUSED=router_tail
-        # (ttnn/fused/router_tail); the long chunk and the slab keep their inline chain until the four-tile form is proven.
+        # The one-tile router tail (rows <= 32): the fused program (ttnn/fused/router_tail) by default, the composed chain
+        # under QWEN38_FUSED_OFF=router_tail; the long chunk and the slab keep their inline chain until the four-tile form
+        # is proven in the model.
         self._route_tail = fused.resolve("router_tail") if self.row_contract.row_tiles == 1 else None
         if self._route_tail is fused.kernel("router_tail").fused:
             fused.router_tail.router_tail_prepare(mesh_device)  # the constant index tiles, before any trace capture

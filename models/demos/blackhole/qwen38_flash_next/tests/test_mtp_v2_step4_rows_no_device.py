@@ -1203,15 +1203,8 @@ def test_one_row_gdn_bodies_are_the_pinned_walk() -> None:
         )
         if ast.unparse(node.func).startswith("self._")
     ]
-    assert called == [
-        "_validate_state",
-        "_all_gather_hidden",
-        "_project",
-        "_causal_conv_decode",
-        "_make_recurrent_inputs",
-        "_recurrent_decode",
-        "_gate_and_project",
-    ]
+    # the conv, recurrent inputs, recurrent step and gate run inside the resolved gdn_step chain (ttnn/fused/gdn_step)
+    assert called == ["_validate_state", "_all_gather_hidden", "_project", "_gdn_step", "_out_project"]
     assert "rows" not in ast.get_source_segment(GDN_SOURCE.read_text(), forward)
 
 

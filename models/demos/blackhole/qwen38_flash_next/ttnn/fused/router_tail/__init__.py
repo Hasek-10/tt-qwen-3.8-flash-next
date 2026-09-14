@@ -245,5 +245,6 @@ register(
         fused=router_tail,
         composed=router_tail_composed,
         gate=GateSpec(inputs=_gate_inputs, output=routing_table, reference=_gate_reference, layers=tuple(range(48))),
+        default_on=True,
     )
 )

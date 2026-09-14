@@ -21,6 +21,17 @@ Every number here was measured on 4x p150 unless a date and host say otherwise.
   packer), and every start re-packs one routed expert of the first cached layer from the checkpoint and compares the
   bytes with the cache; a cache converted by different code is refused (`SERVER.md`).
 
+## Fused decode kernels (2026-09-14)
+
+Two decode chains exist as fused programs (`ttnn/fused/`, built on `ttnn.generic_op`): the MoE router tail (softmax,
+top-10, fill, sum, div, casts and layouts: 12 programs per layer as one), on by default, and the gated-residual read
+(18 programs per read as 5 compute programs around the chain's two collectives), opt-in (`QWEN38_FUSED=gr_read`) until
+its step-time pin lands.  Both are bitwise against the chains they replace on device (12,288 real router rows; the read
+on all four TP slices at rows 1, 5 and 32), so the token streams and every pinned table above are unchanged; they cover
+rows 1..32 (decode, the MTP verify rows); the 128-row prefill chunk and the slab keep their chains.
+`QWEN38_FUSED_OFF=router_tail` (or `all`) in the server's environment falls back to the composed chain; an unknown name
+in either variable refuses to start.  Measured 2026-09-14 on 4x p150 (200 traced decode steps, host wall): 49.88 ms per token with the chains, 47.35 ms with the router tail fused (21.1 tokens/s); 6,120 programs and 42.5 ms of kernel time per step on chip 0 under the device profiler.
+
 ## The acceptance mechanism
 
 `--acceptance` replays the twelve shipped CPU greedy records under `tools/acceptance/greedy-prompts/` against the CPU

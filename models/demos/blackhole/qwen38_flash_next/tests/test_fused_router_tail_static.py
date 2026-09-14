@@ -26,8 +26,9 @@ def test_registered_bitwise_with_a_gate():
     assert entry.tolerance == fused.BITWISE
     assert entry.fused is rt.router_tail and entry.composed is rt.router_tail_composed
     assert entry.gate is not None and entry.gate.layers == tuple(range(48)) and entry.gate.topk is None
-    assert fused.resolve("router_tail", {}) is rt.router_tail_composed
-    assert fused.resolve("router_tail", {fused.ENV: "router_tail"}) is rt.router_tail
+    assert entry.default_on and fused.resolve("router_tail", {}) is rt.router_tail  # the foundation test pins the set
+    assert fused.resolve("router_tail", {fused.OFF_ENV: "router_tail"}) is rt.router_tail_composed
+    assert fused.resolve("router_tail", {fused.ENV: "router_tail", fused.OFF_ENV: "all"}) is rt.router_tail_composed
     assert inspect.signature(rt.router_tail).parameters.keys() == inspect.signature(rt.router_tail_composed).parameters.keys()
 
 

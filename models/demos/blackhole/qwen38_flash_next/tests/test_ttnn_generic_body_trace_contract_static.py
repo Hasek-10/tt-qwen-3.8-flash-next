@@ -31,6 +31,12 @@ ROOTS = (
     ("model", "Qwen38TTNNTextModel", "forward_decode_generic"),
     ("embedding", "Qwen38TTNNLMHead", "greedy_candidates"),
     ("embedding", "Qwen38TTNNLMHead", "resolve_greedy_on_device"),
+    # the composed GDN step: forward_decode reaches it through the resolved ``self._step`` (ttnn/fused/gdn_step)
+    ("gdn", "Qwen38TTNNGDN", "_split_projection"),
+    ("gdn", "Qwen38TTNNGDN", "_causal_conv_decode"),
+    ("gdn", "Qwen38TTNNGDN", "_make_recurrent_inputs"),
+    ("gdn", "Qwen38TTNNGDN", "_recurrent_decode"),
+    ("gdn", "Qwen38TTNNGDN", "_gate"),
 )
 # Receivers whose method name exists on several classes: the class the body
 # actually dispatches to (None: a branch the generic body never takes).  A
@@ -329,8 +335,9 @@ def test_the_only_buffer_bound_shape_op_is_the_gdn_ring_slot_write() -> None:
         for keyword in call.keywords
         if keyword.arg in BUFFER_BINDINGS
     ]
-    assert bound == ["gdn.Qwen38TTNNGDN._project ttnn.slice output_tensor=newest"]
+    assert bound == ["gdn.Qwen38TTNNGDN._split_projection ttnn.slice output_tensor=newest"]
     forward = ast.unparse(index.node(("gdn", "Qwen38TTNNGDN", "forward_decode")))
     assert "window = state.conv_window()" in forward
-    assert "self._project(full_hidden, window[-1])" in forward
+    assert "projected = self._project(full_hidden)" in forward
+    assert "step = self._gdn_step()" in forward and "gated = step(self, projected, window, state)" in forward
     assert "state.advance_conv_window()" in forward

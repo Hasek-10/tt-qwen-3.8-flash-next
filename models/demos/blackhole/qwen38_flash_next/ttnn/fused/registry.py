@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
-"""The fused decode kernels by name and the ``QWEN38_FUSED`` switch.
+"""The fused decode kernels by name and the ``QWEN38_FUSED`` / ``QWEN38_FUSED_OFF`` switches.
 
-Every fused kernel stands in for one named chain of existing ttnn ops.  The composed chain is the default; a kernel
-runs only when its name is in ``QWEN38_FUSED`` (comma-separated names, or ``all``).  A name that is not registered
-raises, so a typo cannot silently run the composed chain.  Callers resolve once at construction and keep the choice
-through trace capture: ``run = resolve("router_tail")``.
+Every fused kernel stands in for one named chain of existing ttnn ops.  A kernel registered ``default_on`` (proven
+bitwise against its chain and at the model level) serves by default; ``QWEN38_FUSED_OFF`` (comma-separated names, or
+``all``) falls back to the composed chains, ``QWEN38_FUSED`` switches an opt-in kernel on.  A name that is not
+registered raises in either variable, so a typo cannot silently change what runs.  Callers resolve once at
+construction and keep the choice through trace capture: ``run = resolve("router_tail")``.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 ENV = "QWEN38_FUSED"
+OFF_ENV = "QWEN38_FUSED_OFF"
 ALL = "all"
 # Tolerance classes of the component gate (fused_component_gate, dev tools): BITWISE where the arithmetic order is preserved (pure data
 # movement, integer work, the same ops in the same order); ULP where the same math is re-associated or fused
@@ -52,6 +54,7 @@ class FusedKernel:
     fused: Callable[..., Any]
     composed: Callable[..., Any]
     gate: GateSpec | None = None
+    default_on: bool = False  # serves by default (QWEN38_FUSED_OFF falls back); False = opt-in through QWEN38_FUSED
 
     def __post_init__(self) -> None:
         if not _NAME.match(self.name) or self.name == ALL:
@@ -83,16 +86,25 @@ def kernel(name: str) -> FusedKernel:
         raise KeyError(f"no fused kernel {name!r}; registered: {sorted(_REGISTRY)}") from None
 
 
-def enabled_names(environ: Mapping[str, str] = os.environ) -> frozenset[str]:
-    """The names switched on by ``QWEN38_FUSED``; every name must be registered."""
-
-    tokens = [t.strip() for t in environ.get(ENV, "").split(",") if t.strip()]
+def _names(environ: Mapping[str, str], variable: str) -> frozenset[str]:
+    tokens = [t.strip() for t in environ.get(variable, "").split(",") if t.strip()]
     if ALL in tokens:
         return frozenset(_REGISTRY)
     unknown = sorted(set(tokens) - set(_REGISTRY))
     if unknown:
-        raise ValueError(f"{ENV} names unregistered fused kernels {unknown}; registered: {sorted(_REGISTRY)}")
+        raise ValueError(f"{variable} names unregistered fused kernels {unknown}; registered: {sorted(_REGISTRY)}")
     return frozenset(tokens)
+
+
+def default_names() -> frozenset[str]:
+    return frozenset(name for name, entry in _REGISTRY.items() if entry.default_on)
+
+
+def enabled_names(environ: Mapping[str, str] = os.environ) -> frozenset[str]:
+    """The kernels that run: the ``default_on`` ones plus ``QWEN38_FUSED``, less ``QWEN38_FUSED_OFF``; every name in
+    either variable must be registered."""
+
+    return (default_names() | _names(environ, ENV)) - _names(environ, OFF_ENV)
 
 
 def enabled(name: str, environ: Mapping[str, str] = os.environ) -> bool:
@@ -101,7 +113,7 @@ def enabled(name: str, environ: Mapping[str, str] = os.environ) -> bool:
 
 
 def resolve(name: str, environ: Mapping[str, str] = os.environ) -> Callable[..., Any]:
-    """The kernel's fused callable when switched on, else its composed chain (the default)."""
+    """The kernel's fused callable when it runs (see ``enabled_names``), else its composed chain."""
 
     entry = kernel(name)
     return entry.fused if name in enabled_names(environ) else entry.composed
