@@ -21,16 +21,23 @@ Every number here was measured on 4x p150 unless a date and host say otherwise.
   packer), and every start re-packs one routed expert of the first cached layer from the checkpoint and compares the
   bytes with the cache; a cache converted by different code is refused (`SERVER.md`).
 
-## Fused decode kernels (2026-09-14)
+## Fused decode kernels (2026-09-15)
 
-Two decode chains exist as fused programs (`ttnn/fused/`, built on `ttnn.generic_op`): the MoE router tail (softmax,
-top-10, fill, sum, div, casts and layouts: 12 programs per layer as one), on by default, and the gated-residual read
-(18 programs per read as 5 compute programs around the chain's two collectives), opt-in (`QWEN38_FUSED=gr_read`) until
-its step-time pin lands.  Both are bitwise against the chains they replace on device (12,288 real router rows; the read
-on all four TP slices at rows 1, 5 and 32), so the token streams and every pinned table above are unchanged; they cover
-rows 1..32 (decode, the MTP verify rows); the 128-row prefill chunk and the slab keep their chains.
-`QWEN38_FUSED_OFF=router_tail` (or `all`) in the server's environment falls back to the composed chain; an unknown name
-in either variable refuses to start.  Measured 2026-09-14 on 4x p150 (200 traced decode steps, host wall): 49.88 ms per token with the chains, 47.35 ms with the router tail fused (21.1 tokens/s); 6,120 programs and 42.5 ms of kernel time per step on chip 0 under the device profiler.
+Decode chains run as fused programs (`ttnn/fused/`, built on `ttnn.generic_op`) where a kernel is bitwise against the
+chain it replaces on device, leaves every pinned table above unchanged and beats the previous step time in its own
+timing slot.  On by default: `gr_write`, `greedy_tail`, `moe_post`, `position_derive`, `qsa_block`, `router_tail`,
+`shared_expert`: the gated-residual write as one program (SFPU multiply, FPU add, as the chain); the tail's greedy
+epilogue (24 programs as 4 plus one gather); the MoE post program (fill, tilize, the score-weighted reduce over the
+ten expert slots in slot order, the shared expert's x sigmoid and the partial add as one program); the prologue's
+position derivation (40 programs as 1); the sparse-attention block's decode glue as six programs (index tail, main
+tail, post-attention, partial widen, selection row, score merge); the MoE router tail (softmax, top-10, sum, div,
+casts and layouts: 12 programs per layer as one); the shared expert as three programs (one DRAM-sharded linear over
+the concatenated [gate | up | scalar] weight, one silu / product / sigmoid program, the down linear).  Opt-in through
+`QWEN38_FUSED=<name>`: `final_mixer`, `gdn_step`, `gr_read`.  The kernels cover rows 1..32 (decode, the MTP verify
+rows); the 128-row prefill chunk and the slab keep their chains.  `QWEN38_FUSED_OFF=<name>[,...]` (or `all`) in the
+server's environment falls back to the composed chains; an unknown name in either variable refuses to start.  Measured
+2026-09-15 on 4x p150 (200 traced decode steps, host wall): 49.91 ms per token with the chains, 42.24 ms with the
+default set (23.7 tokens/s); 4,652 programs and 38.0 ms of kernel time per step on chip 0 under the device profiler.
 
 ## The acceptance mechanism
 

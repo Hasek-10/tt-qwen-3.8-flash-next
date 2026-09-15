@@ -15,6 +15,7 @@ from .registry import (
     ALL,
     BITWISE,
     COMPONENT,
+    DEFAULT_ON,
     ENV,
     OFF_ENV,
     TOLERANCE_CLASSES,
@@ -29,12 +30,13 @@ from .registry import (
     register,
     resolve,
 )
-from . import gdn_step, gr_read, router_tail, untilize_rows
+from . import final_mixer, gdn_step, gr_read, gr_write, greedy_tail, moe_post, position_derive, qsa_block, router_tail, shared_expert, untilize_rows
 
 __all__ = [
     "ALL",
     "BITWISE",
     "COMPONENT",
+    "DEFAULT_ON",
     "ENV",
     "OFF_ENV",
     "TOLERANCE_CLASSES",
@@ -44,13 +46,20 @@ __all__ = [
     "default_names",
     "enabled",
     "enabled_names",
+    "final_mixer",
     "gdn_step",
     "gr_read",
+    "gr_write",
+    "greedy_tail",
     "kernel",
     "kernels",
+    "moe_post",
+    "position_derive",
     "program",
+    "qsa_block",
     "register",
     "resolve",
     "router_tail",
+    "shared_expert",
     "untilize_rows",
 ]

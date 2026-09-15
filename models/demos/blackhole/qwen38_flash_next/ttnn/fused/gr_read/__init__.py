@@ -725,6 +725,5 @@ register(
         fused=gr_read_fused,
         composed=gr_read_composed,
         gate=None,  # needs the TP4 collectives: component gate = the single-chip replica tool (one chip, four slices in turn), model gate = the acceptance table
-        default_on=False,  # flips to True on the traced 200-step timing (FUSION-DEFAULTS note)
     )
 )

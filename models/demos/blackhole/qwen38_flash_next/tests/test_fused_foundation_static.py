@@ -16,7 +16,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.fused import registry
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused.untilize_rows import untilize_rows, untilize_rows_composed
 
 NAME = "untilize_rows"
-DEFAULT_ON = frozenset({"router_tail"})  # the kernels that serve by default; gr_read joins on its timing pin
+DEFAULT_ON = registry.DEFAULT_ON  # the one list that decides what serves by default
 
 
 def test_registry_default_is_the_composed_chain_for_an_opt_in_kernel():
@@ -28,18 +28,27 @@ def test_registry_default_is_the_composed_chain_for_an_opt_in_kernel():
 
 
 def test_registry_serves_the_proven_kernels_by_default():
+    assert "router_tail" in DEFAULT_ON and DEFAULT_ON <= set(fused.kernels())
     assert fused.default_names() == DEFAULT_ON
     assert fused.enabled_names({}) == DEFAULT_ON
     for name in DEFAULT_ON:
-        assert fused.kernel(name).tolerance == fused.BITWISE
+        assert fused.kernel(name).default_on and fused.kernel(name).tolerance == fused.BITWISE
         assert fused.resolve(name, {}) is fused.kernel(name).fused
         assert fused.resolve(name, {fused.OFF_ENV: name}) is fused.kernel(name).composed
+    for name in set(fused.kernels()) - DEFAULT_ON:
+        assert not fused.kernel(name).default_on and fused.resolve(name, {}) is fused.kernel(name).composed
     assert fused.enabled_names({fused.OFF_ENV: "router_tail"}) == DEFAULT_ON - {"router_tail"}
     assert fused.enabled_names({fused.OFF_ENV: "all"}) == frozenset()
     assert fused.enabled_names({fused.ENV: "all", fused.OFF_ENV: "all"}) == frozenset()
     both = {fused.ENV: "gr_read", fused.OFF_ENV: "router_tail"}
     assert fused.enabled_names(both) == (DEFAULT_ON | {"gr_read"}) - {"router_tail"}
     assert fused.enabled_names({fused.ENV: NAME}) == DEFAULT_ON | {NAME}
+
+
+def test_default_on_list_must_name_registered_kernels(monkeypatch):
+    monkeypatch.setattr(registry, "DEFAULT_ON", registry.DEFAULT_ON | {"nope_kernel"})
+    with pytest.raises(ValueError, match="DEFAULT_ON names unregistered fused kernels \\['nope_kernel'\\]"):
+        fused.enabled_names({})
 
 
 @pytest.mark.parametrize("value", [NAME, f" {NAME} ,", f"{NAME},{NAME}", "all"])

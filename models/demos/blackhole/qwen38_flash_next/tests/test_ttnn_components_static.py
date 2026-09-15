@@ -680,7 +680,7 @@ def test_moe_dense_linears_share_one_width_sharded_hidden() -> None:
         and isinstance(call.func, ast.Name)
         and call.func.id == "dram_sharded_matmul_configs"
     ]
-    assert grids == [5, 5, 5, 5]
+    assert grids == [5, 5, 5, 5, 5]  # router, shared gate/up, shared down, shared scalar, fused gate|up|scalar
 
     gather = inspect.getsource(moe_module.Qwen38TTNNMoE._all_gather_hidden)
     gathers = _calls_named(ast.parse(textwrap.dedent(gather)), "all_gather")

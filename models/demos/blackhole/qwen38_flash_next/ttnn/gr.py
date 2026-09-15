@@ -451,8 +451,8 @@ class Qwen38TTNNGatedResidual:
         # The gamma multiply runs on the flat row (see _normalize); this view
         # shares the resident weight's buffer.
         self.norm_scale_flat = ttnn.experimental.view(weights.norm_scale, FLAT_LOCAL_SHAPE)
-        # The read resolves through the fused registry at construction (ttnn/fused/gr_read when it is on: default_on,
-        # QWEN38_FUSED=gr_read; QWEN38_FUSED_OFF keeps the chain) and stays so through trace capture; the class body of
+        # The read resolves through the fused registry at construction (ttnn/fused/gr_read when it is on: in
+        # registry.DEFAULT_ON or QWEN38_FUSED=gr_read; QWEN38_FUSED_OFF keeps the chain) and stays so through trace capture; the class body of
         # read() is the composed chain the fused kernel is gated against.
         from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_kernels
 
@@ -460,6 +460,14 @@ class Qwen38TTNNGatedResidual:
         if fused_kernels.enabled("gr_read"):
             self._read_fused = fused_kernels.kernel("gr_read").fused
             self.read = functools.partial(self._read_fused, self)
+        # QWEN38_FUSED=gr_write: write and write_rows (one tile row) resolve to ttnn/fused/gr_write the same way.
+        self._write_fused = None
+        if fused_kernels.enabled("gr_write"):
+            from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gr_write as fused_gr_write
+
+            self._write_fused = fused_gr_write.gr_write
+            self.write = functools.partial(fused_gr_write.write_fused, self)
+            self.write_rows = functools.partial(fused_gr_write.write_rows_fused, self)
 
     def _validate_residual(self, residual) -> None:
         if _shape(residual) != RESIDUAL_LOCAL_SHAPE:

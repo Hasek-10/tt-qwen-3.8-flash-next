@@ -239,13 +239,17 @@ def test_sync_policy_rejects_untyped_alias_before_any_device_access() -> None:
         )
 
 
-def test_five_row_clone_borrows_resident_weights_and_allocates_only_private_buffers() -> None:
+def test_five_row_clone_borrows_resident_weights_and_allocates_only_private_buffers(monkeypatch) -> None:
+    # the fused MoE post program and shared expert (on by default) upload constants through the mesh at construction,
+    # which a Mock mesh cannot do; the router tail's constants are patched below and its resolution is asserted
+    monkeypatch.setenv(moe_module.fused.OFF_ENV, "moe_post,shared_expert")
     ttnn = moe_module.ttnn
     mesh_device = mock.Mock()
     mesh_device.arch.return_value = object()
     mesh_device.dram_grid_size.return_value = ttnn.CoreCoord(8, 1)  # decode matmul configs read the bank grid
     mesh_contract = mock.Mock()
-    borrowed_weights = object()
+    # the fused shared expert (on by default) checks the concatenated weight is loaded; the clone borrows it as is
+    borrowed_weights = mock.Mock(shared_gate_up_scalar=object())
     mapping_tensor = _FakeTensor((4, ROUTED_EXPERTS), dtype=ttnn.uint16)
     local_tensor = _FakeTensor(
         (TOP_K, TARGET_VERIFIER_ROWS, HIDDEN_SIZE),

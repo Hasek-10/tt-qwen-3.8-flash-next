@@ -940,6 +940,8 @@ class Qwen38TTNNTextModel:
     allocated_context = MAX_CONTEXT
     semantic_max_context = MAX_CONTEXT
 
+    _position_derive = None  # the fused tail derive when QWEN38_FUSED names position_derive (see __init__)
+
     def __init__(
         self,
         *,
@@ -1033,6 +1035,10 @@ class Qwen38TTNNTextModel:
         # model lifetime so every captured address stays valid.
         self.rope_table: Qwen38TTNNRoPETable | None = None
         self.qsa_position_constants: Any | None = None
+        from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_kernels
+
+        if fused_kernels.enabled("position_derive"):
+            self._position_derive = fused_kernels.kernel("position_derive").fused
         self._state_owner = object()
         self._poisoned_error: Qwen38TTNNModelPoisonedError | None = None
         self._poisoned_device_owners: list[Any] = []
@@ -2215,11 +2221,14 @@ class Qwen38TTNNTextModel:
             raise TypeError(f"retain_mtp_inputs must be a bool, got {retain_mtp_inputs!r}")
         processed_layers = GENERIC_HEAD_LAYERS
         try:
-            index_row = state.position.index_row()
-            block_start_row = state.position.block_start_index_row(index_row)
-            rope = self.rope_table.rows(index_row, block_start_row)
-            _deallocate_unique(index_row, block_start_row)
-            qsa_position = qsa_module.derive_qsa_position_inputs(state.position.scalar, self.qsa_position_constants)
+            if self._position_derive is None:
+                index_row = state.position.index_row()
+                block_start_row = state.position.block_start_index_row(index_row)
+                rope = self.rope_table.rows(index_row, block_start_row)
+                _deallocate_unique(index_row, block_start_row)
+                qsa_position = qsa_module.derive_qsa_position_inputs(state.position.scalar, self.qsa_position_constants)
+            else:
+                rope, qsa_position = self._position_derive(self, state)
             residual = head.residual
             for layer_index in range(GENERIC_HEAD_LAYERS, BACKBONE_LAYERS):
                 layer, layer_state = self.layers[layer_index], state.layers[layer_index]

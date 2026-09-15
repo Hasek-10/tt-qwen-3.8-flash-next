@@ -95,13 +95,17 @@ class CoreWork:
     count: int
 
 
-def split_work(units: int, mesh) -> list[CoreWork]:
-    """``units`` work items over the compute grid in linear core order, as evenly as possible; cores with work only."""
+def split_work(units: int, mesh, cores: int | None = None) -> list[CoreWork]:
+    """``units`` work items over the compute grid in linear core order, as evenly as possible; cores with work only
+    (``cores`` caps the count below one unit per core)."""
 
     grid = mesh.compute_with_storage_grid_size()
-    cores = min(units, grid.x * grid.y)
-    if cores <= 0:
+    if units <= 0:
         raise ValueError(f"nothing to split: {units} units")
+    most = min(units, grid.x * grid.y)
+    cores = most if cores is None else cores
+    if not 1 <= cores <= most:
+        raise ValueError(f"cannot split {units} units over {cores} cores (grid {grid.x}x{grid.y})")
     base, extra = divmod(units, cores)
     work, start = [], 0
     for i in range(cores):
@@ -113,6 +117,30 @@ def split_work(units: int, mesh) -> list[CoreWork]:
 
 def core_set(work: Iterable[CoreWork]) -> ttnn.CoreRangeSet:
     return ttnn.CoreRangeSet([ttnn.CoreRange(w.core, w.core) for w in work])
+
+
+def core_rectangle(work: Sequence[CoreWork], mesh=None) -> ttnn.CoreRangeSet:
+    """The cores of ``work`` as few CoreRanges: one range when they fill a rectangle; with ``mesh``, the
+    ``split_work`` order (grid columns filled top to bottom) as the whole columns plus the partial one (two ranges);
+    otherwise the per-core set.  One range = one kernel group: the dispatcher multicasts the binaries once per range
+    instead of once per core (80 single-core ranges cost 52 us per launch against 24 for one rectangle; 15-20 us of
+    dispatch per program on 80 cores)."""
+
+    cores = {(w.core.x, w.core.y) for w in work}
+    xs, ys = sorted({x for x, _ in cores}), sorted({y for _, y in cores})
+    if cores and len(cores) == len(xs) * len(ys) and all((x, y) in cores for x in xs for y in ys):
+        return ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(xs[0], ys[0]), ttnn.CoreCoord(xs[-1], ys[-1]))])
+    if mesh is not None and work:
+        grid = mesh.compute_with_storage_grid_size()
+        if [(w.core.x, w.core.y) for w in work] == [(i // grid.y, i % grid.y) for i in range(len(work))]:
+            columns, rest = divmod(len(work), grid.y)
+            ranges = []
+            if columns:
+                ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(columns - 1, grid.y - 1)))
+            if rest:
+                ranges.append(ttnn.CoreRange(ttnn.CoreCoord(columns, 0), ttnn.CoreCoord(columns, rest - 1)))
+            return ttnn.CoreRangeSet(ranges)
+    return core_set(work)
 
 
 def accessor_args(tensor) -> list[int]:
@@ -201,6 +229,17 @@ def program_descriptor(kernels: Sequence, cbs: Sequence = (), semaphores: Sequen
 
 def allocate(shape: Sequence[int], dtype, layout, mesh, memory_config=ttnn.DRAM_MEMORY_CONFIG):
     return ttnn.allocate_tensor_on_device(ttnn.Shape(list(shape)), dtype, layout, mesh, memory_config)
+
+
+def stamp_topology(tensor, reference, shard_dim: int | None = None):
+    """Give a program's output (``allocate`` leaves the allocation's topology) the distributed topology the chain's op
+    would have produced: ``reference``'s mesh and coordinates, replicated (or sharded on ``shard_dim``); a collective
+    or a mesh contract check downstream reads it.  Returns ``tensor``."""
+
+    topology = reference.tensor_topology()
+    placements = [ttnn.PlacementReplicate(), ttnn.PlacementReplicate() if shard_dim is None else ttnn.PlacementShard(shard_dim)]
+    tensor.update_tensor_topology(ttnn.TensorTopology(topology.distribution_shape(), placements, topology.mesh_coords()))
+    return tensor
 
 
 def run_program(io_tensors: Sequence, descriptor: ttnn.ProgramDescriptor):

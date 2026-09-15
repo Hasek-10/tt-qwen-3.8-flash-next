@@ -38,6 +38,8 @@ inventing one.
 
 from __future__ import annotations
 
+import functools
+
 import fcntl
 import hashlib
 import json
@@ -1024,6 +1026,7 @@ class Qwen38GreedyCandidates:
     local_values: Any
     rows: int
     vocab_ranges: tuple[tuple[int, int], ...]
+    packed: Any = None  # fused greedy tail: the fp32 ROW_MAJOR [value | local id] row its resolve gathers
 
 
 @dataclass(frozen=True)
@@ -1715,6 +1718,14 @@ class Qwen38TTNNLMHead:
         )
         self.hidden_act_memory_config = chunk_configs[0][0]
         self.chunk_program_configs = tuple(program_config for _, program_config in chunk_configs)
+        # QWEN38_FUSED=greedy_tail: candidates and the device resolve bind to ttnn/fused/greedy_tail at construction.
+        from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_kernels
+
+        if fused_kernels.enabled("greedy_tail"):
+            from models.demos.blackhole.qwen38_flash_next.ttnn.fused import greedy_tail as fused_greedy_tail
+
+            self.greedy_candidates = functools.partial(fused_greedy_tail.greedy_candidates_fused, self)
+            self.resolve_greedy_on_device = functools.partial(fused_greedy_tail.resolve_greedy_on_device_fused, self)
 
     def _mark_vocab_shard(self, tensor, *, rows: int) -> None:
         expected = (1, 1, rows, LOCAL_VOCAB_SIZE)

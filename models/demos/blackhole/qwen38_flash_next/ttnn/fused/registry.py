@@ -3,11 +3,12 @@
 
 """The fused decode kernels by name and the ``QWEN38_FUSED`` / ``QWEN38_FUSED_OFF`` switches.
 
-Every fused kernel stands in for one named chain of existing ttnn ops.  A kernel registered ``default_on`` (proven
-bitwise against its chain and at the model level) serves by default; ``QWEN38_FUSED_OFF`` (comma-separated names, or
-``all``) falls back to the composed chains, ``QWEN38_FUSED`` switches an opt-in kernel on.  A name that is not
-registered raises in either variable, so a typo cannot silently change what runs.  Callers resolve once at
-construction and keep the choice through trace capture: ``run = resolve("router_tail")``.
+Every fused kernel stands in for one named chain of existing ttnn ops.  The kernels in ``DEFAULT_ON`` (the one list
+below: proven bitwise against their chains and at the model level, and faster than the record in their own timing
+slot) serve by default; ``QWEN38_FUSED_OFF`` (comma-separated names, or ``all``) falls back to the composed chains,
+``QWEN38_FUSED`` switches an opt-in kernel on.  A name that is not registered raises in either variable and in
+``DEFAULT_ON``, so a typo cannot silently change what runs.  Callers resolve once at construction and keep the choice
+through trace capture: ``run = resolve("router_tail")``.
 """
 
 from __future__ import annotations
@@ -27,6 +28,24 @@ ALL = "all"
 BITWISE, ULP, COMPONENT = "bitwise", "ulp", "component"
 TOLERANCE_CLASSES = (BITWISE, ULP, COMPONENT)
 _NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+# The kernels that serve by default: bitwise against their chains, the acceptance tables unchanged, and a 200-step
+# traced wall under the record in their own slot (the FUSION-DEFAULTS notes).  Flipping a kernel is this one list.
+DEFAULT_ON: frozenset[str] = frozenset(
+    {
+        "gr_write",
+        "greedy_tail",
+        "moe_post",
+        "position_derive",
+        "qsa_index_tail",
+        "qsa_main_tail",
+        "qsa_post_attention",
+        "qsa_score_merge",
+        "qsa_selection_row",
+        "qsa_widen_partial",
+        "router_tail",
+        "shared_expert",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -54,7 +73,10 @@ class FusedKernel:
     fused: Callable[..., Any]
     composed: Callable[..., Any]
     gate: GateSpec | None = None
-    default_on: bool = False  # serves by default (QWEN38_FUSED_OFF falls back); False = opt-in through QWEN38_FUSED
+
+    @property
+    def default_on(self) -> bool:
+        return self.name in DEFAULT_ON
 
     def __post_init__(self) -> None:
         if not _NAME.match(self.name) or self.name == ALL:
@@ -97,12 +119,17 @@ def _names(environ: Mapping[str, str], variable: str) -> frozenset[str]:
 
 
 def default_names() -> frozenset[str]:
-    return frozenset(name for name, entry in _REGISTRY.items() if entry.default_on)
+    """``DEFAULT_ON``, every name of which must be registered."""
+
+    unknown = sorted(DEFAULT_ON - set(_REGISTRY))
+    if unknown:
+        raise ValueError(f"DEFAULT_ON names unregistered fused kernels {unknown}; registered: {sorted(_REGISTRY)}")
+    return DEFAULT_ON
 
 
 def enabled_names(environ: Mapping[str, str] = os.environ) -> frozenset[str]:
-    """The kernels that run: the ``default_on`` ones plus ``QWEN38_FUSED``, less ``QWEN38_FUSED_OFF``; every name in
-    either variable must be registered."""
+    """The kernels that run: ``DEFAULT_ON`` plus ``QWEN38_FUSED``, less ``QWEN38_FUSED_OFF``; every name in either
+    variable must be registered."""
 
     return (default_names() | _names(environ, ENV)) - _names(environ, OFF_ENV)
 

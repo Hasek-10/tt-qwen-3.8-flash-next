@@ -33,6 +33,7 @@ ordinary decode lets this module release replaced staging tensors.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1849,6 +1850,14 @@ class Qwen38TTNNQSA:
     max_context = MAX_CONTEXT
     allocated_context = MAX_CONTEXT
     allocated_compressed_blocks = MAX_COMPRESSED_BLOCKS
+    # QWEN38_FUSED=<names>: the ttnn/fused/qsa_block programs, resolved at construction and kept through trace capture
+    # (qsa_index_tail, qsa_main_tail (implies qsa_post_attention), qsa_widen_partial, qsa_selection_row).
+    _index_tail_fused = None
+    _main_tail_fused = None
+    _post_attention_fused = None
+    _widen_partial_fused = None
+    _selection_row_fused = None
+    _score_merge_fused = None
 
     def __init__(
         self,
@@ -1971,6 +1980,28 @@ class Qwen38TTNNQSA:
         self.keep_step = self.uint32_rows["keep_step"]
         self.sentinel_step = self.uint32_rows["sentinel_step"]
         self.slot_zero = self.uint32_rows["slot_zero"]
+        # The fused index tail stands in for the chain after the two index linears in forward_decode_generic; the
+        # chain methods below stay the composed reference it is gated against.
+        from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_kernels
+
+        if fused_kernels.enabled("qsa_index_tail"):
+            self._index_tail_fused = fused_kernels.kernel("qsa_index_tail").fused
+        if fused_kernels.enabled("qsa_main_tail"):
+            self._main_tail_fused = fused_kernels.kernel("qsa_main_tail").fused
+            self._post_attention_fused = fused_kernels.kernel("qsa_post_attention").fused
+        elif fused_kernels.enabled("qsa_post_attention"):
+            raise ValueError("qsa_post_attention reads the gates from the fused main tail's qg shard: enable qsa_main_tail too")
+        if fused_kernels.enabled("qsa_widen_partial"):
+            self._widen_partial_fused = fused_kernels.kernel("qsa_widen_partial").fused
+        if fused_kernels.enabled("qsa_selection_row"):
+            self._selection_row_fused = fused_kernels.kernel("qsa_selection_row").fused
+        if fused_kernels.enabled("qsa_score_merge"):
+            self._score_merge_fused = fused_kernels.kernel("qsa_score_merge").fused
+        if any(
+            switch is not None
+            for switch in (self._index_tail_fused, self._main_tail_fused, self._widen_partial_fused, self._selection_row_fused, self._score_merge_fused)
+        ):
+            self.forward_decode_generic = functools.partial(type(self)._forward_decode_generic_fused, self)
 
     def deallocate(self) -> None:
         """Release module-owned constants after every state epoch is gone.
@@ -3317,6 +3348,227 @@ class Qwen38TTNNQSA:
             raise RuntimeError("compressed QSA index update was not in place")
         _deallocate(rotated_sharded)
 
+    def _index_tail_step(
+        self,
+        full_hidden,
+        cos,
+        sin,
+        block_start_cos,
+        block_start_sin,
+        state: Qwen38TTNNQSAGenericState,
+        position: Qwen38TTNNQSAPositionInputs,
+    ):
+        """The index linears, then the fused index tail (ttnn/fused/qsa_block.index_tail) in place of the chain after
+        them in :meth:`_index_projection` and :meth:`_write_compressed_index_generic`."""
+
+        index_q_ws = ttnn.linear(
+            full_hidden,
+            self.weights.index_q,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.index_program_config,
+            compute_kernel_config=self.compute_config,
+        )
+        raw_key_ws = ttnn.linear(
+            full_hidden,
+            self.weights.index_k,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.index_program_config,
+            compute_kernel_config=self.compute_config,
+        )
+        rotated = self._index_tail_fused(
+            index_q_ws,
+            raw_key_ws,
+            position,
+            self.weights.index_q_norm,
+            self.weights.index_k_norm,
+            cos,
+            sin,
+            block_start_cos,
+            block_start_sin,
+            state.raw_key_ring,
+            state.compressed_index_cache,
+        )
+        _deallocate(index_q_ws, raw_key_ws)
+        _require_shape(rotated, (1, 1, 1, INDEX_HEAD_DIM), "fused local index query")
+        _retag_tensor(rotated, reference=full_hidden, shard_dim=1)
+        self.mesh_contract.validate_tensor(rotated, placement=TensorPlacement.HEAD_SHARDED, shard_dim=1)
+        return rotated
+
+    def _score_blocks_fused(self, index_query, state: Qwen38TTNNQSAGenericState, position: Qwen38TTNNQSAPositionInputs):
+        """:meth:`_score_blocks_generic` with the all-reduce split into its all-gather (the collective stays) and the
+        fused merge (ttnn/fused/qsa_block.score_merge: the composite's moreh_sum order, then the mask add)."""
+
+        tile_shape = ttnn.Shape((1, INDEX_QUERY_HEADS_PER_DEVICE, ttnn.TILE_SIZE, INDEX_HEAD_DIM))
+        query_tile = ttnn.reshape(index_query, tile_shape, tile_shape)
+        _retag_tensor(query_tile, reference=index_query, shard_dim=1)
+        local_scores = ttnn.experimental.indexer_score_dsa(
+            query_tile,
+            state.compressed_index_cache,
+            self.index_gate,
+            chunk_start_idx=self.indexer_chunk_start,
+            compute_kernel_config=self.indexer_compute_config,
+            seq_shard_axes=[STAGING_AXIS],
+        )
+        score_row = ttnn.slice(
+            local_scores,
+            (0, 0, 0, 0),
+            (1, 1, 1, self.allocated_compressed_blocks),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        _deallocate(local_scores)
+        self.mesh_contract.mark_local_partial(
+            score_row,
+            replicated_reference=state.compressed_index_cache,
+            expected_shape=(1, 1, 1, self.allocated_compressed_blocks),
+        )
+        gathered = ttnn.all_gather(
+            score_row,
+            dim=2,
+            cluster_axis=TP_AXIS,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        _deallocate(score_row)
+        _require_shape(gathered, (1, 1, TP_SIZE, self.allocated_compressed_blocks), "gathered QSA block scores")
+        masked = self._score_merge_fused(gathered, position.indexer_neg_mask)
+        _deallocate(gathered)
+        # generic_op leaves the allocation's topology: stamp the placement the chain's add would have given it
+        _retag_tensor(masked, reference=state.compressed_index_cache, shard_dim=None)
+        self.mesh_contract.validate_tensor(masked, placement=TensorPlacement.REPLICATED)
+        _require_shape(masked, (1, 1, 1, self.allocated_compressed_blocks), "masked QSA block scores")
+        return masked
+
+    def _materialize_row_fused(self, masked_scores, position: Qwen38TTNNQSAPositionInputs):
+        """The top-k, then the fused selection row (ttnn/fused/qsa_block.selection_row) in place of the integer chain
+        of :meth:`_materialize_row_generic`."""
+
+        block_ids = ttnn.experimental.topk_large_indices(masked_scores, k=BLOCK_TOPK)
+        _deallocate(masked_scores)
+        _require_shape(block_ids, (1, 1, 1, BLOCK_TOPK), "top-k QSA block IDs")
+        sparse_indices = self._selection_row_fused(
+            block_ids, self.sentinel_pad, self.block_offsets, position.row_keep_bits, position.row_fill
+        )
+        _deallocate(block_ids)
+        _require_shape(sparse_indices, (1, 1, 1, SPARSE_INDEX_CAPACITY), "fused QSA sparse indices")
+        _retag_tensor(sparse_indices, reference=self.sentinel_pad, shard_dim=None)
+        self.mesh_contract.validate_tensor(sparse_indices, placement=TensorPlacement.REPLICATED)
+        return sparse_indices
+
+    def _main_tail_step(self, full_hidden, cos, sin, state: Qwen38TTNNQSAGenericState, position: Qwen38TTNNQSAPositionInputs):
+        """The three main linears, then the fused main tail (ttnn/fused/qsa_block.main_tail) in place of the chain after
+        them in :meth:`_main_projection`, :meth:`_write_packed_kv_generic` and the query build of
+        :meth:`_sparse_value_attention`.  Returns the sparse query and the qg shard (the gates for the post-attention
+        program, released there)."""
+
+        qg_ws = ttnn.linear(
+            full_hidden,
+            self.weights.qg,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.qg_program_config,
+            compute_kernel_config=self.compute_config,
+        )
+        k_ws = ttnn.linear(
+            full_hidden,
+            self.weights.k_pair_grouped,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.kv_program_config,
+            compute_kernel_config=self.compute_config,
+        )
+        v_ws = ttnn.linear(
+            full_hidden,
+            self.weights.v_pair_grouped,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.kv_program_config,
+            compute_kernel_config=self.compute_config,
+        )
+        sparse_query = self._main_tail_fused(
+            qg_ws,
+            k_ws,
+            v_ws,
+            position,
+            self.weights.q_norm,
+            self.weights.k_norm,
+            cos,
+            sin,
+            state.kv_staging,
+            state.packed_kv_cache,
+        )
+        _deallocate(k_ws, v_ws)
+        _require_shape(sparse_query, (1, 32, 1, 2 * HEAD_DIM), "fused padded sparse QSA query")
+        _retag_tensor(sparse_query, reference=state.packed_kv_cache, shard_dim=1)
+        return sparse_query, qg_ws
+
+    def _sparse_value_attention_fused(self, sparse_query, qg_ws, sparse_indices, state):
+        """sparse_sdpa on the fused query, then the fused post-attention (ttnn/fused/qsa_block.post_attention) straight
+        into the out-projection's activation shard; the chain's tail of :meth:`_sparse_value_attention`."""
+
+        sparse_output = ttnn.transformer.sparse_sdpa(
+            sparse_query,
+            state.packed_kv_cache,
+            sparse_indices,
+            HEAD_DIM,
+            kv_format=ttnn.transformer.SparseKVFormat.BF16,
+            scale=HEAD_DIM**-0.5,
+            k_chunk_size=ttnn.TILE_SIZE,
+            compute_kernel_config=self.compute_config,
+        )
+        _deallocate(sparse_query)
+        attention_ws = self._post_attention_fused(sparse_output, qg_ws, memory_config=self.out_act_memory_config)
+        _deallocate(sparse_output, qg_ws)
+        _require_shape(attention_ws, (1, 1, 1, LOCAL_QUERY_WIDTH), "fused gated QSA attention")
+        _retag_tensor(attention_ws, reference=state.packed_kv_cache, shard_dim=3)
+        return attention_ws
+
+    def _project_output_fused(self, local_attention, full_hidden):
+        """:meth:`_project_output` with the fused widen (ttnn/fused/qsa_block.widen_partial) for the reduce_scatter's
+        fp32 input when it is on, and no activation move when the input already sits in the out-projection's shard."""
+
+        if local_attention.memory_config() == self.out_act_memory_config:
+            attention_ws = local_attention
+        else:
+            attention_ws = ttnn.to_memory_config(local_attention, self.out_act_memory_config)
+            _deallocate(local_attention)
+        local_partial_ws = ttnn.linear(
+            attention_ws,
+            self.weights.out,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.out_program_config,
+            compute_kernel_config=self.compute_config,
+        )
+        _deallocate(attention_ws)
+        if self._widen_partial_fused is not None:
+            local_partial_fp32 = self._widen_partial_fused(local_partial_ws)
+            _deallocate(local_partial_ws)
+        else:
+            local_partial = ttnn.to_memory_config(local_partial_ws, ttnn.DRAM_MEMORY_CONFIG)
+            _deallocate(local_partial_ws)
+            local_partial_fp32 = ttnn.typecast(local_partial, ttnn.float32, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _deallocate(local_partial)
+        self.mesh_contract.mark_local_partial(
+            local_partial_fp32,
+            replicated_reference=full_hidden,
+            expected_shape=(1, 1, 1, HIDDEN_SIZE),
+        )
+        output_fp32 = ttnn.reduce_scatter(
+            local_partial_fp32,
+            dim=3,
+            cluster_axis=TP_AXIS,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            topology=self.collective_topology,
+        )
+        _deallocate(local_partial_fp32)
+        self.mesh_contract.mark_collective_shard(
+            output_fp32,
+            replicated_reference=full_hidden,
+            shard_dim=3,
+            expected_local_shape=(1, 1, 1, HIDDEN_SIZE // TP_SIZE),
+        )
+        output = ttnn.typecast(output_fp32, ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _retag_tensor(output, reference=output_fp32, shard_dim=3)
+        _deallocate(output_fp32)
+        _require_shape(output, (1, 1, 1, HIDDEN_SIZE // TP_SIZE), "QSA output projection")
+        self.mesh_contract.validate_tensor(output, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        return output
+
     def _score_blocks_generic(
         self, index_query, state: Qwen38TTNNQSAGenericState, position: Qwen38TTNNQSAPositionInputs
     ):
@@ -3534,6 +3786,59 @@ class Qwen38TTNNQSA:
         local_attention = self._sparse_value_attention(query, gate, sparse_indices, state)
         _deallocate(sparse_indices)
         output = self._project_output(local_attention, full_hidden)
+        _deallocate(full_hidden)
+        return output
+
+    def _forward_decode_generic_fused(
+        self,
+        hidden_sharded,
+        state: Qwen38TTNNQSAGenericState,
+        *,
+        cos,
+        sin,
+        block_start_cos,
+        block_start_sin,
+        position: Qwen38TTNNQSAPositionInputs,
+    ):
+        """:meth:`forward_decode_generic` with the enabled ttnn/fused/qsa_block programs in place of their chains;
+        bound to ``forward_decode_generic`` at construction when any of them is on (the class body stays the chain
+        the programs are gated against).  Every switch is a construction-time constant."""
+
+        self._validate_generic_state(state)
+        self._validate_rope(cos, sin, "QSA current RoPE")
+        self._validate_rope(block_start_cos, block_start_sin, "QSA block-start RoPE")
+        self._validate_position_inputs(position)
+
+        full_hidden = self._all_gather_hidden(hidden_sharded)
+        if self._index_tail_fused is not None:
+            index_query = self._index_tail_step(full_hidden, cos, sin, block_start_cos, block_start_sin, state, position)
+        else:
+            index_query, raw_key = self._index_projection(full_hidden, cos, sin)
+            self._write_compressed_index_generic(state, raw_key, position, block_start_cos, block_start_sin)
+        if self._score_merge_fused is not None:
+            masked_scores = self._score_blocks_fused(index_query, state, position)
+        else:
+            masked_scores = self._score_blocks_generic(index_query, state, position)
+        _deallocate(index_query)
+        if self._selection_row_fused is not None:
+            sparse_indices = self._materialize_row_fused(masked_scores, position)
+        else:
+            sparse_indices = self._materialize_row_generic(masked_scores, position)
+
+        if self._main_tail_fused is not None:
+            sparse_query, qg_ws = self._main_tail_step(full_hidden, cos, sin, state, position)
+            local_attention = self._sparse_value_attention_fused(sparse_query, qg_ws, sparse_indices, state)
+            _deallocate(sparse_indices)
+            output = self._project_output_fused(local_attention, full_hidden)
+        else:
+            query, gate, key, value = self._main_projection(full_hidden, cos, sin)
+            self._write_packed_kv_generic(state, key, value, position)
+            local_attention = self._sparse_value_attention(query, gate, sparse_indices, state)
+            _deallocate(sparse_indices)
+            if self._widen_partial_fused is not None:
+                output = self._project_output_fused(local_attention, full_hidden)
+            else:
+                output = self._project_output(local_attention, full_hidden)
         _deallocate(full_hidden)
         return output
 

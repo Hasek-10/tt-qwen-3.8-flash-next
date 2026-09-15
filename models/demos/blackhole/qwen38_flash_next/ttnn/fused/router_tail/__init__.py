@@ -73,10 +73,15 @@ def _compute_kernel_config(logits):
 def _rows_of(logits) -> int:
     shape = tuple(int(v) for v in logits.shape)
     rows = shape[-2] if len(shape) == 4 else 0
-    if len(shape) != 4 or shape[:2] != (1, 1) or shape[3] != EXPERTS or not (1 <= rows <= fp.TILE or rows % fp.TILE == 0):
+    if (
+        len(shape) != 4
+        or shape[:2] != (1, 1)
+        or shape[3] != EXPERTS
+        or not (1 <= rows <= fp.TILE or rows % fp.TILE == 0)
+    ):
         raise ValueError(f"router tail logits must be [1, 1, rows (1..32 or n x 32), {EXPERTS}], got {list(shape)}")
-    if logits.dtype != ttnn.float32 or logits.layout != ttnn.TILE_LAYOUT:
-        raise ValueError(f"router tail logits must be fp32 TILE, got {logits.dtype} {logits.layout}")
+    if logits.dtype not in (ttnn.float32, ttnn.bfloat16) or logits.layout != ttnn.TILE_LAYOUT:
+        raise ValueError(f"router tail logits must be fp32 or bf16 TILE, got {logits.dtype} {logits.layout}")
     return rows
 
 
@@ -103,14 +108,26 @@ def router_tail_program(logits, index_template, scores, indices, *, rows: int, t
     tile_rows = -(-rows // fp.TILE)
     cores = [ttnn.CoreCoord(0, y) for y in range(tile_rows)]
     grid = ttnn.CoreRangeSet([ttnn.CoreRange(cores[0], cores[-1])])
-    named = [(name, index) for name, index, _dtype, _pages in CBS] + [("Wt", WIDTH_TILES), ("top_k", top_k), ("stage_pages", STAGE_PAGES)]
+    named = [(name, index) for name, index, _dtype, _pages in CBS] + [
+        ("Wt", WIDTH_TILES),
+        ("top_k", top_k),
+        ("stage_pages", STAGE_PAGES),
+    ]
     cbs = [
-        fp.cb_descriptor(index, dtype, TOKEN_PAGE_BYTES if name in TOKEN_CBS else fp.TILE_BYTES[dtype], pages, grid)
+        fp.cb_descriptor(
+            index,
+            logits.dtype if name == "cb_in0" else dtype,
+            TOKEN_PAGE_BYTES if name in TOKEN_CBS else fp.TILE_BYTES[logits.dtype if name == "cb_in0" else dtype],
+            pages,
+            grid,
+        )
         for name, index, dtype, pages in CBS
     ]
 
     def per_core(args_of):
-        return [(core, args_of(tile_row, min(fp.TILE, rows - tile_row * fp.TILE))) for tile_row, core in enumerate(cores)]
+        return [
+            (core, args_of(tile_row, min(fp.TILE, rows - tile_row * fp.TILE))) for tile_row, core in enumerate(cores)
+        ]
 
     compute_config = ttnn.ComputeConfigDescriptor(
         math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, dst_full_sync_en=False
@@ -163,15 +180,36 @@ def _dev_defines() -> list[tuple[str, str]]:
 
 def router_tail(logits, *, top_k: int = TOP_K, compute_kernel_config=None, memory_config=ttnn.DRAM_MEMORY_CONFIG):
     """``(scores, indices)`` ROW_MAJOR bf16 / uint16 ``[1, 1, rows, top_k]``; ``compute_kernel_config`` is the chain's
-    (HiFi4, fp32 dest) and is pinned inside the kernel."""
+    (HiFi4, fp32 dest) and is pinned inside the kernel.  ``logits`` are the fp32 tiles the chain drains, or the router
+    linear's bf16 L1 shard itself (the same values: a bf16 value is exact in the 19-bit source registers the softmax
+    unpacks fp32 into)."""
+
+    rows = _rows_of(logits)
+    mesh = logits.device()
+    scores = fp.allocate((1, 1, rows, top_k), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, mesh, memory_config)
+    indices = fp.allocate((1, 1, rows, top_k), ttnn.uint16, ttnn.ROW_MAJOR_LAYOUT, mesh, memory_config)
+    return router_tail_into(logits, scores, indices, top_k=top_k)
+
+
+def router_tail_into(logits, scores, indices, *, top_k: int = TOP_K):
+    """``router_tail`` writing its ROW_MAJOR rows into the pre-allocated ``scores`` (bf16) and ``indices`` (uint16)
+    of ``rows x top_k`` rows in any layout (e.g. the drain-core L1 shards ``moe_compute`` reads); returns them."""
 
     rows = _rows_of(logits)
     if not 1 <= top_k <= 16:
         raise ValueError(f"router tail top_k must be 1..16 (one face of the sorted tile), got {top_k}")
-    mesh = logits.device()
-    scores = fp.allocate((1, 1, rows, top_k), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, mesh, memory_config)
-    indices = fp.allocate((1, 1, rows, top_k), ttnn.uint16, ttnn.ROW_MAJOR_LAYOUT, mesh, memory_config)
-    index_template = router_tail_prepare(mesh)
+    for name, tensor, dtype in (("scores", scores, ttnn.bfloat16), ("indices", indices, ttnn.uint16)):
+        shape = tuple(int(v) for v in tensor.shape)
+        if (
+            shape[-2:] != (rows, top_k)
+            or any(v != 1 for v in shape[:-2])
+            or tensor.dtype != dtype
+            or tensor.layout != ttnn.ROW_MAJOR_LAYOUT
+        ):
+            raise ValueError(
+                f"router tail {name} output must be ROW_MAJOR {dtype} [.., {rows}, {top_k}], got {list(shape)} {tensor.dtype}"
+            )
+    index_template = router_tail_prepare(logits.device())
     fp.run_program(
         [logits, index_template, scores, indices],
         router_tail_program(logits, index_template, scores, indices, rows=rows, top_k=top_k),
@@ -245,6 +283,5 @@ register(
         fused=router_tail,
         composed=router_tail_composed,
         gate=GateSpec(inputs=_gate_inputs, output=routing_table, reference=_gate_reference, layers=tuple(range(48))),
-        default_on=True,
     )
 )

@@ -1,0 +1,198 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+"""The fused greedy tail without a device: its registry entry, the three kernels' argument contracts against the Python
+side, the bf16 / fp32 sign-magnitude order keys against torch's order, the staging layouts against the CBs, the composed
+chains as subsequences of the LM head's own op sequences, and the LM-head hook and dataclass field pinned in
+``embedding.py``."""
+
+from __future__ import annotations
+
+import ast
+import inspect
+import json
+import re
+import struct
+from pathlib import Path
+
+import pytest
+import torch
+
+from models.demos.blackhole.qwen38_flash_next.ttnn import fused
+from models.demos.blackhole.qwen38_flash_next.ttnn.fused import greedy_tail as gt
+from models.demos.blackhole.qwen38_flash_next.ttnn.fused import program as fp
+
+HERE = Path(__file__).resolve().parents[1]
+EMBEDDING_SOURCE = (HERE / "ttnn" / "embedding.py").read_text()
+SOURCES = {name: (fp.REPO_ROOT / path).read_text() for name, path in gt.KERNELS.items()}
+
+
+def _ttnn_calls(source: str) -> list[str]:
+    tree = ast.parse(inspect.cleandoc(source) if not source.startswith("def") else source)
+    calls = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            value = node.func.value
+            if isinstance(value, ast.Name) and value.id == "ttnn":
+                calls.append((node.lineno, node.col_offset, node.func.attr))
+    return [name for _, _, name in sorted(calls)]
+
+
+def _method_source(class_name: str, method: str) -> str:
+    body = EMBEDDING_SOURCE[EMBEDDING_SOURCE.index(f"\nclass {class_name}") :]
+    match = re.search(rf"\n    def {method}\(.*?(?=\n    def |\n\S)", body, re.S)
+    assert match, (class_name, method)
+    return inspect.cleandoc(match.group(0))
+
+
+def _is_subsequence(short: list[str], long: list[str]) -> bool:
+    it = iter(long)
+    return all(any(item == other for other in it) for item in short)
+
+
+def test_registered_bitwise():
+    entry = fused.kernel("greedy_tail")
+    assert entry.tolerance == fused.BITWISE and entry.gate is None
+    assert entry.fused is gt.greedy_candidates_fused and entry.composed is gt.greedy_candidates_chain
+    default = gt.greedy_candidates_fused if "greedy_tail" in fused.DEFAULT_ON else gt.greedy_candidates_chain
+    assert fused.resolve("greedy_tail", {}) is default  # the registry list decides
+    assert fused.resolve("greedy_tail", {fused.OFF_ENV: "greedy_tail"}) is gt.greedy_candidates_chain
+    assert fused.resolve("greedy_tail", {fused.ENV: "greedy_tail"}) is gt.greedy_candidates_fused
+    assert (
+        inspect.signature(gt.greedy_candidates_fused).parameters.keys()
+        == inspect.signature(gt.greedy_candidates_chain).parameters.keys()
+    )
+
+
+@pytest.mark.parametrize(
+    "kernel, runtime_args, tensors, named",
+    [
+        ("scan", gt.SCAN_ARGS, 2, {"cb_stage", "lanes_per_tile"}),
+        ("merge", gt.MERGE_ARGS, 5, {"cb_stage", "cores"}),
+        ("resolve", gt.RESOLVE_ARGS, 5, {"cb_stage", "devices"}),
+    ],
+)
+def test_kernel_arg_contracts(kernel, runtime_args, tensors, named):
+    source = SOURCES[kernel]
+    used = sorted({int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d+)\)", source)})
+    assert used == list(range(len(runtime_args)))
+    assert "TensorAccessorArgs<0>()" in source and source.count("next_compile_time_args_offset()") == tensors - 1
+    assert set(re.findall(r'get_named_compile_time_arg_val\("([a-z_0-9]+)"\)', source)) == named
+    assert "void kernel_main()" in source
+
+
+def test_python_side_named_args_match_the_kernels():
+    source = inspect.getsource(gt)
+    for kernel, expected in (
+        ("scan", {"cb_stage", "lanes_per_tile"}),
+        (
+            "merge",
+            {"cb_stage", "cores"},
+        ),
+        ("resolve", {"cb_stage", "devices"}),
+    ):
+        block = source.split(f'KERNELS["{kernel}"]')[1].split("named={")[1].split("}")[0]
+        assert set(re.findall(r'"([a-z_0-9]+)":', block)) == expected, kernel
+
+
+def _key16(bits: int) -> int:
+    return (~bits & 0xFFFF) if bits & 0x8000 else (bits | 0x8000)
+
+
+def _key32(bits: int) -> int:
+    return (~bits & 0xFFFFFFFF) if bits & 0x80000000 else (bits | 0x80000000)
+
+
+def test_sign_magnitude_keys_order_as_the_floats():
+    assert "return (bits & 0x8000u) ? (~bits & 0xFFFFu) : (bits | 0x8000u);" in SOURCES["scan"]
+    assert "return (bits & 0x7FFFu) ? bits : uint16_t(0);" in SOURCES["scan"]  # -0.0 -> +0.0 before keying
+    assert "const uint16_t bits = canonical(halves[word]);" in SOURCES["scan"]
+    assert "fp32_bits = (fp32_bits & 0x7FFFFFFFu) ? fp32_bits : 0u;" in SOURCES["merge"]
+    assert "return (fp32_bits & 0x80000000u) ? ~fp32_bits : (fp32_bits | 0x80000000u);" in SOURCES["merge"]
+    g = torch.Generator().manual_seed(1)
+    values = torch.cat([torch.randn(4096, generator=g) * 40, torch.tensor([-1e30, 1e30, -0.0, 0.0, 1e-38, -1e-38])])
+    bf16 = values.to(torch.bfloat16)
+    order = torch.argsort(bf16.float(), stable=True)
+    floats = bf16[order].float().tolist()
+    keys = [_key16(0 if (int(b) & 0x7FFF) == 0 else int(b) & 0xFFFF) for b in bf16[order].view(torch.int16)]
+    for (k0, f0), (k1, f1) in zip(zip(keys, floats), zip(keys[1:], floats[1:])):
+        assert (k0 < k1) if f0 < f1 else (k0 == k1)  # zeros canonicalized: equal floats have equal keys
+    keys32 = [_key32(struct.unpack("<I", struct.pack("<f", f))[0]) for f in floats]
+    assert all(a <= b for a, b in zip(keys32, keys32[1:]))
+
+
+def test_scan_visits_lanes_in_id_order_and_keeps_the_first_maximum():
+    source = SOURCES["scan"]
+    assert "if (!any || key > best_key)" in source  # strict: an equal later lane never replaces the lower id
+    assert "best_id = (first + t) * LANES + lane;" in source
+    assert "(lane < 16 ? lane : 32 + (lane - 16))" in source  # face 0 row 0 then face 1 row 0 of the 128-byte stage
+    assert "if (c == 0 || key > best_key)" in SOURCES["merge"]
+    assert "id_fp32.f = static_cast<float>(best_id);" in SOURCES["merge"]  # the packed lane is float(id), not its bits
+    assert (
+        "words[STAGE_OUT / 4 + 1] = id_fp32.u;" in SOURCES["merge"]
+        and "words[STAGE_OUT / 4 + 4] = best_id;" in SOURCES["merge"]
+    )
+    assert "if (ranked > best)" in SOURCES["resolve"] and "for (uint32_t d = 1; d < DEVICES; ++d)" in SOURCES["resolve"]
+
+
+def test_staging_layouts_fit_the_cbs():
+    tiles = 62080 // fp.TILE
+    per_core = -(-tiles // gt.SCAN_CORES)
+    assert gt.scan_cores({}) == gt.SCAN_CORES == 40 and gt.scan_cores({gt.SCAN_CORES_ENV: "80"}) == 80
+    assert 128 * per_core + 16 <= gt.SCAN_STAGE_PAGES * 2048
+    pairs_bytes = ((16 * gt.SCAN_CORES) + 63) & ~63
+    assert 2048 + pairs_bytes + 32 <= gt.MERGE_STAGE_PAGES * 2048
+    assert 4096 + 3 * 64 <= gt.RESOLVE_STAGE_PAGES * 4096
+    assert "PAIRS_BYTES = ((16 * CORES) + 63) & ~63u;" in SOURCES["merge"]
+    assert "pairs_lanes = -(-4 * len(work) // 16) * 16" in inspect.getsource(gt.greedy_candidates)
+    assert "{.page_id = 0, .offset_bytes = 16 * core}" in SOURCES["scan"]
+
+
+def test_composed_chains_follow_the_lm_head_op_order():
+    candidates = _ttnn_calls(inspect.getsource(gt.greedy_candidates_composed))
+    chain = _ttnn_calls(_method_source("Qwen38TTNNLMHead", "greedy_candidates"))
+    core = [c for c in candidates if c not in ("deallocate", "typecast", "concat")][:7]
+    assert core == ["to_layout", "argmax", "pad", "reshape", "max", "reshape", "max"]
+    assert _is_subsequence(core, chain)
+    resolve = [c for c in _ttnn_calls(inspect.getsource(gt.resolve_composed)) if c != "deallocate"]
+    assert resolve == [
+        "to_layout",
+        "typecast",
+        "subtract",
+        "argmax",
+        "typecast",
+        "add",
+        "gather",
+        "multiply",
+        "to_layout",
+    ]
+    assert _is_subsequence(resolve, _ttnn_calls(_method_source("Qwen38TTNNLMHead", "resolve_greedy_on_device")))
+
+
+def test_fused_resolve_gathers_once_along_the_tp_axis():
+    source = inspect.getsource(gt.resolve_greedy_on_device_fused)
+    assert source.count("ttnn.all_gather(") == 1 and "dim=3, cluster_axis=embedding.TP_AXIS" in source
+    assert 'raise RuntimeError("on-device greedy resolve requires Linear topology")' in source
+    assert "placement=TensorPlacement.LOCAL_PARTIAL" in source and "placement=TensorPlacement.REPLICATED" in source
+    assert "return type(lm_head).resolve_greedy_on_device(lm_head, candidates)" in source  # chain candidates: chain
+
+
+def test_lm_head_hook_and_dataclass_field_are_pinned():
+    assert "    packed: Any = None  # fused greedy tail" in EMBEDDING_SOURCE
+    init = _method_source("Qwen38TTNNLMHead", "__init__")
+    assert 'if fused_kernels.enabled("greedy_tail"):' in init
+    assert "self.greedy_candidates = functools.partial(fused_greedy_tail.greedy_candidates_fused, self)" in init
+    assert (
+        "self.resolve_greedy_on_device = functools.partial(fused_greedy_tail.resolve_greedy_on_device_fused, self)"
+        in init
+    )
+    for method in ("greedy_candidates", "resolve_greedy_on_device"):
+        assert "greedy_tail" not in _method_source("Qwen38TTNNLMHead", method)  # the chain bodies stay the chain
+
+
+def test_manifest_lists_the_files():
+    manifest = json.loads((HERE / "tools" / "release" / "manifest.json").read_text())["public"]
+    for path in ("tests/test_fused_greedy_tail_static.py", "ttnn/fused/greedy_tail/__init__.py") + tuple(
+        f"ttnn/fused/greedy_tail/kernels/{name}.cpp" for name in ("scan", "merge", "resolve")
+    ):
+        assert path in manifest, path
