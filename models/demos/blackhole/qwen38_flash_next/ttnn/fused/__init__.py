@@ -30,7 +30,7 @@ from .registry import (
     register,
     resolve,
 )
-from . import final_mixer, gdn_step, gr_read, gr_write, greedy_tail, moe_post, position_derive, qsa_block, router_tail, shared_expert, untilize_rows
+from . import final_mixer, gdn_step, gr_read, gr_write, greedy_tail, moe_post, ple, position_derive, qsa_block, router_tail, shared_expert, untilize_rows
 
 __all__ = [
     "ALL",
@@ -54,6 +54,7 @@ __all__ = [
     "kernel",
     "kernels",
     "moe_post",
+    "ple",
     "position_derive",
     "program",
     "qsa_block",

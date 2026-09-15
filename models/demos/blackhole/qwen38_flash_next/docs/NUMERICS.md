@@ -25,19 +25,21 @@ Every number here was measured on 4x p150 unless a date and host say otherwise.
 
 Decode chains run as fused programs (`ttnn/fused/`, built on `ttnn.generic_op`) where a kernel is bitwise against the
 chain it replaces on device, leaves every pinned table above unchanged and beats the previous step time in its own
-timing slot.  On by default: `gr_write`, `greedy_tail`, `moe_post`, `position_derive`, `qsa_block`, `router_tail`,
-`shared_expert`: the gated-residual write as one program (SFPU multiply, FPU add, as the chain); the tail's greedy
+timing slot.  On by default: `gr_write`, `greedy_tail`, `moe_post`, `ple`, `position_derive`, `qsa_block`,
+`router_tail`, `shared_expert`: the gated-residual write as one program (SFPU multiply, FPU add, as the chain); the tail's greedy
 epilogue (24 programs as 4 plus one gather); the MoE post program (fill, tilize, the score-weighted reduce over the
 ten expert slots in slot order, the shared expert's x sigmoid and the partial add as one program); the prologue's
 position derivation (40 programs as 1); the sparse-attention block's decode glue as six programs (index tail, main
 tail, post-attention, partial widen, selection row, score merge); the MoE router tail (softmax, top-10, sum, div,
 casts and layouts: 12 programs per layer as one); the shared expert as three programs (one DRAM-sharded linear over
-the concatenated [gate | up | scalar] weight, one silu / product / sigmoid program, the down linear).  Opt-in through
-`QWEN38_FUSED=<name>`: `final_mixer`, `gdn_step`, `gr_read`.  The kernels cover rows 1..32 (decode, the MTP verify
+the concatenated [gate | up | scalar] weight, one silu / product / sigmoid program, the down linear); the layer-1 PLE
+(stats, group norm, gate, conv with the state shift and the layer's permute + add: 56 programs as 9, the SFPU `mac_tile`
+of `ttnn.mac`, the accurate fp32 reduce of the gate's sum).  Opt-in through `QWEN38_FUSED=<name>`: `final_mixer`,
+`gdn_step`, `gr_read`, `position_advance`.  The kernels cover rows 1..32 (decode, the MTP verify
 rows); the 128-row prefill chunk and the slab keep their chains.  `QWEN38_FUSED_OFF=<name>[,...]` (or `all`) in the
 server's environment falls back to the composed chains; an unknown name in either variable refuses to start.  Measured
-2026-09-15 on 4x p150 (200 traced decode steps, host wall): 49.91 ms per token with the chains, 42.24 ms with the
-default set (23.7 tokens/s); 4,652 programs and 38.0 ms of kernel time per step on chip 0 under the device profiler.
+2026-09-15 on 4x p150 (200 traced decode steps, host wall): 49.91 ms per token with the chains, 42.14 ms with the
+default set (23.7 tokens/s); 4,618 programs and 37.9 ms of kernel time per step on chip 0 under the device profiler.
 
 ## The acceptance mechanism
 

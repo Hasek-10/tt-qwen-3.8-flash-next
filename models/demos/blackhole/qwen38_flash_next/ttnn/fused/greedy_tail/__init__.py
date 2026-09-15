@@ -44,7 +44,7 @@ MERGE_STAGE_PAGES = 2  # zero tile + pairs + out
 RESOLVE_STAGE_PAGES = 3  # fp32 zero tile (4 KB) + three 64-byte reads
 SCAN_ARGS = ("logits_addr", "pairs_addr", "first_tile", "tile_count", "core_index")
 MERGE_ARGS = ("pairs_addr", "zero_tile_addr", "values_addr", "indices_addr", "packed_addr")
-RESOLVE_ARGS = ("gathered_addr", "tie_break_addr", "vocab_starts_addr", "zero_tile_addr", "token_row_addr")
+RESOLVE_ARGS = ("gathered_addr", "tie_break_addr", "vocab_starts_addr", "zero_tile_addr", "token_row_addr", "into_addr")
 _ZERO_TILES: dict[int, tuple] = {}
 
 
@@ -162,11 +162,17 @@ def greedy_candidates_composed(logits, *, memory_config=ttnn.DRAM_MEMORY_CONFIG)
     return local_values, local_indices, packed
 
 
-def resolve(gathered, tie_break, vocab_starts, *, memory_config=ttnn.DRAM_MEMORY_CONFIG):
-    """The token row (fp32 TILE ``[1,1,1,32]``, lane 0 = the global id) from the gathered packed rows ``[1,1,1,2*devices]``."""
+def resolve(gathered, tie_break, vocab_starts, *, into=None, memory_config=ttnn.DRAM_MEMORY_CONFIG):
+    """The token row (fp32 TILE ``[1,1,1,32]``, lane 0 = the global id) from the gathered packed rows ``[1,1,1,2*devices]``;
+    ``into`` (a resident TOKEN_ROW) receives the same tile from the same program (the chain's ``ttnn.copy`` after it).
+    """
 
     embedding = _embedding()
     devices = int(gathered.shape[3]) // 2
+    if into is not None and (
+        tuple(into.shape) != embedding.TOKEN_ROW_SHAPE or into.dtype != ttnn.float32 or into.layout != ttnn.TILE_LAYOUT
+    ):
+        raise ValueError(f"greedy_tail resolve copies into an fp32 TILE token row {embedding.TOKEN_ROW_SHAPE}")
     if (
         gathered.dtype != ttnn.float32
         or gathered.layout != ttnn.ROW_MAJOR_LAYOUT
@@ -177,13 +183,13 @@ def resolve(gathered, tie_break, vocab_starts, *, memory_config=ttnn.DRAM_MEMORY
     _zero_bf16, zero_fp32 = prepare(mesh)
     token_row = fp.allocate(embedding.TOKEN_ROW_SHAPE, ttnn.float32, ttnn.TILE_LAYOUT, mesh, memory_config)
     core, one = _one_core(mesh)
-    tensors = [gathered, tie_break, vocab_starts, zero_fp32, token_row]
+    tensors = [gathered, tie_break, vocab_starts, zero_fp32, token_row, token_row if into is None else into]
     kernel = fp.reader_kernel(
         KERNELS["resolve"],
         one,
         [a for t in tensors for a in fp.accessor_args(t)],
         [(core, [t.buffer_address() for t in tensors])],
-        named={"cb_stage": CB_STAGE, "devices": devices},
+        named={"cb_stage": CB_STAGE, "devices": devices, "copy_into": 0 if into is None else 1},
     )
     fp.run_program(
         tensors,
@@ -230,15 +236,16 @@ def greedy_candidates_fused(lm_head, logits, *, values_by_gather: bool = False):
     )
 
 
-def resolve_greedy_on_device_fused(lm_head, candidates):
-    """``Qwen38TTNNLMHead.resolve_greedy_on_device`` with one gather of the packed rows and the resolve program; candidates
-    without a packed row (the chain's) take the chain."""
+def resolve_greedy_on_device_fused(lm_head, candidates, *, into=None):
+    """``Qwen38TTNNLMHead.resolve_greedy_on_device`` with one gather of the packed rows and the resolve program (which
+    also writes ``into``, the server's persistent token row, instead of a ttnn.copy); candidates without a packed row
+    (the chain's) take the chain."""
 
     from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import TensorPlacement
 
     embedding = _embedding()
     if getattr(candidates, "packed", None) is None:
-        return type(lm_head).resolve_greedy_on_device(lm_head, candidates)
+        return type(lm_head).resolve_greedy_on_device(lm_head, candidates, into=into)
     if candidates.rows != 1:
         raise TypeError("on-device greedy resolve requires single-token Qwen38GreedyCandidates")
     if candidates.vocab_ranges != lm_head.weights.vocab_ranges:
@@ -251,7 +258,7 @@ def resolve_greedy_on_device_fused(lm_head, candidates):
         candidates.packed, dim=3, cluster_axis=embedding.TP_AXIS, memory_config=ttnn.DRAM_MEMORY_CONFIG
     )
     lm_head.mesh_contract.validate_tensor(gathered, placement=TensorPlacement.REPLICATED)
-    token_row = resolve(gathered, constants.owner_tie_break, constants.lm_head_vocab_starts)
+    token_row = resolve(gathered, constants.owner_tie_break, constants.lm_head_vocab_starts, into=into)
     ttnn.deallocate(gathered)
     lm_head.mesh_contract.validate_tensor(token_row, placement=TensorPlacement.REPLICATED)
     return token_row

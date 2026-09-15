@@ -4,7 +4,10 @@
 """The fused-kernel foundation without a device: the registry and its switch, the rows contract, the work split, the
 kernel-source convention and the writer kernel's argument contract."""
 
+import inspect
 import re
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -139,3 +142,59 @@ def test_byte_tables_are_consistent():
         assert fp.TILE_BYTES[dtype] == elem * fp.TILE * fp.TILE
     assert fp.TILE == 32 and fp.FACE == 16 and fp.ROWS_MAX == 32
     assert ttnn.TILE_SIZE == fp.TILE
+
+
+def _reachable_sources(module: types.ModuleType, entry) -> dict[str, str]:
+    """Module-level functions reachable from ``entry`` by direct reference (``name(`` in the same module, or
+    ``alias.name(`` through a sibling fused module), with their sources."""
+
+    def functions(mod):
+        return {n: o for n, o in vars(mod).items() if inspect.isfunction(o) and o.__module__ == mod.__name__}
+
+    def siblings(mod):
+        return {
+            n: o
+            for n, o in vars(mod).items()
+            if isinstance(o, types.ModuleType) and o.__name__.startswith(fused.__name__)
+        }
+
+    out: dict[str, str] = {}
+    todo = [(module, entry.__name__)]
+    while todo:
+        mod, name = todo.pop()
+        key = f"{mod.__name__}.{name}"
+        funcs = functions(mod)
+        if key in out or name not in funcs:
+            continue
+        out[key] = src = inspect.getsource(funcs[name])
+        todo += [(mod, m) for m in funcs if re.search(rf"(?<![.\w]){m}\(", src)]
+        for alias, sib in siblings(mod).items():
+            todo += [(sib, m) for m in functions(sib) if f"{alias}.{m}(" in src]
+    return out
+
+
+def test_model_level_paths_read_mesh_tensors_per_device():
+    """Every ``ttnn.to_torch`` on a path a model-level entry can reach reads one device's shard (``for x in
+    ttnn.get_device_tensors(...)``) or passes a mesh composer: the 4-chip acceptance ON run of final_mixer at 10cdff7d8a
+    died in gr_read.noc_map on ``ttnn.to_torch(mesh tensor)`` -- a path the single-chip tests never execute."""
+
+    entries = []
+    for kernel in registry.kernels().values():
+        module = sys.modules[kernel.fused.__module__]
+        entries.append((module, kernel.fused))
+        entries += [
+            (module, o)
+            for n, o in vars(module).items()
+            if inspect.isfunction(o) and n.endswith("_fused") and o is not kernel.fused
+        ]
+    assert entries
+    checked = 0
+    for module, entry in entries:
+        for key, src in _reachable_sources(module, entry).items():
+            for match in re.finditer(r"ttnn\.to_torch\((\w+)", src):
+                checked += 1
+                arg = match.group(1)
+                call = src[match.start() : src.find("\n", match.start())]
+                per_device = re.search(rf"for {arg} in ttnn\.get_device_tensors\(", src)
+                assert per_device or "mesh_composer=" in call, (key, call.strip())
+    assert checked >= 2  # final_mixer.norm_scale_rows and gr_read.noc_map at least

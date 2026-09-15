@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import re
 from pathlib import Path
 
@@ -150,6 +151,54 @@ def _calls(function: ast.FunctionDef) -> list[str]:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr not in ("deallocate",)
     ]
     return [ast.unparse(node.func) for node in sorted(calls, key=lambda n: (n.lineno, n.col_offset))]
+
+
+ADVANCE_SOURCE = (fp.REPO_ROOT / pd.ADVANCE_KERNEL).read_text()
+CONTRACTS_SOURCE = Path(__file__).resolve().parents[1] / "ttnn" / "contracts.py"
+
+
+def test_advance_is_registered_and_is_the_chains_in_place_add():
+    entry = fused.kernel("position_advance")
+    assert entry.tolerance == fused.BITWISE and entry.gate is None and entry.default_on is False
+    assert entry.fused is pd.advance and entry.composed is pd.advance_composed
+    assert fused.resolve("position_advance", {}) is pd.advance_composed
+    assert fused.resolve("position_advance", {fused.ENV: "position_advance"}) is pd.advance
+    assert inspect.signature(pd.advance).parameters.keys() == inspect.signature(pd.advance_composed).parameters.keys()
+    used = sorted({int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d+)\)", ADVANCE_SOURCE)})
+    assert used == [0] and ADVANCE_SOURCE.count("TensorAccessorArgs<") == 1
+    named = set(re.findall(r'get_named_compile_time_arg_val\("([a-z_0-9]+)"\)', ADVANCE_SOURCE))
+    assert named == {"cb_stage", "count"}
+    source = inspect.getsource(pd.advance)
+    assert set(re.findall(r'"([a-z_0-9]+)": ', source.split("named={")[1].split("}")[0])) == named
+    assert "words[0] = words[0] + ADVANCE_COUNT;" in ADVANCE_SOURCE  # the uint32 add of the chain's ttnn.add(scalar, count)
+    assert "noc.async_write(stage, position, SCALAR_BYTES," in ADVANCE_SOURCE  # in place, the 4-byte page
+    assert "\n        [position, position]," in source  # the resident scalar is the input and the output (in place)
+    composed = inspect.getsource(pd.advance_composed)
+    assert "ttnn.add(position, count, memory_config=ttnn.DRAM_MEMORY_CONFIG)" in composed
+    assert "ttnn.copy(advanced, position)" in composed
+
+
+def test_advance_hook_is_pinned_in_contracts():
+    source = CONTRACTS_SOURCE.read_text()
+    assert "    _fused_advance: Any = field(default=None, repr=False, compare=False)" in source
+    assert 'if fused_kernels.enabled("position_advance"):' in source
+    assert 'fused_advance = fused_kernels.kernel("position_advance").fused' in source
+    assert "return cls(uploaded[0], uploaded[1], uploaded[2], mesh_device, mesh_contract, fused_advance)" in source
+    fused_branch = (
+        "        if self._fused_advance is not None:\n            self._advance_fused({})\n            return\n"
+    )
+    for method, count in (("advance", "1"), ("advance_by", "count")):
+        body = source[source.index(f"    def {method}(self") :]
+        body = body[: body.index("\n    def ", 1)]
+        assert fused_branch.format(count) in body, method  # the fused program first, the chain's add + copy kept
+        assert f"advanced = ttnn.add(self.scalar, {count}, memory_config=ttnn.DRAM_MEMORY_CONFIG)" in body, method
+        assert "copied = ttnn.copy(advanced, self.scalar)" in body and "ttnn.deallocate(advanced)" in body, method
+    fused_body = source[source.index("    def _advance_fused(self, count: int) -> None:") :]
+    fused_body = fused_body[: fused_body.index("    def advance_by(")]
+    assert "written = self._fused_advance(self.scalar, count)" in fused_body
+    assert 'raise RuntimeError("device position advance did not write the resident scalar in place")' in fused_body
+    manifest = json.loads((Path(__file__).resolve().parents[1] / "tools" / "release" / "manifest.json").read_text())
+    assert "ttnn/fused/position_derive/kernels/advance.cpp" in manifest["public"]
 
 
 def test_composed_is_the_model_bodys_derive_lines():

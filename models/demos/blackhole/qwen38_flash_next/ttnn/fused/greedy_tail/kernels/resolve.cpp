@@ -6,8 +6,11 @@
 // first maximum in owner order (ttnn.argmax's lowest index), the owner's id plus lm_head_vocab_starts[owner] (fp32
 // add, exact below 2^24), written as lane 0 of row 0 of an fp32 TILE [1,1,1,32] whose other lanes are 0.0 (the
 // chain's unit_column multiply).  The RISC's soft-float subtract and add are IEEE round-to-nearest-even, as the SFPU's.
-// Named compile-time args: cb_stage, devices.  Compile-time args: TensorAccessorArgs(gathered), (tie_break),
-// (vocab_starts), (zero fp32 tile), (token_row).  Runtime args: the five buffer addresses in that order.
+// With copy_into = 1 the same tile is also written to a second TOKEN_ROW tensor (the server's persistent token row:
+// the chain's ttnn.copy(token_row, token_row_io) after the resolve, as one more 4 KB write of this program).
+// Named compile-time args: cb_stage, devices, copy_into.  Compile-time args: TensorAccessorArgs(gathered),
+// (tie_break), (vocab_starts), (zero fp32 tile), (token_row), (into).  Runtime args: the six buffer addresses in
+// that order (into repeats token_row when copy_into = 0).
 
 #include <cstdint>
 
@@ -19,6 +22,7 @@
 
 constexpr uint32_t CB_STAGE = get_named_compile_time_arg_val("cb_stage");
 constexpr uint32_t DEVICES = get_named_compile_time_arg_val("devices");
+constexpr uint32_t COPY_INTO = get_named_compile_time_arg_val("copy_into");
 constexpr uint32_t FP32_TILE_BYTES = 4096;
 constexpr uint32_t GRAIN = 64;
 
@@ -28,11 +32,13 @@ void kernel_main() {
     constexpr auto a_starts = TensorAccessorArgs<a_tie.next_compile_time_args_offset()>();
     constexpr auto a_zero = TensorAccessorArgs<a_starts.next_compile_time_args_offset()>();
     constexpr auto a_token = TensorAccessorArgs<a_zero.next_compile_time_args_offset()>();
+    constexpr auto a_into = TensorAccessorArgs<a_token.next_compile_time_args_offset()>();
     const auto gathered = TensorAccessor(a_gathered, get_arg_val<uint32_t>(0));
     const auto tie = TensorAccessor(a_tie, get_arg_val<uint32_t>(1));
     const auto starts = TensorAccessor(a_starts, get_arg_val<uint32_t>(2));
     const auto zero = TensorAccessor(a_zero, get_arg_val<uint32_t>(3));
     const auto token = TensorAccessor(a_token, get_arg_val<uint32_t>(4));
+    const auto into = TensorAccessor(a_into, get_arg_val<uint32_t>(5));
 
     Noc noc;
     DataflowBuffer stage(CB_STAGE);
@@ -62,6 +68,9 @@ void kernel_main() {
     volatile tt_l1_ptr float* row = reinterpret_cast<volatile tt_l1_ptr float*>(base + STAGE_TILE);
     row[0] = id;  // lane (0, 0) of the token tile; the rest of the zero tile stays 0.0
     noc.async_write(stage, token, FP32_TILE_BYTES, {.offset_bytes = STAGE_TILE}, {.page_id = 0, .offset_bytes = 0});
+    if constexpr (COPY_INTO) {
+        noc.async_write(stage, into, FP32_TILE_BYTES, {.offset_bytes = STAGE_TILE}, {.page_id = 0, .offset_bytes = 0});
+    }
     noc.async_write_barrier();
     stage.push_back(1);
 }

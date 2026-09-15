@@ -37,6 +37,8 @@ view owns reused complete-block indices would make rejection cleanup unsafe.
 
 from __future__ import annotations
 
+import functools
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -272,6 +274,8 @@ class Qwen38TTNNDecoderLayer:
     fallback.
     """
 
+    _fused_apply_ple = None  # QWEN38_FUSED=ple binds ttnn/fused/ple's layer glue per instance; the body is the chain
+
     def __init__(
         self,
         *,
@@ -347,6 +351,13 @@ class Qwen38TTNNDecoderLayer:
         self.mlp_gr = mlp_gr
         self.expert_streamer = expert_streamer
         self.ple = ple
+        # QWEN38_FUSED=ple: the fused PLE body with the layer's output permute + residual add folded into its conv program.
+        from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_kernels
+
+        if ple is not None and fused_kernels.enabled("ple"):
+            from models.demos.blackhole.qwen38_flash_next.ttnn.fused import ple as fused_ple
+
+            self._fused_apply_ple = functools.partial(fused_ple.ple_layer_fused, self)
 
     def _validate_residual(self, residual, *, label: str) -> None:
         if (
@@ -808,6 +819,10 @@ class Qwen38TTNNDecoderLayer:
         prepared_ple: Qwen38TTNNPLEPreparedInput | None = None,
         release_input: bool = True,
     ) -> tuple[Any, Qwen38TTNNPLEState | None]:
+        if self._fused_apply_ple is not None:
+            return self._fused_apply_ple(
+                residual, state, token_id=token_id, prepared_ple=prepared_ple, release_input=release_input
+            )
         if self.ple is None:
             if prepared_ple is not None:
                 raise ValueError("prepared PLE input was supplied outside checkpoint layer 1")

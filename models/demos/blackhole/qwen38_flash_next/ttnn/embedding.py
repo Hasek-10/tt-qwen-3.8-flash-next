@@ -1913,8 +1913,9 @@ class Qwen38TTNNLMHead:
             raise RuntimeError("resolved greedy token is outside the pinned vocabulary")
         return tokens.reshape(1, 1, candidates.rows)
 
-    def resolve_greedy_on_device(self, candidates: Qwen38GreedyCandidates):
-        """Resolve the greedy token on device into one replicated token row.
+    def resolve_greedy_on_device(self, candidates: Qwen38GreedyCandidates, *, into=None):
+        """Resolve the greedy token on device into one replicated token row; ``into`` (a resident TOKEN_ROW) receives a
+        copy as the last op (the server's persistent token row; the fused greedy tail writes it from its program).
 
         Gathers the four (value, index) candidates, lowers owner ``d``'s value by
         ``d * GREEDY_TIE_BREAK_EPS`` in FP32 so equal maxima leave a unique maximum
@@ -2011,6 +2012,8 @@ class Qwen38TTNNLMHead:
             or token_row.layout != ttnn.TILE_LAYOUT
         ):
             raise RuntimeError(f"resolved token row must be FP32 TILE {TOKEN_ROW_SHAPE}, got {_metadata(token_row)}")
+        if into is not None:
+            ttnn.copy(token_row, into)
         return token_row
 
     def sampling_candidates(self, logits: Qwen38ShardedLogits, constants: Qwen38TTNNSamplingCandidateConstants):

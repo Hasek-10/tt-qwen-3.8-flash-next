@@ -440,6 +440,9 @@ class Qwen38TTNNDevicePosition:
     block_start_mask_row: Any
     mesh_device: Any = field(repr=False, compare=False)
     mesh_contract: Qwen38MeshContract = field(repr=False, compare=False)
+    # QWEN38_FUSED=position_advance binds ttnn/fused/position_derive.advance (P += count as one in-place program) in
+    # allocate(); None runs the chain's add + copy.
+    _fused_advance: Any = field(default=None, repr=False, compare=False)
 
     @classmethod
     def allocate(cls, mesh_device, mesh_contract: Qwen38MeshContract, *, position: int = 0) -> Qwen38TTNNDevicePosition:
@@ -465,7 +468,12 @@ class Qwen38TTNNDevicePosition:
             for tensor in uploaded:
                 ttnn.deallocate(tensor)
             raise
-        return cls(uploaded[0], uploaded[1], uploaded[2], mesh_device, mesh_contract)
+        from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_kernels
+
+        fused_advance = None
+        if fused_kernels.enabled("position_advance"):
+            fused_advance = fused_kernels.kernel("position_advance").fused
+        return cls(uploaded[0], uploaded[1], uploaded[2], mesh_device, mesh_contract, fused_advance)
 
     def reset(self, position: int) -> None:
         """Host write of ``P`` (outside any trace); the only host path into ``scalar``."""
@@ -481,6 +489,9 @@ class Qwen38TTNNDevicePosition:
     def advance(self) -> None:
         """In-trace ``P += 1``; must be the last op of the model body."""
 
+        if self._fused_advance is not None:
+            self._advance_fused(1)
+            return
         key = _tensor_key(self.scalar)
         advanced = ttnn.add(self.scalar, 1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         copied = ttnn.copy(advanced, self.scalar)
@@ -488,11 +499,22 @@ class Qwen38TTNNDevicePosition:
             raise RuntimeError("device position advance did not write the resident scalar in place")
         ttnn.deallocate(advanced)
 
+    def _advance_fused(self, count: int) -> None:
+        """``P += count`` as one in-place program (ttnn/fused/position_derive.advance), the chain's add + copy."""
+
+        key = _tensor_key(self.scalar)
+        written = self._fused_advance(self.scalar, count)
+        if _tensor_key(self.scalar) != key or (written is not None and _tensor_key(written) != key):
+            raise RuntimeError("device position advance did not write the resident scalar in place")
+
     def advance_by(self, count: int) -> None:
         """In-trace ``P += count`` (the prefill chunk's ``CHUNK_ROWS``); must be the last op of the chunk body."""
 
         if isinstance(count, bool) or type(count) is not int or count <= 0:
             raise ValueError(f"device position advance needs a positive int, got {count!r}")
+        if self._fused_advance is not None:
+            self._advance_fused(count)
+            return
         key = _tensor_key(self.scalar)
         advanced = ttnn.add(self.scalar, count, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         copied = ttnn.copy(advanced, self.scalar)

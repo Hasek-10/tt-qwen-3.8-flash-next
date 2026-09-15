@@ -254,8 +254,7 @@ class Qwen38SamplingChainExtension:
             raise RuntimeError("TAIL capture returned no logits")
         if self.sampler is None:
             candidates = self.lm_head.greedy_candidates(trace_output.logits)
-            trace_token_row = self.lm_head.resolve_greedy_on_device(candidates)
-            ttnn.copy(trace_token_row, token_row_io)
+            trace_token_row = self.lm_head.resolve_greedy_on_device(candidates, into=token_row_io)
             self.trace_rows.append(self.lm_head.sampling_candidates(trace_output.logits, self.constants))
             self.trace_logits.append(trace_output.logits)
             return candidates, trace_token_row

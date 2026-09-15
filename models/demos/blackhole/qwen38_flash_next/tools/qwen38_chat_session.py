@@ -1769,7 +1769,11 @@ class Qwen38TracedChain:
             if output.logits is None:
                 raise Qwen38ChatChainError(f"warm position {position} returned no logits")
             candidates = lm_head.greedy_candidates(output.logits)
-            resolved_row = lm_head.resolve_greedy_on_device(candidates)
+            # The plain greedy body's last op is the copy into the persistent token row, done by the resolve (its
+            # ``into``); an MTP body copies after the MTP row (below).  The warm run compiles the traced programs.
+            resolved_row = lm_head.resolve_greedy_on_device(
+                candidates, into=None if chain_mtp is not None else token_row_io
+            )
             synchronize()
             actual = state.position.read()
             if actual != position + 1:
@@ -1788,7 +1792,7 @@ class Qwen38TracedChain:
                     qsa_position=output.qsa_position,
                 )
                 chain_mtp.step_written = False
-            ttnn.copy(resolved_row, token_row_io)  # the body's last op: warm its program
+                ttnn.copy(resolved_row, token_row_io)  # the MTP body's last op: warm its program
             synchronize()
             resident_decode.require_token_row_holds(
                 token_row_io, resident_decode.host_token_row(resolved), label=f"warm position {position} row copy"
@@ -2043,8 +2047,7 @@ class Qwen38TracedChain:
             if trace_output.logits is None:
                 raise Qwen38ChatChainError("TAIL capture returned no logits")
             candidates = lm_head.greedy_candidates(trace_output.logits)
-            trace_token_row = lm_head.resolve_greedy_on_device(candidates)
-            ttnn.copy(trace_token_row, token_row_io)
+            trace_token_row = lm_head.resolve_greedy_on_device(candidates, into=token_row_io)
             return candidates, trace_token_row
 
         marker("before-chat-captures")

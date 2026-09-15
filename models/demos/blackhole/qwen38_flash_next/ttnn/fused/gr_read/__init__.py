@@ -81,6 +81,8 @@ def matmul_mode(environ=None) -> str:
     if mode not in MATMUL_MODES:
         raise ValueError(f"{MATMUL_ENV} must be one of {MATMUL_MODES}, got {mode!r}")
     return mode
+
+
 CONST_SCALER, CONST_COL_SCALAR, CONST_ZERO = 1, 2, 3
 
 
@@ -103,7 +105,9 @@ def avg_scaler(mode: str) -> tuple[int, object]:
 def residual_rows(residual) -> int:
     shape, padded = tuple(residual.shape), tuple(residual.padded_shape)
     if len(shape) != 4 or shape[:2] != (1, BRANCHES) or shape[3] != LOCAL_HIDDEN or padded[2] != TILE:
-        raise ValueError(f"GR residual must be [1, {BRANCHES}, 1..{TILE}, {LOCAL_HIDDEN}] padded to one row tile, got {shape}")
+        raise ValueError(
+            f"GR residual must be [1, {BRANCHES}, 1..{TILE}, {LOCAL_HIDDEN}] padded to one row tile, got {shape}"
+        )
     if residual.layout != ttnn.TILE_LAYOUT or residual.dtype != BF16:
         raise ValueError("GR residual must be TILE bfloat16")
     return shape[2]
@@ -111,7 +115,9 @@ def residual_rows(residual) -> int:
 
 def _expect(tensor, shape: tuple[int, ...], dtype, label: str) -> None:
     if tuple(tensor.shape) != shape or tensor.dtype != dtype or tensor.layout != ttnn.TILE_LAYOUT:
-        raise ValueError(f"{label} must be TILE {dtype} {shape}, got {tensor.layout} {tensor.dtype} {tuple(tensor.shape)}")
+        raise ValueError(
+            f"{label} must be TILE {dtype} {shape}, got {tensor.layout} {tensor.dtype} {tuple(tensor.shape)}"
+        )
 
 
 def _tiles_wide(tensor) -> int:
@@ -152,7 +158,14 @@ def _writer(cores, streams, runtime):
         cores,
         compile_args,
         [
-            (core, [a for (tensor, _), (count, first, stride, batch) in zip(streams, per_stream) for a in (tensor.buffer_address(), count, first, stride, batch)])
+            (
+                core,
+                [
+                    a
+                    for (tensor, _), (count, first, stride, batch) in zip(streams, per_stream)
+                    for a in (tensor.buffer_address(), count, first, stride, batch)
+                ],
+            )
             for core, per_stream in runtime
         ],
     )
@@ -226,7 +239,9 @@ def normalize(residual, gathered_stats, norm_scale, *, scaler_mode: str = "chain
             for w in work
         ],
     )
-    compute = fp.compute_kernel(NORM, cores, [HIDDEN_TILES, STATS_TILES, 4, 16], fp32_dest=True, unpack_to_dest_fp32=(4, 7))
+    compute = fp.compute_kernel(
+        NORM, cores, [HIDDEN_TILES, STATS_TILES, 4, 16], fp32_dest=True, unpack_to_dest_fp32=(4, 7)
+    )
     writer = _writer(cores, [(out, 16)], [(w.core, [(HIDDEN_TILES, w.start * HIDDEN_TILES, 1, 4)]) for w in work])
     return fp.run_program(
         [residual, gathered_stats, norm_scale, out], fp.program_descriptor([reader, compute, writer], cbs=cbs)
@@ -258,12 +273,20 @@ def down_project(normalized, down_inject, *, matmul: str = "chain"):
         [
             (
                 w.core,
-                ([_stream(normalized, 1, FLAT_TILES, 0, 1, 0, blk), _stream(down_inject, 1, FLAT_TILES, w.start, n_tiles, 0, blk)], []),
+                (
+                    [
+                        _stream(normalized, 1, FLAT_TILES, 0, 1, 0, blk),
+                        _stream(down_inject, 1, FLAT_TILES, w.start, n_tiles, 0, blk),
+                    ],
+                    [],
+                ),
             )
             for w in work
         ],
     )
-    compute = fp.compute_kernel(DOWN, cores, [FLAT_TILES, blk, 0, 1, 16, DOWN_SPILL if matmul == "chain" else 0, 2], fp32_dest=True)
+    compute = fp.compute_kernel(
+        DOWN, cores, [FLAT_TILES, blk, 0, 1, 16, DOWN_SPILL if matmul == "chain" else 0, 2], fp32_dest=True
+    )
     writer = _writer(cores, [(out, 16)], [(w.core, [(1, w.start, 1, 1)]) for w in work])
     return fp.run_program([normalized, down_inject, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
 
@@ -296,7 +319,10 @@ def low_rank(gathered_partials):
         cores,
         [(gathered_partials, 0)],
         [(CONST_ZERO, 1)],
-        [(w.core, ([_stream(gathered_partials, t, TP_SIZE, w.start * t, PARTIAL_TILES, 1, TP_SIZE)], [0])) for w in work],
+        [
+            (w.core, ([_stream(gathered_partials, t, TP_SIZE, w.start * t, PARTIAL_TILES, 1, TP_SIZE)], [0]))
+            for w in work
+        ],
     )
     computes = [
         fp.compute_kernel(LOWRANK, plain, [t, TP_SIZE, t, 16, 17], fp32_dest=True),
@@ -367,21 +393,42 @@ def gate(low_rank_row, normalized, up, *, matmul: str = "chain", debug: bool = F
     )
     if not debug:
         writer = _writer(cores, [(out, 16)], [(w.core, [(1, w.start, 1, 1)]) for w in work])
-        return fp.run_program([low_rank_row, normalized, up, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
+        return fp.run_program(
+            [low_rank_row, normalized, up, out], fp.program_descriptor([reader, compute, writer], cbs=cbs)
+        )
     up_tiles = fp.allocate((1, BRANCHES, rows, LOCAL_HIDDEN), BF16, ttnn.TILE_LAYOUT, mesh)
     gated = fp.allocate((1, BRANCHES, rows, LOCAL_HIDDEN), BF16, ttnn.TILE_LAYOUT, mesh)
     writer = _writer(
         cores,
         [(out, 16), (up_tiles, 4), (gated, 6)],
-        [(w.core, [(1, w.start, 1, 1), (BRANCHES, w.start, HIDDEN_TILES, BRANCHES), (BRANCHES, w.start, HIDDEN_TILES, BRANCHES)]) for w in work],
+        [
+            (
+                w.core,
+                [
+                    (1, w.start, 1, 1),
+                    (BRANCHES, w.start, HIDDEN_TILES, BRANCHES),
+                    (BRANCHES, w.start, HIDDEN_TILES, BRANCHES),
+                ],
+            )
+            for w in work
+        ],
     )
-    fp.run_program([low_rank_row, normalized, up, out, up_tiles, gated], fp.program_descriptor([reader, compute, writer], cbs=cbs))
+    fp.run_program(
+        [low_rank_row, normalized, up, out, up_tiles, gated], fp.program_descriptor([reader, compute, writer], cbs=cbs)
+    )
     return out, up_tiles, gated
 
 
+class NocMapMismatch(RuntimeError):
+    """The mesh's devices map logical cores to different NoC coordinates: one program descriptor (one runtime-argument
+    set, replicated to every device) cannot carry the multicast rectangles, so the merged forms cannot run on it."""
+
+
 def noc_map(mesh) -> dict[tuple[int, int], tuple[int, int]]:
-    """Logical compute core -> its NoC-0 coordinates, measured once per device by a probe program (Python has no
-    logical-to-NoC binding; the dispatcher's coordinate virtualization decides the mapping)."""
+    """Logical compute core -> its NoC-0 coordinates, measured once per mesh by a probe program (Python has no
+    logical-to-NoC binding; the dispatcher's coordinate virtualization decides the mapping).  Every device of the mesh
+    runs the probe; the maps must agree (the 4-chip acceptance ON run at 10cdff7d8a failed here on ttnn.to_torch of the
+    mesh tensor, which needs a per-device readback)."""
 
     key = id(mesh)
     if key not in _NOC_MAPS:
@@ -389,11 +436,23 @@ def noc_map(mesh) -> dict[tuple[int, int], tuple[int, int]]:
         cores = [ttnn.CoreCoord(x, y) for x in range(grid.x) for y in range(grid.y)]
         out = fp.allocate((1, 1, TILE, TILE * len(cores)), ttnn.uint32, ttnn.TILE_LAYOUT, mesh)
         core_set = _core_set(cores)
-        probe = fp.writer_kernel(NOC_PROBE, core_set, fp.accessor_args(out), [(c, [out.buffer_address(), i]) for i, c in enumerate(cores)])
-        fp.run_program([out, out], fp.program_descriptor([probe], cbs=[fp.cb_descriptor(0, ttnn.uint32, fp.TILE_BYTES[ttnn.uint32], 1, core_set)]))
-        words = ttnn.to_torch(out).reshape(TILE, len(cores), TILE)[0]  # row 0 of each tile: words 0..3
-        _NOC_MAPS[key] = {(c.x, c.y): (int(words[i, 0]), int(words[i, 1])) for i, c in enumerate(cores)}
+        probe = fp.writer_kernel(
+            NOC_PROBE, core_set, fp.accessor_args(out), [(c, [out.buffer_address(), i]) for i, c in enumerate(cores)]
+        )
+        fp.run_program(
+            [out, out],
+            fp.program_descriptor(
+                [probe], cbs=[fp.cb_descriptor(0, ttnn.uint32, fp.TILE_BYTES[ttnn.uint32], 1, core_set)]
+            ),
+        )
+        maps = []
+        for shard in ttnn.get_device_tensors(out):  # one probe tile per device of the mesh
+            words = ttnn.to_torch(shard).reshape(TILE, len(cores), TILE)[0]  # row 0 of each tile: words 0..3
+            maps.append({(c.x, c.y): (int(words[i, 0]), int(words[i, 1])) for i, c in enumerate(cores)})
         ttnn.deallocate(out)
+        if any(m != maps[0] for m in maps[1:]):
+            raise NocMapMismatch(f"logical-to-NoC maps differ across the {len(maps)} devices of the mesh")
+        _NOC_MAPS[key] = maps[0]
     return _NOC_MAPS[key]
 
 
@@ -402,7 +461,9 @@ def _rectangle(mesh, width: int, height: int, *, rows_above: int):
 
     grid = mesh.compute_with_storage_grid_size()
     if grid.x < max(width, rows_above) or grid.y < height + 1:
-        raise RuntimeError(f"compute grid {grid.x}x{grid.y} cannot hold {width}x{height} consumers and {rows_above} producers")
+        raise RuntimeError(
+            f"compute grid {grid.x}x{grid.y} cannot hold {width}x{height} consumers and {rows_above} producers"
+        )
     consumers = [ttnn.CoreCoord(x, y) for x in range(width) for y in range(height)]
     producers = [ttnn.CoreCoord(x, height) for x in range(rows_above)]
     noc = noc_map(mesh)
@@ -451,13 +512,29 @@ def _mcast_writer(cores, runtime, *, src_cb, dst_cb, tiles, tiles_tensor=None, e
 def _mcast_reader(cores, streams, runtime, *, recv_cb, recv_tiles, senders, zero_cb=NONE_CB, sem=0):
     """streams: [(tensor, cb)] (<= 2, each CB holds its whole stream); runtime: per core -> stream arg lists."""
 
-    compile_args = [recv_cb, recv_tiles, senders, sem, len(streams), *[cb for _, cb in streams], *[0] * (2 - len(streams)), zero_cb]
+    compile_args = [
+        recv_cb,
+        recv_tiles,
+        senders,
+        sem,
+        len(streams),
+        *[cb for _, cb in streams],
+        *[0] * (2 - len(streams)),
+        zero_cb,
+    ]
     for slot in range(2):
         compile_args += fp.accessor_args(streams[min(slot, len(streams) - 1)][0])
-    return fp.reader_kernel(MCAST_READER, cores, compile_args, [(core, [a for args in stream_args for a in args]) for core, stream_args in runtime])
+    return fp.reader_kernel(
+        MCAST_READER,
+        cores,
+        compile_args,
+        [(core, [a for args in stream_args for a in args]) for core, stream_args in runtime],
+    )
 
 
-def normalize_down(residual, gathered_stats, norm_scale, down_inject, *, scaler_mode: str = "chain", matmul: str = "chain"):
+def normalize_down(
+    residual, gathered_stats, norm_scale, down_inject, *, scaler_mode: str = "chain", matmul: str = "chain"
+):
     """Stages 2a+2b as one program: the four norm cores multicast the normalized row into the twelve matmul cores'
     CB (and write it for stage 3) while those cores prefetch their weight column."""
 
@@ -506,7 +583,9 @@ def normalize_down(residual, gathered_stats, norm_scale, down_inject, *, scaler_
             for b, core in enumerate(producers)
         ],
     )
-    norm = fp.compute_kernel(NORM, p_set, [HIDDEN_TILES, STATS_TILES, 4, 16], fp32_dest=True, unpack_to_dest_fp32=(4, 7))
+    norm = fp.compute_kernel(
+        NORM, p_set, [HIDDEN_TILES, STATS_TILES, 4, 16], fp32_dest=True, unpack_to_dest_fp32=(4, 7)
+    )
     sender = _mcast_writer(
         p_set,
         [(core, (b * HIDDEN_TILES, rect, (b * HIDDEN_TILES, 1), (0, 0, 1, 1))) for b, core in enumerate(producers)],
@@ -523,11 +602,15 @@ def normalize_down(residual, gathered_stats, norm_scale, down_inject, *, scaler_
         recv_tiles=FLAT_TILES,
         senders=BRANCHES,
     )
-    down = fp.compute_kernel(DOWN, w_set, [FLAT_TILES, 8, 8, 9, 17, DOWN_SPILL if matmul == "chain" else 0, 10], fp32_dest=True)
+    down = fp.compute_kernel(
+        DOWN, w_set, [FLAT_TILES, 8, 8, 9, 17, DOWN_SPILL if matmul == "chain" else 0, 10], fp32_dest=True
+    )
     writer = _writer(w_set, [(partial, 17)], [(core, [(1, w, 1, 1)]) for w, core in enumerate(workers)])
     fp.run_program(
         [residual, gathered_stats, norm_scale, down_inject, normalized, partial],
-        fp.program_descriptor([reader, norm, sender, receiver, down, writer], cbs=cbs, semaphores=[fp.semaphore_descriptor(0, all_set)]),
+        fp.program_descriptor(
+            [reader, norm, sender, receiver, down, writer], cbs=cbs, semaphores=[fp.semaphore_descriptor(0, all_set)]
+        ),
     )
     return normalized, partial
 
@@ -575,7 +658,10 @@ def low_rank_gate(gathered_partials, normalized, up, *, matmul: str = "chain"):
         p_set,
         [(gathered_partials, 0)],
         [(CONST_ZERO, 1)],
-        [(core, ([_stream(gathered_partials, t, TP_SIZE, c * t, PARTIAL_TILES, 1, TP_SIZE)], [0])) for c, core in enumerate(producers)],
+        [
+            (core, ([_stream(gathered_partials, t, TP_SIZE, c * t, PARTIAL_TILES, 1, TP_SIZE)], [0]))
+            for c, core in enumerate(producers)
+        ],
     )
     computes = [
         fp.compute_kernel(LOWRANK, plain_set, [t, TP_SIZE, t, 16, 17], fp32_dest=True),
@@ -627,7 +713,11 @@ def low_rank_gate(gathered_partials, normalized, up, *, matmul: str = "chain"):
     writer = _writer(w_set, [(block, 18)], [(core, [(1, j, 1, 1)]) for j, core in enumerate(workers)])
     fp.run_program(
         [gathered_partials, normalized, up, block, injection],
-        fp.program_descriptor([reader, *computes, *senders, receiver, gate_k, writer], cbs=cbs, semaphores=[fp.semaphore_descriptor(0, all_set)]),
+        fp.program_descriptor(
+            [reader, *computes, *senders, receiver, gate_k, writer],
+            cbs=cbs,
+            semaphores=[fp.semaphore_descriptor(0, all_set)],
+        ),
     )
     return block, injection
 
@@ -642,11 +732,18 @@ def _topology(module, tensor, shard_dim: int | None) -> None:
     """Record the placement the chain's ops would have given ``tensor`` (generic_op leaves the allocation's)."""
 
     reference = module.weights.replicated_anchor.tensor_topology()
-    placements = [ttnn.PlacementReplicate(), ttnn.PlacementReplicate() if shard_dim is None else ttnn.PlacementShard(shard_dim)]
-    tensor.update_tensor_topology(ttnn.TensorTopology(reference.distribution_shape(), placements, reference.mesh_coords()))
+    placements = [
+        ttnn.PlacementReplicate(),
+        ttnn.PlacementReplicate() if shard_dim is None else ttnn.PlacementShard(shard_dim),
+    ]
+    tensor.update_tensor_topology(
+        ttnn.TensorTopology(reference.distribution_shape(), placements, reference.mesh_coords())
+    )
 
 
-def gr_read_fused(module, residual, *, scaler_mode: str = "chain", merged: bool | None = None, matmul: str | None = None):
+def gr_read_fused(
+    module, residual, *, scaler_mode: str = "chain", merged: bool | None = None, matmul: str | None = None
+):
     """The model-level read: the fused programs around the chain's two collectives; returns (block input, state).
     ``merged`` (default: the QWEN38_FUSED_GR_READ_MERGED environment switch) runs normalize+down and low_rank+gate as
     one program each."""

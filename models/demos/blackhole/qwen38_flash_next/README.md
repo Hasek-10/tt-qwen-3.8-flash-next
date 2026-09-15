@@ -25,7 +25,7 @@ This was implemented with the intention of the n-gram model residing in system m
 | path | measured | notes |
 |---|---|---|
 | prompt prefill | 300 tok/s (and climbing); 650 tok/s with `--long-chunks`; 1,150 tok/s with `--prefill-slab 2048` | 32-token chunk trace, 3.0-3.5 ms per prompt token, flat from 2k to 261k tokens; 128-token chunks at 1.45-1.56 ms per prompt token (`--long-chunks`); 2,048-row slabs at 0.87-1.08 ms per prompt token (`--prefill-slab 2048`, 2026-09-09, tolerance class: see `docs/PREFILL.md`) |
-| decode, one stream | 23.7 tok/s | position-generic traced decode, 42.2 ms per token, flat with depth; 7 decode chains run as fused programs by default (2026-09-15, bitwise: `docs/NUMERICS.md`) |
+| decode, one stream | 23.7 tok/s | position-generic traced decode, 42.1 ms per token, flat with depth; 8 decode chains run as fused programs by default (2026-09-15, bitwise: `docs/NUMERICS.md`) |
 | decode with MTP (`--mtp 4`) | 37 tok/s aggregate, 55 tok/s on structured output | speculative drafting with exact acceptance: the committed stream leaves the CPU reference at the same token as greedy decode on 8 of the 12 acceptance prompts and at a different token on the other 4 (section 6, `docs/NUMERICS.md`) |
 | contexts | 32k, 64k, 128k, 256k | 256k is single-user; MTP fits at 32k, 64k and 128k |
 | correctness | bitwise repeatable; 96/96 greedy token match against the CPU reference on the acceptance prompt | chunked prefill is tolerance-class against the CPU reference on all 48 layers |

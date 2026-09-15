@@ -69,7 +69,7 @@ def test_registered_bitwise():
     [
         ("scan", gt.SCAN_ARGS, 2, {"cb_stage", "lanes_per_tile"}),
         ("merge", gt.MERGE_ARGS, 5, {"cb_stage", "cores"}),
-        ("resolve", gt.RESOLVE_ARGS, 5, {"cb_stage", "devices"}),
+        ("resolve", gt.RESOLVE_ARGS, 6, {"cb_stage", "devices", "copy_into"}),
     ],
 )
 def test_kernel_arg_contracts(kernel, runtime_args, tensors, named):
@@ -89,7 +89,7 @@ def test_python_side_named_args_match_the_kernels():
             "merge",
             {"cb_stage", "cores"},
         ),
-        ("resolve", {"cb_stage", "devices"}),
+        ("resolve", {"cb_stage", "devices", "copy_into"}),
     ):
         block = source.split(f'KERNELS["{kernel}"]')[1].split("named={")[1].split("}")[0]
         assert set(re.findall(r'"([a-z_0-9]+)":', block)) == expected, kernel
@@ -174,7 +174,36 @@ def test_fused_resolve_gathers_once_along_the_tp_axis():
     assert source.count("ttnn.all_gather(") == 1 and "dim=3, cluster_axis=embedding.TP_AXIS" in source
     assert 'raise RuntimeError("on-device greedy resolve requires Linear topology")' in source
     assert "placement=TensorPlacement.LOCAL_PARTIAL" in source and "placement=TensorPlacement.REPLICATED" in source
-    assert "return type(lm_head).resolve_greedy_on_device(lm_head, candidates)" in source  # chain candidates: chain
+    assert "return type(lm_head).resolve_greedy_on_device(lm_head, candidates, into=into)" in source  # chain candidates
+
+
+def test_token_copy_is_the_resolves_second_write():
+    """The server's ttnn.copy(token_row, token_row_io) after the resolve is the resolve program's second 4 KB write
+    (``into``); the chain method copies after its own resolve; the MTP body keeps its copy after the MTP row."""
+
+    assert "if constexpr (COPY_INTO) {" in SOURCES["resolve"] and SOURCES["resolve"].count("noc.async_write(") == 2
+    assert gt.RESOLVE_ARGS[-1] == "into_addr" and len(gt.RESOLVE_ARGS) == 6
+    source = inspect.getsource(gt.resolve)
+    assert "token_row if into is None else into]" in source and '"copy_into": 0 if into is None else 1' in source
+    chain = _method_source("Qwen38TTNNLMHead", "resolve_greedy_on_device")
+    assert "def resolve_greedy_on_device(self, candidates: Qwen38GreedyCandidates, *, into=None):" in chain
+    assert chain.rstrip().endswith("if into is not None:\n        ttnn.copy(token_row, into)\n    return token_row")
+    session = (HERE / "tools" / "qwen38_chat_session.py").read_text()
+    epilogue = session[
+        session.index("        def capture_epilogue(trace_output: Any)") : session.index(
+            '        marker("before-chat-captures")'
+        )
+    ]
+    assert epilogue.count("lm_head.resolve_greedy_on_device(candidates, into=token_row_io)") == 1
+    assert epilogue.count("ttnn.copy(trace_token_row, token_row_io)") == 1  # the MTP body's copy after the MTP row
+    assert epilogue.index("ttnn.copy(trace_token_row, token_row_io)") < epilogue.index("into=token_row_io")
+    start = session.index("            resolved_row = lm_head.resolve_greedy_on_device(")
+    warm = session[
+        start : session.index("            synchronize()\n            actual = state.position.read()", start)
+    ]
+    assert "into=None if chain_mtp is not None else token_row_io" in warm  # the warm body compiles the traced program
+    sampling = (HERE / "tools" / "qwen38_sampling_step.py").read_text()
+    assert sampling.count("self.lm_head.resolve_greedy_on_device(candidates, into=token_row_io)") == 1
 
 
 def test_lm_head_hook_and_dataclass_field_are_pinned():

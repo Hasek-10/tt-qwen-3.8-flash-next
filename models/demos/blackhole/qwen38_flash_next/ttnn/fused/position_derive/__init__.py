@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
-"""``position_derive``: the decode step's position-derived tensors as one program.  From the uint32 position ``P``
+"""``position_derive``: the decode step's position-derived tensors as one program; ``position_advance`` (this module's
+second kernel, ``advance.cpp``): the step's closing ``P += 1`` as one in-place program.  From the uint32 position ``P``
 (``[1,1,1,1]`` ROW_MAJOR): the two uint32 index rows (``P`` and ``P & ~3`` in 32 lanes), the four RoPE rows (cos/sin
 table rows ``P`` and ``P & ~3``) and the nine QSA inputs of ``derive_qsa_position_inputs`` -- the chain's 40 programs
 (two uint32 row ops, four ``embedding`` gathers, 33 integer / 0-1 mask ops).
@@ -26,6 +27,9 @@ NAME = "position_derive"
 TILE = fp.TILE
 ROPE_DIM = 64
 KERNEL = fp.kernel_source(NAME, "derive.cpp")
+ADVANCE_NAME = "position_advance"
+ADVANCE_KERNEL = fp.kernel_source(NAME, "advance.cpp")
+ADVANCE_STAGE_BYTES = 64  # the scalar page's DRAM read grain
 CB_STAGE = 0
 STAGE_PAGE_BYTES = 2048
 STAGE_PAGES = 24  # >= the kernel's STAGE_BYTES (bf16 row 16 KB + uint32 row 8.3 KB + 2 tiles + rows + scalars)
@@ -276,6 +280,52 @@ def derive_composed(model, state):
     rope = model.rope_table.rows(index_row, block_start_row)
     _deallocate_unique(index_row, block_start_row)
     return rope, _qsa().derive_qsa_position_inputs(state.position.scalar, model.qsa_position_constants)
+
+
+def advance(position, count: int = 1):
+    """``Qwen38TTNNDevicePosition.advance`` / ``advance_by`` as one program: ``P += count`` in place on the resident
+    uint32 scalar (the chain's ``ttnn.add`` into a fresh tensor + in-place ``ttnn.copy``).  Returns the scalar."""
+
+    if isinstance(count, bool) or type(count) is not int or count <= 0:
+        raise ValueError(f"position advance needs a positive int, got {count!r}")
+    _expect(position, (1, 1, 1, 1), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, "position")
+    mesh = position.device()
+    core = ttnn.CoreCoord(0, 0)
+    one = ttnn.CoreRangeSet([ttnn.CoreRange(core, core)])
+    kernel = fp.reader_kernel(
+        ADVANCE_KERNEL,
+        one,
+        fp.accessor_args(position),
+        [(core, [position.buffer_address()])],
+        named={"cb_stage": CB_STAGE, "count": count},
+    )
+    fp.run_program(  # generic_op wants an input and an output: the resident scalar is both (read, then written)
+        [position, position],
+        fp.program_descriptor([kernel], cbs=[fp.cb_descriptor(CB_STAGE, ttnn.uint32, ADVANCE_STAGE_BYTES, 1, one)]),
+    )
+    return position
+
+
+def advance_composed(position, count: int = 1):
+    """The chain's two programs (contracts.py ``advance`` / ``advance_by``): add into a fresh tensor, copy back."""
+
+    advanced = ttnn.add(position, count, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    ttnn.copy(advanced, position)
+    ttnn.deallocate(advanced)
+    return position
+
+
+register(
+    FusedKernel(
+        name=ADVANCE_NAME,
+        replaces="Qwen38TTNNDevicePosition.advance / advance_by: ttnn.add + in-place ttnn.copy (2 programs per decode step "
+        "and per prefill chunk)",
+        tolerance=BITWISE,
+        fused=advance,
+        composed=advance_composed,
+        gate=None,  # the device test (P sweep, counts, trace replay) against the chain's two ops is the component gate
+    )
+)
 
 
 register(

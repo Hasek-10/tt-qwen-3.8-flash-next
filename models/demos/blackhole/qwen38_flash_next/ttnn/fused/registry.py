@@ -35,6 +35,7 @@ DEFAULT_ON: frozenset[str] = frozenset(
         "gr_write",
         "greedy_tail",
         "moe_post",
+        "ple",
         "position_derive",
         "qsa_index_tail",
         "qsa_main_tail",

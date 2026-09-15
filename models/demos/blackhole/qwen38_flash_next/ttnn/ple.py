@@ -16,6 +16,8 @@ and ordering semantics before asynchronous host prefetch is introduced.
 
 from __future__ import annotations
 
+import functools
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -676,6 +678,8 @@ class Qwen38ResidentPLELookup:
 class Qwen38TTNNPLE:
     """Synchronous global-B1 PLE decode for zero-based language layer one."""
 
+    _fused_forward_prepared = None  # QWEN38_FUSED=ple binds ttnn/fused/ple per instance; the body is the chain
+
     def __init__(
         self,
         mesh_device,
@@ -703,6 +707,11 @@ class Qwen38TTNNPLE:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
+        # QWEN38_FUSED=ple: the fused device body (ttnn/fused/ple) binds at construction; forward_prepared's chain stays.
+        from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_kernels
+
+        if fused_kernels.enabled("ple"):
+            self._fused_forward_prepared = functools.partial(fused_kernels.kernel("ple").fused, self)
 
     def allocate_state(self) -> Qwen38TTNNPLEState:
         return Qwen38TTNNPLEState.allocate(self.mesh_device, self.mesh_contract)
@@ -857,7 +866,8 @@ class Qwen38TTNNPLE:
         state: Qwen38TTNNPLEState,
     ) -> Qwen38TTNNPLEResult:
         """Run only device PLE work while retaining the persistent prepared row."""
-
+        if self._fused_forward_prepared is not None:
+            return self._fused_forward_prepared(residual, prepared, state)
         self._validate_residual(residual, label="PLE residual input")
         state.validate()
         if not isinstance(prepared, Qwen38TTNNPLEPreparedInput) or not prepared.active:

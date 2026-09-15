@@ -351,10 +351,9 @@ def test_logprobs_fields_and_the_content_item_shape() -> None:
 
 def test_chain_extension_runs_the_greedy_epilogue_unchanged_before_the_row() -> None:
     body = inspect.getsource(step.Qwen38SamplingChainExtension.capture_epilogue)
-    greedy = (
+    greedy = (  # the resolve writes the persistent token row itself (into=): the greedy epilogue's last op
         "greedy_candidates(trace_output.logits)",
-        "resolve_greedy_on_device(candidates)",
-        "ttnn.copy(trace_token_row, token_row_io)",
+        "resolve_greedy_on_device(candidates, into=token_row_io)",
     )
     positions = [body.index(fragment) for fragment in greedy]
     assert positions == sorted(positions) and body.index("sampling_candidates(") > positions[-1]
@@ -593,7 +592,8 @@ def test_device_sampler_epilogue_runs_after_the_row_and_the_host_branch_is_uncha
     host_branch, device_branch = body.split("if self.sampler is None:")[1].split(
         "return candidates, trace_token_row", 1
     )
-    assert "resolve_greedy_on_device(candidates)" in host_branch and "sample_on_device" not in host_branch
+    assert "resolve_greedy_on_device(candidates, into=token_row_io)" in host_branch  # the greedy row lands in place
+    assert "sample_on_device" not in host_branch and "ttnn.copy(" not in host_branch
     order = [
         device_branch.index(f)
         for f in (
