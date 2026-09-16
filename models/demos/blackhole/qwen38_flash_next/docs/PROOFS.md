@@ -77,8 +77,8 @@ with 256k allocated context.  The `qb2` route derived as `[0, 1, 2, 3]`.
 
 ## What the other profiles have
 
-- `bh-loudbox` (Blackhole LoudBox, 4x p150 in one line): the README's numbers were measured on 4x p150 hosts (the
+- `p150-line` (4x p150 in one host, ethernet line): the README's numbers were measured on 4x p150 hosts (the
   performance table of 2026-09-04, the pinned divergence tables of 2026-09-06 in `NUMERICS.md`, the conversion rate of
-  2026-09-05 above); a fresh-clone run of the form recorded above for the QuietBox is not recorded for a LoudBox.
+  2026-09-05 above); a fresh-clone run of the form recorded above for the QuietBox is not recorded for a p150 line.
 - `qb2` (QuietBox 2, 2x p300c): the contributor's run of 2026-09-07 above; the route it derived, `[0, 1, 2, 3]`, is
   recorded there and not yet pinned in the profile.

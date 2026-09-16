@@ -61,7 +61,7 @@ def test_validate_only_runs_the_interpreter_from_the_repository_root_wherever_it
         run = run_launcher(
             cwd,
             "--profile",
-            "bh-loudbox",
+            "p150-line",
             "--checkpoint",
             os.path.relpath(checkpoint, cwd),
             "--cache-root",

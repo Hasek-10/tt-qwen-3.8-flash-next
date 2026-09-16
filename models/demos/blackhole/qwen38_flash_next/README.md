@@ -12,7 +12,7 @@ its caches.  Nothing else is required: no prebuilt archive, no pinned binary, no
 | hardware | profile | status |
 |---|---|---|
 | QuietBox, 4x p150c (fw 19.4.1.0) | `tt-quietbox` | verified 2026-09-04: startup acceptance 96/96 tokens against the CPU, 19.6 tokens/s at 32k context; `docs/PROOFS.md`: the fresh-clone proof of 2026-09-06 |
-| Blackhole LoudBox, 4x p150 (one line) | `bh-loudbox` | section 9: what was verified and where |
+| 4x p150 in one host, ethernet line | `p150-line` | section 9: what was verified and where |
 | QuietBox 2, 2x p300c (4 dies) | `qb2` | **untested**: designed from the p300 ring topology, should run fine |
 
 Every number below was measured on 4x p150.
@@ -32,8 +32,8 @@ This was implemented with the intention of the n-gram model residing in system m
 
 ## 1. What you need
 
-- Four Blackhole chips in one host as one 1x4 mesh: a QuietBox (4x p150c in an ethernet ring), a Blackhole LoudBox
-  (4x p150 in an ethernet line), or four chips of a larger host (`--devices`).  tt-kmd and the firmware bundle the
+- Four Blackhole chips in one host as one 1x4 mesh: a QuietBox (4x p150c in an ethernet ring), four p150 cards
+  in one host as an ethernet line, or four chips of a larger host (`--devices`).  tt-kmd and the firmware bundle the
   chips shipped with (19.4.1.0 or later).
 - This repository, built (section 2).  It is tt-metal main `28238f903b` (2026-09-06; the previous base `d04395ed86`
   of 2026-08-29 was merged forward, the device token streams are bitwise the same) plus the runtime fixes the model
@@ -110,7 +110,7 @@ Then the server:
     models/demos/blackhole/qwen38_flash_next/tools/run_qwen38_chat_server.sh --profile tt-quietbox \
         --checkpoint /data/Qwen3.8-Flash-Next --cache-root /data/qwen38-cache --acceptance
 
-    models/demos/blackhole/qwen38_flash_next/tools/run_qwen38_chat_server.sh --profile bh-loudbox \
+    models/demos/blackhole/qwen38_flash_next/tools/run_qwen38_chat_server.sh --profile p150-line \
         --checkpoint /data/Qwen3.8-Flash-Next --cache-root /data/qwen38-cache --acceptance
 
 (`tools/` is `models/demos/blackhole/qwen38_flash_next/tools/`.)  The launcher prints the checkout it runs from (commit,
@@ -137,19 +137,19 @@ The run directory (`<cache-root>/runs/<stamp>/`) holds `READY`, `phase-markers.j
 
 | launcher flag | meaning |
 |---|---|
-| `--profile tt-quietbox\|bh-loudbox\|qb2` | the hardware profile: the mesh graph descriptor, the device set, the route |
+| `--profile tt-quietbox\|p150-line\|qb2` | the hardware profile: the mesh graph descriptor, the device set, the route |
 | `--allocated-context 32768\|65536\|131072\|262144` | the resident build (KV caches, RoPE tables and the context limit; the limit is the context minus 64 for the consumed EOS step); default 32768 |
 | `--acceptance`, `--require-json-96` | replay the twelve CPU greedy records at start; refuse to serve unless `json` matches 96/96 |
 | `--prepare-only --bf4-stage-limit N` | convert at most N missing expert layers into the BF4 cache and stop |
 | `--long-chunks` | 128-row prefill chunks where the prompt allows (section 6); off by default, not combined with `--mtp` |
 | `--prefill-slab 2048` | prefill slabs of 2048 rows ahead of the 128-row chunks: one matmul per dense linear, tolerance-class against the chunk bodies (`docs/PREFILL.md`); off by default, not combined with `--mtp` |
 | `--mtp 3\|4` | speculative drafting on greedy requests (section 6); off by default |
-| `--port`, `--host` | the listening port; `--host` default `0.0.0.0`: the QuietBox and LoudBox profiles serve the LAN |
+| `--port`, `--host` | the listening port; `--host` default `0.0.0.0`: the QuietBox and p150-line profiles serve the LAN |
 | `--serve-seconds N` | stop after N seconds (a drain: the request in flight gets its reply) |
 | `--sampling` / `--no-sampling` | the launcher passes `--sampling`: sampled requests are served, a request naming no sampling field is still the bitwise greedy stream; `--no-sampling` refuses sampling fields with HTTP 400 (+0.3 ms per token saved) |
 | `--stall-seconds N` | the watchdog on zero device progress, 300 through the launcher; 0 disables it (`docs/SERVER.md`) |
-| `--validate-only` | run the checks and the CPU preparation without opening the mesh (a profile whose route is derived at start, the LoudBox, still needs the chips present) |
-| `--devices A,B,C,D` | run `bh-loudbox` on four other KMD device nodes (four chips of a larger host) |
+| `--validate-only` | run the checks and the CPU preparation without opening the mesh (a profile whose route is derived at start, `p150-line`, still needs the chips present) |
+| `--devices A,B,C,D` | run `p150-line` on four other KMD device nodes (four chips of a larger host) |
 | `--python` | another interpreter of this checkout |
 
 ## 5. Talk to it
@@ -230,7 +230,7 @@ route is derived from the cluster descriptor at start and recorded.  A QuietBox 
                                                    qwen38_sampling_step.py
     tools/runtime_admission.py                     the runtime identity (this checkout's build); live_decode_diagnostic.py the
                                                    CPU preparation and the live construction (BF4 conversion on the first start)
-    tools/hardware_profiles.py                     the profiles (tt-quietbox, bh-loudbox, tt-quietbox-2); physical_route.py the
+    tools/hardware_profiles.py                     the profiles (tt-quietbox, p150-line, tt-quietbox-2); physical_route.py the
                                                    route derivation; resident_decode.py the chain's fixed points;
                                                    evidence_records.py the run records
     tools/download_checkpoint.py                   the ModelScope download with SHA-256 verification
@@ -255,7 +255,7 @@ Run the tests from the repository root (`docs/TESTING.md` has the regression har
   acceptance 96/96 against the CPU, 19.6 tokens/s at 32k.  The launcher and profile are the ones here; on 2026-09-06
   the same box served the model from a fresh clone of this repository (`docs/PROOFS.md`: build, checkpoint by digest,
   the first-start expert conversion, the acceptance replay, then `--mtp 4`, `--long-chunks` and the 64k context).
-- The checkout build and `bh-loudbox`: `docs/PROOFS.md` records the fresh-clone proof (the build, the checkpoint by
+- The checkout build and `p150-line`: `docs/PROOFS.md` records the fresh-clone proof (the build, the checkpoint by
   digest, the first-start expert conversion, the acceptance replay) and the hardware it ran on.
 - Numerics, 2026-09-06 on 4x p150: `json` 96/96 against the CPU, the other eleven records leave the CPU greedy stream
   between token 6 and 75 (`docs/NUMERICS.md`); MTP is not bitwise with plain decode on 4 of 12 prompts (near-ties).

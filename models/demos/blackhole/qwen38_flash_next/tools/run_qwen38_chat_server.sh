@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Start the Qwen3.8-Flash-Next chat server on one 1x4 mesh of Blackhole chips, from this checkout's build.
 #
-#   tools/run_qwen38_chat_server.sh --profile tt-quietbox|bh-loudbox|qb2 --checkpoint DIR --cache-root DIR [options]
+#   tools/run_qwen38_chat_server.sh --profile tt-quietbox|p150-line|qb2 --checkpoint DIR --cache-root DIR [options]
 #
 #   --profile tt-quietbox   QuietBox, 4x p150b in an ethernet ring (verified; opened as a 1x4 line through the shipped
 #                           mesh graph descriptor)
-#   --profile bh-loudbox    Blackhole LoudBox, 4x p150 in an ethernet line, ttnn's default descriptor; the route is
+#   --profile p150-line     4x p150 in one host as an ethernet line, ttnn's default descriptor; the route is
 #                           derived at start
 #   --profile qb2           p300-based box (QuietBox 2, or a 4x p300 host with --instance 0|1) -- UNTESTED, see README
-#   --devices A,B,C,D       run bh-loudbox on these four KMD device nodes (four chips of a larger host)
+#   --devices A,B,C,D       run p150-line on these four KMD device nodes (four chips of a larger host)
 #   --checkpoint DIR        the ModelScope checkpoint directory (tools/download_checkpoint.py)
 #   --cache-root DIR        the converted weights, the BF4 expert cache, the model I/O cache, the JIT cache and the run
 #                           directories (about 23 GB for 32k plus 107 GB of BF4 experts on the first start)
@@ -106,15 +106,15 @@ case "$profile" in
         [[ "$instance" == 0 && -z "$devices" ]] || die "--instance and --devices do not apply to --profile tt-quietbox"
         hardware_profile=tt-quietbox visible_devices=0,1,2,3
         descriptor="$HERE/qb_p150_x4_1x4_line_mesh_graph_descriptor.textproto" ;;
-    bh-loudbox)
+    p150-line)
         [[ "$instance" == 0 ]] || die "--instance applies to --profile qb2"
-        hardware_profile=bh-loudbox visible_devices=${devices:-0,1,2,3} descriptor= ;;
+        hardware_profile=p150-line visible_devices=${devices:-0,1,2,3} descriptor= ;;
     qb2)
-        [[ -z "$devices" ]] || die "--devices applies to --profile bh-loudbox"
+        [[ -z "$devices" ]] || die "--devices applies to --profile p150-line"
         printf 'run_qwen38_chat_server: the qb2 profile is UNTESTED (no QuietBox 2 was available); the first run prints the derived route to pin\n' >&2
         if [[ "$instance" == 0 ]]; then hardware_profile=tt-quietbox-2 visible_devices=0,1,2,3; else hardware_profile=tt-quietbox-2-instance-1 visible_devices=4,5,6,7; fi
         descriptor="$HERE/qb2_p300_1x4_line_mesh_graph_descriptor.textproto" ;;
-    *) die "--profile must be tt-quietbox, bh-loudbox or qb2" ;;
+    *) die "--profile must be tt-quietbox, p150-line or qb2" ;;
 esac
 
 # -- the checkout identity the server admits (printed here, proven there) -----------------------------------------

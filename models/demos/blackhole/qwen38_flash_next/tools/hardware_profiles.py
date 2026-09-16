@@ -1,7 +1,7 @@
 """Hardware profiles: which four Blackhole chips make the model's 1x4 mesh, and how the host wires them.
 
 A profile pins the KMD device nodes, the route derivation (``physical_route``), the derived route to expect and the
-system mesh shape ttnn discovers.  The public table holds the QuietBox, the Blackhole LoudBox and the QuietBox 2
+system mesh shape ttnn discovers.  The public table holds the QuietBox, the 4x p150 line and the QuietBox 2
 profiles; a private table (a module named by ``QWEN38_HARDWARE_PROFILE_TABLE`` exposing ``HARDWARE_PROFILES``)
 extends it for other hosts.
 """
@@ -92,12 +92,12 @@ QUIETBOX = ResidentHardwareProfile(
 )
 
 
-# Blackhole LoudBox: 4x p150 in one host, KMD nodes 0-3, the chips in an ethernet line opened as the 1x4 with
+# p150 line: 4x p150 in one host, KMD nodes 0-3, the chips in an ethernet line opened as the 1x4 with
 # ttnn's default mesh descriptor (the same 1x4 mesh); the route is
 # derived at start and recorded.  ``--device-nodes`` moves it to another four nodes.
-LOUDBOX = ResidentHardwareProfile(
-    host="bh-loudbox",
-    partition="lb",
+P150_LINE = ResidentHardwareProfile(
+    host="p150-line",
+    partition="line",
     visible_devices="0,1,2,3",
     device_nodes=(0, 1, 2, 3),
     numa_node=None,
@@ -136,7 +136,7 @@ def _quietbox_2_instance(instance: int) -> ResidentHardwareProfile:
 
 HARDWARE_PROFILES: dict[str, ResidentHardwareProfile] = {
     "tt-quietbox": QUIETBOX,
-    "bh-loudbox": LOUDBOX,
+    "p150-line": P150_LINE,
     "tt-quietbox-2": _quietbox_2_instance(0),
     "tt-quietbox-2-instance-1": _quietbox_2_instance(1),
 }

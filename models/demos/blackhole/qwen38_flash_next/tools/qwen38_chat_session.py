@@ -1140,7 +1140,7 @@ def template_decoder(template: Any) -> Callable[[list[int]], str]:
 
 def resolve_route(hardware_profile: ResidentHardwareProfile) -> tuple[ResidentHardwareProfile, dict]:
     """The profile with its route: derived from the cluster descriptor (no device is opened) and adopted when the
-    profile leaves it ``None`` (the LoudBox: recorded, not pinned), checked against the pinned one otherwise."""
+    profile leaves it ``None`` (the p150 line: recorded, not pinned), checked against the pinned one otherwise."""
 
     import yaml
 

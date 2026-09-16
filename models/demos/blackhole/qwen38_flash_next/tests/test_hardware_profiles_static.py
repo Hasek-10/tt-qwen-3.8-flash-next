@@ -47,7 +47,7 @@ def _resolve(name: str | None, *, host: str, visible: str | None = None) -> Resi
         return resolve_hardware_profile(name, table=TABLE)
 
 
-@pytest.mark.parametrize("host", ("tt-quietbox", "bh-loudbox", "host-one", "some-box"))
+@pytest.mark.parametrize("host", ("tt-quietbox", "p150-line", "host-one", "some-box"))
 @pytest.mark.parametrize("name", sorted(HARDWARE_PROFILES))
 def test_a_named_public_profile_resolves_on_any_host(name: str, host: str) -> None:
     # A QuietBox 2 shipped with the hostname of the QuietBox profile; the named profile must still resolve.
@@ -69,7 +69,7 @@ def test_a_private_lane_of_another_known_host_refuses() -> None:
 
 def test_an_unknown_name_lists_the_table() -> None:
     with pytest.raises(
-        HardwareProfileError, match=r"unknown hardware profile 'nowhere', expected one of \['bh-loudbox'"
+        HardwareProfileError, match=r"unknown hardware profile 'nowhere', expected one of \[.*'p150-line', 'tt-quietbox'"
     ):
         _resolve("nowhere", host="host-one")
 

@@ -27,7 +27,7 @@ first start, replays the CPU acceptance records after the captures
 agreement records, the device column and its score against the HF reference),
 writes READY, serves until SIGTERM, then releases the chain and the mesh in the
 timing runner's order.  ``--host`` is loopback unless the profile serves the
-LAN (the QuietBox, the LoudBox) or ``--allow-lan`` is given.
+LAN (the QuietBox, the p150 line) or ``--allow-lan`` is given.
 """
 
 from __future__ import annotations
@@ -1519,7 +1519,7 @@ def _parser() -> argparse.ArgumentParser:
         "--hardware-profile",
         choices=tuple(hardware_profiles.hardware_profile_table()),
         default=None,
-        help="tt-quietbox | bh-loudbox | tt-quietbox-2[-instance-1] (a private table adds development hosts)",
+        help="tt-quietbox | p150-line | tt-quietbox-2[-instance-1] (a private table adds development hosts)",
     )
     parser.add_argument("--validate-only", action="store_true", help="provenance and CPU preparation, no mesh")
     parser.add_argument(
@@ -1633,7 +1633,7 @@ def main() -> int:
     runtime = runtime_admission.admit_runtime(args)
     _log("runtime", **{key: value for key, value in runtime.items() if key != "bundle"})
     lock_proof = hardware_profiles.verify_inherited_locks(hardware_profile)
-    # The route: pinned by the profile, or (the LoudBox) derived from the cluster descriptor now and recorded.
+    # The route: pinned by the profile, or (the p150 line) derived from the cluster descriptor now and recorded.
     hardware_profile, route_derivation = resolve_route(hardware_profile)
     _log(
         "route",
