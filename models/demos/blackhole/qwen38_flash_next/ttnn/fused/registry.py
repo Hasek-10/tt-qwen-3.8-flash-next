@@ -32,6 +32,7 @@ _NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 # traced wall under the record in their own slot (the FUSION-DEFAULTS notes).  Flipping a kernel is this one list.
 DEFAULT_ON: frozenset[str] = frozenset(
     {
+        "gr_read",
         "gr_write",
         "greedy_tail",
         "moe_post",

@@ -4,13 +4,14 @@
 """The fused GR read without a device: its registry entry, the kernel argument contracts against the Python side,
 the CB indices the compute kernels hard-code, the scaler bit patterns, and the model hook."""
 
+import inspect
 import re
 from pathlib import Path
 
 import pytest
 import ttnn
 from models.demos.blackhole.qwen38_flash_next.ttnn import fused
-from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gr_read
+from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gr_read, registry
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import program as fp
 
 KERNELS = fp.REPO_ROOT / fp.KERNEL_ROOT / "gr_read" / "kernels"
@@ -30,6 +31,15 @@ def test_registry_entry():
     assert fused.resolve("gr_read", {fused.ENV: "gr_read"}) is gr_read.gr_read_fused
     assert fused.resolve("gr_read", {fused.OFF_ENV: "gr_read"}) is gr_read.gr_read_composed
     assert fused.resolve("gr_read", {fused.ENV: "gr_read", fused.OFF_ENV: "all"}) is gr_read.gr_read_composed
+
+
+def test_merged_forms_are_the_default_and_the_switch_selects_the_split_forms():
+    assert "gr_read" in registry.DEFAULT_ON
+    assert gr_read.merged_enabled({}) is True and gr_read.merged_enabled({gr_read.MERGED_ENV: "1"}) is True
+    assert gr_read.merged_enabled({gr_read.MERGED_ENV: "0"}) is False
+    with pytest.raises(ValueError, match=gr_read.MERGED_ENV):
+        gr_read.merged_enabled({gr_read.MERGED_ENV: "yes"})
+    assert "merged = merged_enabled() if merged is None else merged" in inspect.getsource(gr_read.gr_read_fused)
 
 
 def test_reader_and_writer_argument_contracts():

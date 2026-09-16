@@ -167,7 +167,7 @@ def test_lm_head_modules_bind_the_chunk_plan_and_cache_names() -> None:
     assert not {f"lm-head-chunk-dram-sharded-{index:02d}" for index in range(8)} & set(names)
 
     head_init = inspect.getsource(embedding_module.Qwen38TTNNLMHead.__init__)
-    assert "dram_sharded_matmul_configs(mesh_device, HIDDEN_SIZE, width, num_cores=40)" in head_init
+    assert "mesh_device, HIDDEN_SIZE, width, num_cores=40, num_workers_per_dram_bank=workers" in head_init
     assert "for width in weights.lm_head_chunk_sizes" in head_init
     call = inspect.getsource(embedding_module.Qwen38TTNNLMHead.__call__)
     assert call.count("ttnn.to_memory_config(full_hidden, self.hidden_act_memory_config)") == 1

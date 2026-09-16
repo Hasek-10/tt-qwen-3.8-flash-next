@@ -74,6 +74,8 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_matmul_configs,
     dram_sharded_weight_memory_config,
+    validate_decode_dram_workers,
+    validate_dram_sharded_weight,
 )
 from models.tt_transformers.tt.ccl import tt_all_reduce
 
@@ -1682,6 +1684,7 @@ class Qwen38TTNNLMHead:
         weights: Qwen38TTNNModelIOWeights,
         *,
         collective_topology=None,
+        decode_dram_workers_per_bank: int = 1,
     ) -> None:
         mesh_contract.validate_mesh(mesh_device)
         if mesh_device.arch() != ttnn.Arch.BLACKHOLE:
@@ -1712,8 +1715,14 @@ class Qwen38TTNNLMHead:
         )
         # One K-split storage grid serves every chunk; per-chunk program
         # configs only differ in per-core output width.
+        workers = validate_decode_dram_workers(decode_dram_workers_per_bank)
+        self.decode_dram_workers_per_bank = workers
+        for tensor, width in zip(weights.lm_head_chunks, weights.lm_head_chunk_sizes):
+            validate_dram_sharded_weight(tensor, mesh_device, HIDDEN_SIZE, width, num_workers_per_dram_bank=workers)
         chunk_configs = tuple(
-            dram_sharded_matmul_configs(mesh_device, HIDDEN_SIZE, width, num_cores=40)
+            dram_sharded_matmul_configs(
+                mesh_device, HIDDEN_SIZE, width, num_cores=40, num_workers_per_dram_bank=workers
+            )
             for width in weights.lm_head_chunk_sizes
         )
         self.hidden_act_memory_config = chunk_configs[0][0]
@@ -2170,6 +2179,7 @@ class Qwen38TTNNModelIO:
         tt_ccl,
         collective_topology=None,
         synchronization_policy: Qwen38TTNNEmbeddingSyncPolicy = Qwen38TTNNEmbeddingSyncPolicy.CORRECTNESS_FENCED,
+        decode_dram_workers_per_bank: int = 1,
     ) -> None:
         self.embedding = Qwen38TTNNTokenEmbedding(
             mesh_device,
@@ -2184,4 +2194,5 @@ class Qwen38TTNNModelIO:
             mesh_contract,
             weights,
             collective_topology=collective_topology,
+            decode_dram_workers_per_bank=decode_dram_workers_per_bank,
         )

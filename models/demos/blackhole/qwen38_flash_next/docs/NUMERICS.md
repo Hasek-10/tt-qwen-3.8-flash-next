@@ -21,25 +21,42 @@ Every number here was measured on 4x p150 unless a date and host say otherwise.
   packer), and every start re-packs one routed expert of the first cached layer from the checkpoint and compares the
   bytes with the cache; a cache converted by different code is refused (`SERVER.md`).
 
-## Fused decode kernels (2026-09-15)
+## Fused decode kernels and two-reader decode linears (2026-09-16)
 
 Decode chains run as fused programs (`ttnn/fused/`, built on `ttnn.generic_op`) where a kernel is bitwise against the
 chain it replaces on device, leaves every pinned table above unchanged and beats the previous step time in its own
-timing slot.  On by default: `gr_write`, `greedy_tail`, `moe_post`, `ple`, `position_derive`, `qsa_block`,
-`router_tail`, `shared_expert`: the gated-residual write as one program (SFPU multiply, FPU add, as the chain); the tail's greedy
-epilogue (24 programs as 4 plus one gather); the MoE post program (fill, tilize, the score-weighted reduce over the
-ten expert slots in slot order, the shared expert's x sigmoid and the partial add as one program); the prologue's
-position derivation (40 programs as 1); the sparse-attention block's decode glue as six programs (index tail, main
-tail, post-attention, partial widen, selection row, score merge); the MoE router tail (softmax, top-10, sum, div,
-casts and layouts: 12 programs per layer as one); the shared expert as three programs (one DRAM-sharded linear over
-the concatenated [gate | up | scalar] weight, one silu / product / sigmoid program, the down linear); the layer-1 PLE
-(stats, group norm, gate, conv with the state shift and the layer's permute + add: 56 programs as 9, the SFPU `mac_tile`
-of `ttnn.mac`, the accurate fp32 reduce of the gate's sum).  Opt-in through `QWEN38_FUSED=<name>`: `final_mixer`,
-`gdn_step`, `gr_read`, `position_advance`.  The kernels cover rows 1..32 (decode, the MTP verify
-rows); the 128-row prefill chunk and the slab keep their chains.  `QWEN38_FUSED_OFF=<name>[,...]` (or `all`) in the
-server's environment falls back to the composed chains; an unknown name in either variable refuses to start.  Measured
-2026-09-15 on 4x p150 (200 traced decode steps, host wall): 49.91 ms per token with the chains, 42.14 ms with the
-default set (23.7 tokens/s); 4,618 programs and 37.9 ms of kernel time per step on chip 0 under the device profiler.
+timing slot.  On by default: `gr_read`, `gr_write`, `greedy_tail`, `moe_post`, `ple`, `position_derive`, `qsa_block`,
+`router_tail`, `shared_expert`: the gated-residual read as three programs around its two collectives (stats,
+normalize + down-project, low-rank + gate: 18 programs per read as 5, the chain's LLK sequences call for call, its
+reduce scaler and spill/reload rounding included); the gated-residual write as one program (SFPU multiply, FPU add, as
+the chain); the tail's greedy epilogue (24 programs as 4 plus one gather); the MoE post program (fill, tilize, the
+score-weighted reduce over the ten expert slots in slot order, the shared expert's x sigmoid and the partial add as one
+program); the prologue's position derivation (40 programs as 1); the sparse-attention block's decode glue as six
+programs (index tail, main tail, post-attention, partial widen, selection row, score merge); the MoE router tail
+(softmax, top-10, sum, div, casts and layouts: 12 programs per layer as one); the shared expert as three programs (one
+DRAM-sharded linear over the concatenated [gate | up | scalar] weight, one silu / product / sigmoid program, the down
+linear); the layer-1 PLE (stats, group norm, gate, conv with the state shift and the layer's permute + add: 56 programs
+as 9, the SFPU `mac_tile` of `ttnn.mac`, the accurate fp32 reduce of the gate's sum).  Opt-in through
+`QWEN38_FUSED=<name>`: `final_mixer`, `gdn_step`, `position_advance`.  The kernels cover rows 1..32 (decode, the MTP
+verify rows); the 128-row prefill chunk and the slab keep their chains.  `QWEN38_FUSED_OFF=<name>[,...]` (or `all`) in
+the server's environment falls back to the composed chains; an unknown name in either variable refuses to start;
+`QWEN38_FUSED_GR_READ_MERGED=0` runs the GR read's split form (7 programs per read).
+
+The DRAM-sharded decode linears of the GDN input and output projections, the sparse attention's query-gate and output
+projections and the LM-head chunks read each DRAM bank with two worker cores (`num_workers_per_dram_bank=2`; the K/V and
+index projections, the router, the gated-residual linears and the shared expert keep one).  The arithmetic is the same
+(the same K order into the same fp32 destination): bitwise at rows 1..32 and at the model level, every pinned table
+above holds.  `QWEN38_DRAM_WORKERS=1` restores one reader per bank.  The GDN input weight's bank shard holds a whole
+number of tiles per reader, 18 instead of 17 (576 instead of 544 columns: 1.3 MB per layer, 47 MB per card of the
+4.6 GB the 32k build leaves free), under its own cache file (`qkvzab_tile_aligned_ab_dram_sharded_bank576`); a cached
+tensorbin loads in the layout it was written in, so every loaded member is checked against the layout its linear runs
+and a one-reader file is never accepted for the wider allocation.
+
+Measured 2026-09-16 on 4x p150 (200 traced decode steps, host wall, one hold): 49.89 ms per token with the
+chains and one reader per bank (`QWEN38_FUSED_OFF=all QWEN38_DRAM_WORKERS=1`), 38.67 ms with the defaults
+(25.9 tokens/s; 38.26 min, 38.85 p90); 3,370 programs and 34.5 ms of kernel time per
+step on chip 0 under the device profiler (38.9 ms span).  The 2026-09-15 numbers (13 kernels, one reader per
+bank): 42.14 ms, 4,618 programs, 37.9 ms of kernel time.
 
 ## The acceptance mechanism
 
@@ -86,7 +103,10 @@ each of the three earlier tokens the device's own 1-row logits hold the CPU's to
 step (an exact tie on `summary` and `list`, which the 1-row loop breaks toward the lower id), the verify row lands one
 step the other way, and the CPU oracle rates the two 0.4-1.0 logits apart: near-ties, not a defect (the rows-path gate
 is the 1-row gate bitwise on the same row; the pinned MTP table is `tools/ci/baselines/A3-mtp4-32k-divergence_index.json`).
-Before the gate fix the two paths differed on `code` (44 against 24) and `fact` (16 against 15) only.
+Before the gate fix the two paths differed on `code` (44 against 24) and `fact` (16 against 15) only.  Throughput
+on the 2026-09-16 body (14 fused kernels, two DRAM readers per bank; quiet host, the acceptance replay of the 12
+prompts, both tables as pinned): `--mtp 4` 39.0 tokens/s median over the prompts and 67.9 on `json` (4.80 tokens per
+pass, 70.7 ms per pass); `--mtp 3` 38.0 median, 55.6 on `json`.
 
 | | json | chat | code | fact | list | math | multilingual | prose | refactor | sky | story | summary |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|

@@ -63,6 +63,8 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_weight_memory_config,
     prefill_linear,
     prefill_matmul_program_config,
+    validate_decode_dram_workers,
+    validate_dram_sharded_weight,
 )
 
 TP_SIZE = 4
@@ -1871,6 +1873,7 @@ class Qwen38TTNNQSA:
         allocated_context: int = MAX_CONTEXT,
         collective_topology=None,
         regime_split: bool | None = None,
+        decode_dram_workers_per_bank: int = 1,
     ) -> None:
         mesh_contract.validate_mesh(mesh_device)
         weights.validate(mesh_contract)
@@ -1939,15 +1942,23 @@ class Qwen38TTNNQSA:
         )
         # DRAM-sharded decode matmul configs; every K=2560 projection shares
         # one eight-core activation shard of the gathered hidden state.
+        workers = validate_decode_dram_workers(decode_dram_workers_per_bank)
+        self.decode_dram_workers_per_bank = workers
+        validate_dram_sharded_weight(
+            weights.qg, mesh_device, HIDDEN_SIZE, 2 * LOCAL_QUERY_WIDTH, num_workers_per_dram_bank=workers
+        )
+        validate_dram_sharded_weight(
+            weights.out, mesh_device, LOCAL_QUERY_WIDTH, HIDDEN_SIZE, num_workers_per_dram_bank=workers
+        )
         self.hidden_act_memory_config, self.qg_program_config = dram_sharded_matmul_configs(
-            mesh_device, HIDDEN_SIZE, 2 * LOCAL_QUERY_WIDTH, num_cores=8
+            mesh_device, HIDDEN_SIZE, 2 * LOCAL_QUERY_WIDTH, num_cores=8, num_workers_per_dram_bank=workers
         )
         _, self.kv_program_config = dram_sharded_matmul_configs(mesh_device, HIDDEN_SIZE, HEAD_DIM, num_cores=8)
         _, self.index_program_config = dram_sharded_matmul_configs(
             mesh_device, HIDDEN_SIZE, INDEX_HEAD_DIM, num_cores=8
         )
         self.out_act_memory_config, self.out_program_config = dram_sharded_matmul_configs(
-            mesh_device, LOCAL_QUERY_WIDTH, HIDDEN_SIZE, num_cores=16
+            mesh_device, LOCAL_QUERY_WIDTH, HIDDEN_SIZE, num_cores=16, num_workers_per_dram_bank=workers
         )
 
         self.index_gate = ttnn.from_torch(

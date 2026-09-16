@@ -55,6 +55,10 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import (
     qualify_live_bf4_ring,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import MESH_SHAPE, Qwen38MeshContract
+from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
+    default_decode_dram_workers,
+    validate_decode_dram_workers,
+)
 from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import (
     PINNED_CHECKPOINT_REVISION,
     PINNED_TENSOR_MANIFEST_SHA256,
@@ -266,8 +270,11 @@ def _require_lower_hex(value: str, length: int, *, label: str) -> None:
 
 
 def _identity_key(value: Any) -> str:
-    payload = json.dumps(asdict(value), sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(payload).hexdigest()
+    return _payload_key(asdict(value))
+
+
+def _payload_key(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _topology_identity(topology) -> str:
@@ -423,8 +430,10 @@ class Qwen38LiveBuildIdentity:
     ring_size: int
     expert_residency: Literal["streamed", "resident"] = "streamed"
     qsa_cache_capacity: int = MAX_CONTEXT
+    decode_dram_workers_per_bank: int = 1  # the decode linears' DRAM readers per bank (decode_matmul)
 
     def __post_init__(self) -> None:
+        validate_decode_dram_workers(self.decode_dram_workers_per_bank)
         if not isinstance(self.provenance, Qwen38BuildProvenance):
             raise TypeError("live builder identity requires validated Qwen38BuildProvenance")
         if tuple(self.mesh_shape) != MESH_SHAPE:
@@ -459,7 +468,10 @@ class Qwen38LiveBuildIdentity:
 
     @property
     def key(self) -> str:
-        return _identity_key(self)
+        payload = asdict(self)
+        if self.decode_dram_workers_per_bank == 1:
+            del payload["decode_dram_workers_per_bank"]  # the one-reader caches keep the identity they were built under
+        return _payload_key(payload)
 
 
 @dataclass(frozen=True)
@@ -727,7 +739,15 @@ class Qwen38TTNNBuilder:
         collective_topology,
         expert_residency: Literal["streamed", "resident"] = "streamed",
         qsa_cache_capacity: int = MAX_CONTEXT,
+        decode_dram_workers_per_bank: int | None = None,
     ) -> None:
+        # The decode linears' DRAM readers per bank (decode_matmul): the serving default or QWEN38_DRAM_WORKERS
+        # unless the caller names the count; the GDN weights, the QSA and the LM head (backbone and MTP) run it.
+        decode_dram_workers_per_bank = (
+            default_decode_dram_workers()
+            if decode_dram_workers_per_bank is None
+            else validate_decode_dram_workers(decode_dram_workers_per_bank)
+        )
         validate_checkpoint_and_placement(checkpoint, placement)
         if not isinstance(mesh_contract, Qwen38MeshContract):
             raise TypeError("mesh_contract must be Qwen38MeshContract")
@@ -764,6 +784,7 @@ class Qwen38TTNNBuilder:
             ring_size=len(ring_order),
             expert_residency=expert_residency,
             qsa_cache_capacity=qsa_cache_capacity,
+            decode_dram_workers_per_bank=decode_dram_workers_per_bank,
         )
 
         # The component and model-I/O caches receive a root namespaced by the complete builder identity (the
@@ -807,6 +828,7 @@ class Qwen38TTNNBuilder:
         self.collective_topology = collective_topology
         self.expert_residency = expert_residency
         self.qsa_cache_capacity = qsa_cache_capacity
+        self.decode_dram_workers_per_bank = decode_dram_workers_per_bank
         self.identity = live_identity
         self.component_cache_root = component_cache_root
         self.bf4_cache = bf4_cache
@@ -1035,6 +1057,7 @@ class Qwen38TTNNBuilder:
                 self.component_cache_root,
                 layer_index=spec.layer_index,
                 tt_metal_sha=self.provenance.tt_metal_sha,
+                decode_dram_workers_per_bank=self.decode_dram_workers_per_bank,
             )
             if weights.layer_index != spec.layer_index:
                 raise RuntimeError("constructed GDN weights belong to another checkpoint layer")
@@ -1064,6 +1087,7 @@ class Qwen38TTNNBuilder:
             max_context=self.checkpoint.config.max_position_embeddings,
             allocated_context=self.qsa_cache_capacity,
             collective_topology=self.collective_topology,
+            decode_dram_workers_per_bank=self.decode_dram_workers_per_bank,
         )
 
     def _build_ple(self) -> Qwen38TTNNPLE:
@@ -1131,6 +1155,7 @@ class Qwen38TTNNBuilder:
             weights,
             tt_ccl=self.tt_ccl,
             collective_topology=self.collective_topology,
+            decode_dram_workers_per_bank=self.decode_dram_workers_per_bank,
             synchronization_policy=(
                 Qwen38TTNNEmbeddingSyncPolicy.RESIDENT_ASYNC
                 if self.expert_residency == "resident"
@@ -1291,6 +1316,7 @@ class Qwen38TTNNBuilder:
                 max_context=self.checkpoint.config.max_position_embeddings,
                 allocated_context=self.qsa_cache_capacity,
                 collective_topology=self.collective_topology,
+                decode_dram_workers_per_bank=self.decode_dram_workers_per_bank,
             )
             decoder_layer = Qwen38TTNNDecoderLayer(
                 mesh_contract=self.mesh_contract,

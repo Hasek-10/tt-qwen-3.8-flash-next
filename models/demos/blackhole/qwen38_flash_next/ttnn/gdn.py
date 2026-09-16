@@ -46,6 +46,9 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_weight_memory_config,
     prefill_linear,
     prefill_matmul_program_config,
+    validate_decode_dram_workers,
+    validate_dram_sharded_weight,
+    weight_layout_tag,
 )
 
 TP_SIZE = 4
@@ -367,6 +370,8 @@ class Qwen38TTNNGDNWeights:
     neg_exp_A: Any
     norm: Any
     projection_dtype: Any
+    # The DRAM readers per bank the projection weights are laid out for (decode_matmul); the module runs them so.
+    decode_dram_workers_per_bank: int = 1
 
     @classmethod
     def from_checkpoint(
@@ -379,6 +384,7 @@ class Qwen38TTNNGDNWeights:
         layer_index: int,
         tt_metal_sha: str,
         projection_dtype=None,
+        decode_dram_workers_per_bank: int = 1,
     ) -> "Qwen38TTNNGDNWeights":
         """Pack and upload one exact checkpoint layer.
 
@@ -390,6 +396,7 @@ class Qwen38TTNNGDNWeights:
         be selected silently.
         """
 
+        validate_decode_dram_workers(decode_dram_workers_per_bank)
         mesh_contract.validate_mesh(mesh_device)
         _require_pinned_config(checkpoint, layer_index)
         if projection_dtype is None:
@@ -415,14 +422,36 @@ class Qwen38TTNNGDNWeights:
         # Projection weights are DRAM width-sharded for the decode matmul
         # program; the renamed tensorbins deliberately orphan interleaved
         # caches and the unpadded 4120-column packing.
+        if decode_dram_workers_per_bank != 1 and projection_dtype != ttnn.bfloat16:
+            raise ValueError("two DRAM readers per bank were qualified with bf16 GDN projection weights only")
+        # Two readers per bank pad this weight's bank shard to 18 tiles (576 columns; 17 with one reader): the file
+        # name carries the wider layout (weight_layout_tag), the loaded members are checked against it below.
+        layout_suffix = weight_layout_tag(
+            mesh_device,
+            HIDDEN_SIZE,
+            PROJECTION_WIDTH_PER_DEVICE,
+            num_workers_per_dram_bank=decode_dram_workers_per_bank,
+        )
         qkvzab = ttnn.as_tensor(
             qkvzab_host,
             dtype=projection_dtype,
             layout=ttnn.TILE_LAYOUT,
             device=mesh_device,
-            memory_config=dram_sharded_weight_memory_config(mesh_device, HIDDEN_SIZE, PROJECTION_WIDTH_PER_DEVICE),
+            memory_config=dram_sharded_weight_memory_config(
+                mesh_device,
+                HIDDEN_SIZE,
+                PROJECTION_WIDTH_PER_DEVICE,
+                num_workers_per_dram_bank=decode_dram_workers_per_bank,
+            ),
             mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3)),
-            cache_file_name=cache_dir / f"qkvzab_tile_aligned_ab_dram_sharded.{dtype_tag}",
+            cache_file_name=cache_dir / f"qkvzab_tile_aligned_ab_dram_sharded{layout_suffix}.{dtype_tag}",
+        )
+        validate_dram_sharded_weight(
+            qkvzab,
+            mesh_device,
+            HIDDEN_SIZE,
+            PROJECTION_WIDTH_PER_DEVICE,
+            num_workers_per_dram_bank=decode_dram_workers_per_bank,
         )
 
         # Row-parallel output projection: each coordinate owns the checkpoint
@@ -483,7 +512,17 @@ class Qwen38TTNNGDNWeights:
             cache_file_name=cache_dir / "norm.bf16",
         )
 
-        result = cls(layer_index, qkvzab, out, conv_taps, dt_bias, neg_exp_A, norm, projection_dtype)
+        result = cls(
+            layer_index,
+            qkvzab,
+            out,
+            conv_taps,
+            dt_bias,
+            neg_exp_A,
+            norm,
+            projection_dtype,
+            decode_dram_workers_per_bank=decode_dram_workers_per_bank,
+        )
         result.validate(mesh_contract)
         return result
 
@@ -1102,6 +1141,21 @@ class Qwen38TTNNGDN:
     ) -> None:
         mesh_contract.validate_mesh(mesh_device)
         weights.validate(mesh_contract)
+        workers = validate_decode_dram_workers(weights.decode_dram_workers_per_bank)
+        validate_dram_sharded_weight(
+            weights.qkvzab,
+            mesh_device,
+            HIDDEN_SIZE,
+            PROJECTION_WIDTH_PER_DEVICE,
+            num_workers_per_dram_bank=workers,
+        )
+        validate_dram_sharded_weight(
+            weights.out,
+            mesh_device,
+            VALUE_WIDTH_PER_DEVICE,
+            HIDDEN_SIZE,
+            num_workers_per_dram_bank=workers,
+        )
         self.mesh_device = mesh_device
         self.mesh_contract = mesh_contract
         self.weights = weights
@@ -1114,10 +1168,10 @@ class Qwen38TTNNGDN:
             packer_l1_acc=False,
         )
         self.in_proj_act_memory_config, self.in_proj_program_config = dram_sharded_matmul_configs(
-            mesh_device, HIDDEN_SIZE, PROJECTION_WIDTH_PER_DEVICE, num_cores=8
+            mesh_device, HIDDEN_SIZE, PROJECTION_WIDTH_PER_DEVICE, num_cores=8, num_workers_per_dram_bank=workers
         )
         self.out_proj_act_memory_config, self.out_proj_program_config = dram_sharded_matmul_configs(
-            mesh_device, VALUE_WIDTH_PER_DEVICE, HIDDEN_SIZE, num_cores=16
+            mesh_device, VALUE_WIDTH_PER_DEVICE, HIDDEN_SIZE, num_cores=16, num_workers_per_dram_bank=workers
         )
         # Recurrent step kernels: the qualified configuration of the shared FLA
         # decode step for K = V = 128 (HiFi2, FP32 accumulation).  Changing any

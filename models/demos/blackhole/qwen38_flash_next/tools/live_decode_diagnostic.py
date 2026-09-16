@@ -792,6 +792,7 @@ def construct_live_decode_diagnostic(
     stage_missing_bf4: bool = True,
     bf4_stage_limit: int | None = None,
     require_complete: bool = True,
+    decode_dram_workers_per_bank: int | None = None,
 ) -> Qwen38LiveDecodeConstruction:
     """Construct and attach the real live builder, then stop before target build.
 
@@ -821,6 +822,7 @@ def construct_live_decode_diagnostic(
         collective_topology=collective_topology,
         expert_residency=prepared.expert_residency,
         qsa_cache_capacity=prepared.qsa_cache_capacity,
+        decode_dram_workers_per_bank=decode_dram_workers_per_bank,
     )
     _mark(marker, "after-live-builder-construction")
     production_cache = builder.bf4_cache

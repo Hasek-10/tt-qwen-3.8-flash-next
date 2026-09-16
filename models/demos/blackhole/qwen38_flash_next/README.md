@@ -25,8 +25,8 @@ This was implemented with the intention of the n-gram model residing in system m
 | path | measured | notes |
 |---|---|---|
 | prompt prefill | 300 tok/s (and climbing); 650 tok/s with `--long-chunks`; 1,150 tok/s with `--prefill-slab 2048` | 32-token chunk trace, 3.0-3.5 ms per prompt token, flat from 2k to 261k tokens; 128-token chunks at 1.45-1.56 ms per prompt token (`--long-chunks`); 2,048-row slabs at 0.87-1.08 ms per prompt token (`--prefill-slab 2048`, 2026-09-09, tolerance class: see `docs/PREFILL.md`) |
-| decode, one stream | 23.7 tok/s | position-generic traced decode, 42.1 ms per token, flat with depth; 8 decode chains run as fused programs by default (2026-09-15, bitwise: `docs/NUMERICS.md`) |
-| decode with MTP (`--mtp 4`) | 37 tok/s aggregate, 55 tok/s on structured output | speculative drafting with exact acceptance: the committed stream leaves the CPU reference at the same token as greedy decode on 8 of the 12 acceptance prompts and at a different token on the other 4 (section 6, `docs/NUMERICS.md`) |
+| decode, one stream | 25.9 tok/s | position-generic traced decode, 38.7 ms per token, flat with depth; 9 decode chains run as fused programs and the decode linears read each DRAM bank with two cores by default (2026-09-16, bitwise: `docs/NUMERICS.md`) |
+| decode with MTP (`--mtp 4`) | 39 tok/s median over the acceptance prompts, 68 tok/s on structured output | speculative drafting with exact acceptance: the committed stream leaves the CPU reference at the same token as greedy decode on 8 of the 12 acceptance prompts and at a different token on the other 4 (section 6, `docs/NUMERICS.md`) |
 | contexts | 32k, 64k, 128k, 256k | 256k is single-user; MTP fits at 32k, 64k and 128k |
 | correctness | bitwise repeatable; 96/96 greedy token match against the CPU reference on the acceptance prompt | chunked prefill is tolerance-class against the CPU reference on all 48 layers |
 
@@ -40,7 +40,7 @@ This was implemented with the intention of the n-gram model residing in system m
   needs, which are not on main yet and have no upstream equivalent:
   - `Fix empty-rank moe compute metadata ownership` (moe_compute tilize writer; routed experts at batch 1)
   - `skip idle-expert combine sync in moe_compute B=1` (-1.2 ms per token)
-  - `Add exact TP4 TTNN component path` (`moe_compute(..., local_combine=True)`, DRAM-bank-to-worker query)
+  - `Add exact TP4 TTNN component path` (`moe_compute(..., local_combine=True)`, DRAM-bank-to-worker query; the DRAM-sharded matmul's second reader per bank placed on a 1x4 mesh, 2026-09-16)
   - `Fix fused MoE source buffer double counting`
   - all-gather and fabric guards: `Guard all-gather scatter state initialization`, `Preserve ring connections in
     all-gather endpoint guard`, `Fix all-gather endpoint no-target connection access`, `Clear fabric router packet

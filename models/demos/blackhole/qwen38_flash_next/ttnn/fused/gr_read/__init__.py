@@ -63,7 +63,7 @@ MCAST_WRITER = fp.kernel_source(NAME, "mcast_writer.cpp")
 MCAST_READER = fp.kernel_source(NAME, "mcast_reader.cpp")
 NOC_PROBE = fp.kernel_source(NAME, "noc_probe.cpp")
 _NOC_MAPS: dict[int, dict[tuple[int, int], tuple[int, int]]] = {}
-MERGED_ENV = "QWEN38_FUSED_GR_READ_MERGED"  # "1": normalize+down and low_rank+gate as one program each (7 -> 5 programs per read)
+MERGED_ENV = "QWEN38_FUSED_GR_READ_MERGED"  # default "1": normalize+down and low_rank+gate as one program each (5 programs per read); "0": the split forms (7)
 NONE_CB = 0xFF
 MATMUL_ENV = "QWEN38_FUSED_GR_READ_MATMUL"
 MATMUL_MODES = ("chain", "exact")
@@ -723,9 +723,14 @@ def low_rank_gate(gathered_partials, normalized, up, *, matmul: str = "chain"):
 
 
 def merged_enabled(environ=None) -> bool:
+    """The merged forms (5 programs per read) unless QWEN38_FUSED_GR_READ_MERGED=0 selects the split forms (7)."""
+
     import os
 
-    return (environ if environ is not None else os.environ).get(MERGED_ENV, "0") == "1"
+    value = (environ if environ is not None else os.environ).get(MERGED_ENV, "1")
+    if value not in ("0", "1"):
+        raise ValueError(f"{MERGED_ENV} must be 0 or 1, got {value!r}")
+    return value == "1"
 
 
 def _topology(module, tensor, shard_dim: int | None) -> None:
@@ -745,8 +750,8 @@ def gr_read_fused(
     module, residual, *, scaler_mode: str = "chain", merged: bool | None = None, matmul: str | None = None
 ):
     """The model-level read: the fused programs around the chain's two collectives; returns (block input, state).
-    ``merged`` (default: the QWEN38_FUSED_GR_READ_MERGED environment switch) runs normalize+down and low_rank+gate as
-    one program each."""
+    ``merged`` (default: on, unless the QWEN38_FUSED_GR_READ_MERGED=0 switch) runs normalize+down and low_rank+gate
+    as one program each."""
 
     from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import TensorPlacement
     from models.demos.blackhole.qwen38_flash_next.ttnn.gr import Qwen38TTNNGatedResidualState

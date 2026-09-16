@@ -1833,6 +1833,7 @@ def main() -> int:
             "long_chunk_capture_ms": chain.long_chunk_capture_ms,
             "prefill_mode": session.prefill_mode,
             "sampling": chain.sampling is not None,
+            "dram_workers_per_bank": chain.construction.builder.decode_dram_workers_per_bank,
             "mtp": (
                 None
                 if chain.mtp is None
@@ -1927,6 +1928,7 @@ def main() -> int:
                 "acceptance_gate_pass": None if not records else report["acceptance"]["gate_pass"],
                 "mtp": report["chain"]["mtp"],
                 "fused_kernels": sorted(fused.enabled_names()),
+                "dram_workers_per_bank": report["chain"]["dram_workers_per_bank"],
             }
             ready_marker.write_text(json.dumps(ready, sort_keys=True) + "\n", encoding="utf-8")
             marker("chat-server-ready")
