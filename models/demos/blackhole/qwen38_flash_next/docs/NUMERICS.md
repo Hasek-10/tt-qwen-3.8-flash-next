@@ -33,14 +33,17 @@ the chain); the tail's greedy epilogue (24 programs as 4 plus one gather); the M
 score-weighted reduce over the ten expert slots in slot order, the shared expert's x sigmoid and the partial add as one
 program); the prologue's position derivation (40 programs as 1); the sparse-attention block's decode glue as six
 programs (index tail, main tail, post-attention, partial widen, selection row, score merge); the MoE router tail
-(softmax, top-10, sum, div, casts and layouts: 12 programs per layer as one); the shared expert as three programs (one
+(softmax, top-10, sum, div, casts and layouts: 12 programs per layer as one, its top-k on one core per eight-token
+group: the LLK sort's four independent passes, so every token sees the chain's instructions, bitwise, 88 -> 52 us per
+layer at one row, 2026-09-18); the shared expert as three programs (one
 DRAM-sharded linear over the concatenated [gate | up | scalar] weight, one silu / product / sigmoid program, the down
 linear); the layer-1 PLE (stats, group norm, gate, conv with the state shift and the layer's permute + add: 56 programs
 as 9, the SFPU `mac_tile` of `ttnn.mac`, the accurate fp32 reduce of the gate's sum).  Opt-in through
 `QWEN38_FUSED=<name>`: `final_mixer`, `gdn_step`, `position_advance`.  The kernels cover rows 1..32 (decode, the MTP
 verify rows); the 128-row prefill chunk and the slab keep their chains.  `QWEN38_FUSED_OFF=<name>[,...]` (or `all`) in
 the server's environment falls back to the composed chains; an unknown name in either variable refuses to start;
-`QWEN38_FUSED_GR_READ_MERGED=0` runs the GR read's split form (7 programs per read).
+`QWEN38_FUSED_GR_READ_MERGED=0` runs the GR read's split form (7 programs per read); `QWEN38_ROUTER_TAIL_LANES=0` runs
+the router tail's top-k on one core per tile (the same program, the LLK's four passes on that core).
 
 The DRAM-sharded decode linears of the GDN input and output projections, the sparse attention's query-gate and output
 projections and the LM-head chunks read each DRAM bank with two worker cores (`num_workers_per_dram_bank=2`; the K/V and

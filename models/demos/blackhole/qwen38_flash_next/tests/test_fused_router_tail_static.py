@@ -54,9 +54,13 @@ def test_runtime_arg_layout_matches_the_python_side():
     assert [int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d)\)", writer)] == list(range(len(rt.WRITER_ARGS)))
     assert "TensorAccessorArgs<0, 0>()" in reader and "next_compile_time_args_offset()" in reader
     assert "TensorAccessorArgs<0, 0>()" in writer and "next_compile_time_args_offset()" in writer
+    compute = SOURCES["compute"]
+    assert [int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d)\)", compute)] == list(range(len(rt.COMPUTE_ARGS)))
     source = inspect.getsource(rt.router_tail_program)
-    assert "[logits.buffer_address(), index_template.buffer_address(), t, r]" in source
-    assert "[scores.buffer_address(), indices.buffer_address(), t, r]" in source
+    assert "[logits.buffer_address(), index_template.buffer_address(), t, r, m]" in source
+    assert "[scores.buffer_address(), indices.buffer_address(), t, r, m]" in source
+    assert "per_core(lambda _t, _r, p, _m: [p])" in source
+    assert "token_mask >> row" in SOURCES["reader"] and "token_mask >> row" in SOURCES["writer"]
 
 
 def test_compute_kernel_pins_the_replaced_ops_instruction_sequences():
@@ -74,6 +78,66 @@ def test_compute_kernel_pins_the_replaced_ops_instruction_sequences():
     assert "div_binary_tile(0, 1, 0)" in compute
     assert "typecast_tile<static_cast<uint32_t>(DataFormat::Float32), static_cast<uint32_t>(DataFormat::Float16_b)>(0)" in compute
     assert "stable_sort" not in compute.replace("stable_sort false", "")
+    # the lane form: the same network, masked to the live tokens' passes; the LLK call stays for pass_mask 0
+    assert "topk_local_sort_lanes<false>(0, 0 /* largest */, 5 /* end_phase */, pass_mask)" in compute
+    assert compute.index("if (pass_mask == 0) {") < compute.index("topk_local_sort_lanes<false>")
+    assert '#include "topk_lanes.h"' in compute
+
+
+def _llk_sort_with_pass_guard() -> str:
+    """The LLK's _bitonic_topk_phases_steps with `if (pass_mask & (1u << (face * 2 + col)))` around each pass's phase
+    loop -- what kernels/topk_lanes.h must contain, regenerated from the LLK source of this tree."""
+
+    llk = (fp.REPO_ROOT / "tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h").read_text().splitlines()
+    start = next(i for i, l in enumerate(llk) if "inline void _bitonic_topk_phases_steps(" in l) - 1
+    end = next(i for i in range(start, len(llk)) if llk[i].startswith("}") and "topk_replay_init = -1;" in llk[i - 1])
+    body = llk[start : end + 1]
+    body[1] = body[1].replace("_bitonic_topk_phases_steps(", "_bitonic_topk_phases_steps_lanes(").replace(
+        "const int i_start_step)", "const int i_start_step, const std::uint32_t pass_mask)"
+    )
+    col_open = next(i for i, l in enumerate(body) if l == "        for (int col = 0; col < 2; col++)") + 1
+    close = next(i for i, l in enumerate(body) if l == "            dst_addr_offset += 2;")
+    inner = ["    " + l if l.strip() else l for l in body[col_open + 1 : close]]
+    guard = ["            if (pass_mask & (1u << (face * 2 + col)))", "            {"]
+    return "\n".join(body[: col_open + 1] + guard + inner + ["            }"] + body[close:])
+
+
+def test_masked_sort_is_the_llk_sort_with_a_pass_guard():
+    header = (fp.REPO_ROOT / rt.LANES_HEADER).read_text()
+    expected = _llk_sort_with_pass_guard()
+    assert expected in header, "kernels/topk_lanes.h no longer matches the LLK's _bitonic_topk_phases_steps + guard"
+    assert expected.count("if (pass_mask & (1u << (face * 2 + col)))") == 1  # one guard, around each pass's phase loop
+    assert header.index("#ifdef TRISC_MATH") < header.index(expected) < header.index("#endif  // TRISC_MATH")
+    assert "topk_replay_init = -1;" in header  # the replay-buffer bookkeeping is the LLK's
+    assert "topk_local_sort_lanes(uint32_t idst, int idir, int i_end_phase, uint32_t pass_mask)" in header
+    assert "VectorMode::RC_custom" in header and "calculate_bitonic_topk_phases_steps_lanes" in header
+
+
+def test_lanes_plan_one_core_per_live_pass():
+    fake = tuple(frozenset(range(8 * p, 8 * p + 8)) for p in range(4))  # a stand-in map; the pinned one comes from the probe
+    assert rt.lanes_plan(1, fake) == [(1, 0b1)]
+    assert rt.lanes_plan(8, fake) == [(1, 0xFF)]
+    assert rt.lanes_plan(9, fake) == [(1, 0xFF), (2, 0x100)]
+    assert rt.lanes_plan(32, fake) == [(1, 0xFF), (2, 0xFF00), (4, 0xFF0000), (8, 0xFF000000)]
+    with pytest.raises(ValueError):
+        rt.lanes_plan(33, fake)
+    # the pinned map (device probe 2026-09-18): pass = (row half, row parity)
+    assert rt.PASS_TOKENS == (
+        frozenset(range(0, 16, 2)),
+        frozenset(range(1, 16, 2)),
+        frozenset(range(16, 32, 2)),
+        frozenset(range(17, 32, 2)),
+    )
+    assert frozenset().union(*rt.PASS_TOKENS) == frozenset(range(32))
+    assert rt.lanes_plan(1) == [(1, 0b1)]
+    assert rt.lanes_plan(2) == [(1, 0b01), (2, 0b10)]
+    assert rt.lanes_plan(5) == [(1, 0b10101), (2, 0b01010)]
+    assert rt.lanes_plan(16) == [(1, 0x5555), (2, 0xAAAA)]
+    assert rt.lanes_plan(17) == [(1, 0x5555), (2, 0xAAAA), (4, 0x10000)]
+    masks = [m for _p, m in rt.lanes_plan(32)]
+    assert sum(masks) == rt.ALL_TOKENS and len(masks) == rt.PASSES
+    assert rt.lanes_enabled({}) and rt.lanes_enabled({rt.LANES_ENV: "1"})  # the lane form serves by default
+    assert not rt.lanes_enabled({rt.LANES_ENV: "0"})  # the single-core form is the off switch
 
 
 def _tile_faces(matrix: torch.Tensor) -> torch.Tensor:
@@ -100,7 +164,7 @@ def test_writer_face_addressing_matches_the_tile_layout():
 def test_reader_zero_fill_and_column_broadcast_match_the_tile_layout():
     reader = SOURCES["reader"]
     assert "tile[256 + i] = 0u" in reader and "tile[768 + i] = 0u" in reader  # faces 1 and 3
-    assert "const uint32_t first_zero = row < rows_in_tile ? top_k : 0u;" in reader
+    assert "const uint32_t first_zero = (row < rows_in_tile && ((token_mask >> row) & 1u)) ? top_k : 0u;" in reader
     assert "const uint32_t base = (row >> 4) * 2 * 256 + (row & 15) * 16;" in reader
     tile = torch.arange(1, 32 * 32 + 1).reshape(32, 32)
     flat = _tile_faces(tile)

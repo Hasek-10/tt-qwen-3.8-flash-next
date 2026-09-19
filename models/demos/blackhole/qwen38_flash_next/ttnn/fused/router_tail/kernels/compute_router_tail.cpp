@@ -12,6 +12,10 @@
 //   eltwise_binary_sfpu.cpp DIV (in0 * recip(in1)) then typecast fp32->bf16 -> cb_scores
 // The index tiles arrive pre-transposed (row k of tile w = w*32+k) and are copied into DST: the same DST content
 // the kernel's transpose produces, without the transpose.
+//
+// Runtime arg 0, pass_mask: 0 runs the LLK's four-pass local sort (the single-core form); bits 0..3 run only those
+// passes of the same network (topk_lanes.h), each pass being the complete sort of eight token columns.  The lane
+// form gives every core one pass and the eight tokens it holds; the other columns are left unsorted and never read.
 
 #include <cstdint>
 
@@ -29,8 +33,33 @@
 #include "api/compute/eltwise_unary/typecast.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.hpp"
+#include "topk_lanes.h"
+
+// One tile of the insertion chain into DST: the probabilities tile transposed into value slot `slot`, its
+// pre-transposed index tile copied into slot + 2 (topk.cpp loads both the same way).
+FORCE_INLINE void frt_load_tile(uint32_t cb_probs, uint32_t cb_index, uint32_t w, uint32_t slot) {
+    reconfig_data_format_srca(cb_probs);
+    transpose_init(cb_probs);
+    transpose_tile(cb_probs, w, slot);
+    reconfig_data_format_srca(cb_index);
+    copy_init(cb_index);
+    copy_tile(cb_index, w, slot + 2);
+}
+
+// The chain's sort of the 64 values in DST 0/1 (indices 2/3): topk.cpp's local sort call (unstable network, largest,
+// end phase 5); pass_mask != 0 sorts only those token passes of the same network (topk_lanes.h).
+FORCE_INLINE void frt_sort64(uint32_t pass_mask) {
+#ifndef FRT_TOPK_SORT_SKIP  // dev knob (timing): transposes and copies only, no sort
+    if (pass_mask == 0) {
+        ckernel::topk_local_sort<false>(0, 0 /* largest */, 5 /* end_phase */);
+    } else {
+        topk_local_sort_lanes<false>(0, 0 /* largest */, 5 /* end_phase */, pass_mask);
+    }
+#endif
+}
 
 void kernel_main() {
+    const uint32_t pass_mask = get_arg_val<uint32_t>(0);
     constexpr uint32_t cb_in0 = get_named_compile_time_arg_val("cb_in0");
     constexpr uint32_t cb_max_scaler = get_named_compile_time_arg_val("cb_max_scaler");
     constexpr uint32_t cb_sum_scaler = get_named_compile_time_arg_val("cb_sum_scaler");
@@ -180,20 +209,59 @@ void kernel_main() {
     ckernel::topk_tile_init();
     probs.wait_front(Wt);
     index.wait_front(Wt);
+#ifndef FRT_TOPK_SPLIT
     tile_regs_acquire();
     for (uint32_t w = 0; w < topk_tiles; ++w) {
-        const uint32_t slot = (w == 0) ? 0 : 1;
-        reconfig_data_format_srca(cb_probs);
-        transpose_init(cb_probs);
-        transpose_tile(cb_probs, w, slot);
-        reconfig_data_format_srca(cb_index);
-        copy_init(cb_index);
-        copy_tile(cb_index, w, slot + 2);
+        frt_load_tile(cb_probs, cb_index, w, (w == 0) ? 0 : 1);
         if (w != 0) {
-            ckernel::topk_local_sort<false>(0, 0 /* largest */, 5 /* end_phase */);
+            frt_sort64(pass_mask);
         }
     }
     tile_regs_commit();
+#else
+    // dev knob (study, never serves): a two-core width split emulated on one core.  The chain over tiles 0..Wt/2-1
+    // (its running top 32 staged through cb_vals_t / cb_idx_t), the chain over tiles Wt/2..Wt-1, then one sort of
+    // the two running sets.  The values agree with the sequential chain, the tie order does not.
+    static_assert(FRT_TOPK_SPLIT == 2, "the split emulation is two-way");
+    constexpr uint32_t half = Wt / 2;
+    tile_regs_acquire();
+    for (uint32_t w = 0; w < half; ++w) {
+        frt_load_tile(cb_probs, cb_index, w, (w == 0) ? 0 : 1);
+        if (w != 0) {
+            frt_sort64(pass_mask);
+        }
+    }
+    tile_regs_commit();
+    vals_t.reserve_back(1);
+    idx_t.reserve_back(1);
+    tile_regs_wait();
+    pack_reconfig_data_format(cb_vals_t);
+    pack_tile(0, cb_vals_t);
+    pack_reconfig_data_format(cb_idx_t);
+    pack_tile(2, cb_idx_t);
+    tile_regs_release();
+    vals_t.push_back(1);
+    idx_t.push_back(1);
+    tile_regs_acquire();
+    for (uint32_t w = half; w < Wt; ++w) {
+        frt_load_tile(cb_probs, cb_index, w, (w == half) ? 0 : 1);
+        if (w != half) {
+            frt_sort64(pass_mask);
+        }
+    }
+    vals_t.wait_front(1);
+    idx_t.wait_front(1);
+    reconfig_data_format_srca(cb_vals_t);
+    copy_init(cb_vals_t);
+    copy_tile(cb_vals_t, 0, 1);
+    reconfig_data_format_srca(cb_idx_t);
+    copy_init(cb_idx_t);
+    copy_tile(cb_idx_t, 0, 3);
+    frt_sort64(pass_mask);
+    tile_regs_commit();
+    vals_t.pop_front(1);
+    idx_t.pop_front(1);
+#endif
     probs.pop_front(Wt);
     index.pop_front(Wt);
     vals_t.reserve_back(1);

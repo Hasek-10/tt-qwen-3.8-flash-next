@@ -5,10 +5,19 @@
 bf16 scores and uint16 indices ``[1, 1, rows, top_k]`` (DRAM); the chain ``softmax(numeric_stable) -> topk(k, largest,
 sorted) -> sum -> div -> typecast(bf16) -> to_layout(ROW_MAJOR) x2 -> typecast(uint16)`` of ``Qwen38TTNNMoE._route``.
 
-One core per 32-row tile.  The compute kernel issues each replaced op's instruction sequence on CBs of that op's data
-format and unpack mode (``kernels/compute_router_tail.cpp``), so the values and the top-k tie order are the composed
-chain's: tolerance class BITWISE.  ``rows`` 1..32 is one tile; 128 rows (the long chunk) is four tiles on four cores
-(not proven on device yet; the model keeps the chunk on the composed chain).
+Two program forms, the same three kernels.  The single-core form (``QWEN38_ROUTER_TAIL_LANES=0``): one core per
+32-row tile; the compute kernel issues each replaced op's instruction sequence on CBs of that op's data format and
+unpack mode (``kernels/compute_router_tail.cpp``), so the values and the top-k tie order are the composed chain's:
+tolerance class BITWISE.  ``rows`` 1..32 is one tile; 128 rows (the long chunk) is four tiles on four cores (not
+proven on device yet; the model keeps the chunk on the composed chain).
+
+The lane form (the default, rows <= 32): the top-k LLK sorts a tile's 32 token columns in four
+independent passes of eight tokens each (``kernels/topk_lanes.h``); one core per pass that holds a live token, every
+core running the whole softmax and the whole insertion chain but only its pass of every sort, and writing only its
+tokens.  Same instructions on the same DST rows for every live token: bitwise with the single-core form by
+construction, at a quarter of the sort work per core (one core and one pass for rows <= 8 -- the decode body).
+``PASS_TOKENS`` (which tokens each pass holds: face by row half, pass by row parity) was measured on device by the
+lane probe, a development tool that is not shipped: rows 1 needs one core, rows 2..16 two, rows 17..32 four.
 """
 
 from __future__ import annotations
@@ -28,6 +37,16 @@ WIDTH_TILES = EXPERTS // fp.TILE
 TOP_K = 10
 STAGE_PAGES = 4  # 8 KB of bf16 tile pages for the writer's two 2 KB row stages plus alignment
 KERNELS = {name: fp.kernel_source(NAME, f"{name}_router_tail.cpp") for name in ("reader", "compute", "writer")}
+LANES_HEADER = fp.kernel_source(NAME, "topk_lanes.h")
+LANES_ENV = "QWEN38_ROUTER_TAIL_LANES"
+PASSES = 4  # the LLK local sort's (face, col) passes; pass p = bit p of the compute kernel's pass_mask
+ALL_TOKENS = (1 << fp.TILE) - 1
+# The eight token rows (of the untransposed tile) each sort pass covers: pass (face, col) = tokens of face `face`
+# (rows 0-15 / 16-31) with row parity `col`.  Measured on one Blackhole chip (the lane probe, 2026-09-18: with one
+# pass enabled exactly these rows stay bitwise against the chain; the four sets partition the tile).  A change here changes which core writes which row, nothing in the arithmetic.
+PASS_TOKENS: tuple[frozenset[int], ...] = tuple(
+    frozenset(range(16 * face + col, 16 * face + 16, 2)) for face in range(2) for col in range(2)
+)
 
 # Circular buffers: (name, index, dtype, pages).  The compute kernel unpacks cb_probs, cb_vals_t, cb_pad_reduce,
 # cb_pad_div and cb_denom straight into the 32-bit dest (as topk, the accurate fp32 reduce and binary_ng unpack their
@@ -56,8 +75,9 @@ TOKEN_CBS = ("cb_vals_ready", "cb_sums_ready")
 TOKEN_PAGE_BYTES = 32
 UNPACK_TO_DEST_FP32 = ("cb_probs", "cb_vals_t", "cb_vals", "cb_pad_div", "cb_sums")
 CB_INDEX = {name: index for name, index, _dtype, _pages in CBS}
-READER_ARGS = ("logits_addr", "index_addr", "tile_row", "rows_in_tile")
-WRITER_ARGS = ("scores_addr", "indices_addr", "tile_row", "rows_in_tile")
+READER_ARGS = ("logits_addr", "index_addr", "tile_row", "rows_in_tile", "token_mask")
+COMPUTE_ARGS = ("pass_mask",)
+WRITER_ARGS = ("scores_addr", "indices_addr", "tile_row", "rows_in_tile", "token_mask")
 
 
 def _compute_kernel_config(logits):
@@ -104,9 +124,42 @@ def router_tail_prepare(mesh):
     return _INDEX_TEMPLATES[key]
 
 
-def router_tail_program(logits, index_template, scores, indices, *, rows: int, top_k: int) -> "ttnn.ProgramDescriptor":
+def lanes_enabled(environ=os.environ) -> bool:
+    """The lane form serves by default; ``QWEN38_ROUTER_TAIL_LANES=0`` is the single-core form (the same kernels, one
+    core per tile, the LLK's own four-pass sort)."""
+
+    return environ.get(LANES_ENV, "1") != "0"
+
+
+def lanes_plan(rows: int, pass_tokens=None) -> list[tuple[int, int]]:
+    """``(pass_mask, token_mask)`` per core of the lane form for ``rows`` live tokens: one core per sort pass that holds
+    a live token, in pass order.  ``pass_tokens`` defaults to the pinned ``PASS_TOKENS``."""
+
+    pass_tokens = PASS_TOKENS if pass_tokens is None else pass_tokens
+    if not 1 <= rows <= fp.TILE:
+        raise ValueError(f"router tail lanes: rows must be 1..{fp.TILE}, got {rows}")
+    plan = []
+    for p, tokens in enumerate(pass_tokens):
+        owned = [t for t in range(rows) if t in tokens]
+        if owned:
+            plan.append((1 << p, sum(1 << t for t in owned)))
+    return plan
+
+
+def _core_plan(rows: int) -> tuple[list[tuple[int, int, int]], bool]:
+    """``(tile_row, pass_mask, token_mask)`` per core and whether the lane form was chosen: the lane form for one tile
+    unless ``QWEN38_ROUTER_TAIL_LANES=0``, else one core per tile row (pass_mask = the dev knob, default 0 = the LLK's
+    four-pass sort)."""
+
     tile_rows = -(-rows // fp.TILE)
-    cores = [ttnn.CoreCoord(0, y) for y in range(tile_rows)]
+    if tile_rows == 1 and lanes_enabled():
+        return [(0, pass_mask, token_mask) for pass_mask, token_mask in lanes_plan(rows)], True
+    return [(t, _dev_pass_mask(), ALL_TOKENS) for t in range(tile_rows)], False
+
+
+def router_tail_program(logits, index_template, scores, indices, *, rows: int, top_k: int) -> "ttnn.ProgramDescriptor":
+    plan, _lanes = _core_plan(rows)
+    cores = [ttnn.CoreCoord(0, y) for y in range(len(plan))]
     grid = ttnn.CoreRangeSet([ttnn.CoreRange(cores[0], cores[-1])])
     named = [(name, index) for name, index, _dtype, _pages in CBS] + [
         ("Wt", WIDTH_TILES),
@@ -126,7 +179,8 @@ def router_tail_program(logits, index_template, scores, indices, *, rows: int, t
 
     def per_core(args_of):
         return [
-            (core, args_of(tile_row, min(fp.TILE, rows - tile_row * fp.TILE))) for tile_row, core in enumerate(cores)
+            (core, args_of(tile_row, min(fp.TILE, rows - tile_row * fp.TILE), pass_mask, token_mask))
+            for core, (tile_row, pass_mask, token_mask) in zip(cores, plan)
         ]
 
     compute_config = ttnn.ComputeConfigDescriptor(
@@ -151,23 +205,25 @@ def router_tail_program(logits, index_template, scores, indices, *, rows: int, t
     reader = kernel(
         KERNELS["reader"],
         fp.accessor_args(logits) + fp.accessor_args(index_template),
-        per_core(lambda t, r: [logits.buffer_address(), index_template.buffer_address(), t, r]),
+        per_core(lambda t, r, _p, m: [logits.buffer_address(), index_template.buffer_address(), t, r, m]),
         ttnn.ReaderConfigDescriptor(),
     )
     writer = kernel(
         KERNELS["writer"],
         fp.accessor_args(scores) + fp.accessor_args(indices),
-        per_core(lambda t, r: [scores.buffer_address(), indices.buffer_address(), t, r]),
+        per_core(lambda t, r, _p, m: [scores.buffer_address(), indices.buffer_address(), t, r, m]),
         ttnn.WriterConfigDescriptor(),
     )
-    compute = kernel(KERNELS["compute"], [], [], compute_config)
+    compute = kernel(KERNELS["compute"], [], per_core(lambda _t, _r, p, _m: [p]), compute_config)
     compute.defines = _dev_defines()
     return fp.program_descriptor([reader, writer, compute], cbs=cbs)
 
 
 def _dev_defines() -> list[tuple[str, str]]:
-    """Timing knobs (dev only; both break the output): QWEN38_ROUTER_TAIL_TOPK_TILES=N sorts only the first N width
-    tiles, QWEN38_ROUTER_TAIL_SOFTMAX_COPY_ONLY=1 skips the softmax math."""
+    """Study knobs (dev only; every one of them breaks the output): QWEN38_ROUTER_TAIL_TOPK_TILES=N sorts only the
+    first N width tiles, QWEN38_ROUTER_TAIL_SOFTMAX_COPY_ONLY=1 skips the softmax math, QWEN38_ROUTER_TAIL_TOPK_SORT_SKIP=1
+    keeps the transposes and copies but skips the sorts, QWEN38_ROUTER_TAIL_TOPK_SPLIT=2 emulates a two-core width
+    split on one core (the study's tie-order counter-example)."""
 
     defines = []
     tiles = os.environ.get("QWEN38_ROUTER_TAIL_TOPK_TILES")
@@ -175,7 +231,22 @@ def _dev_defines() -> list[tuple[str, str]]:
         defines.append(("FRT_TOPK_TILES", str(int(tiles))))
     if os.environ.get("QWEN38_ROUTER_TAIL_SOFTMAX_COPY_ONLY") == "1":
         defines.append(("FRT_SOFTMAX_COPY_ONLY", "1"))
+    if os.environ.get("QWEN38_ROUTER_TAIL_TOPK_SORT_SKIP") == "1":
+        defines.append(("FRT_TOPK_SORT_SKIP", "1"))
+    split = os.environ.get("QWEN38_ROUTER_TAIL_TOPK_SPLIT")
+    if split:
+        defines.append(("FRT_TOPK_SPLIT", str(int(split))))
     return defines
+
+
+def _dev_pass_mask() -> int:
+    """Study knob (dev only): QWEN38_ROUTER_TAIL_TOPK_PASS_MASK=<0..15> makes the single-core form sort only those
+    passes of the LLK network (topk_lanes.h); the tokens of the other passes come out wrong.  0 = the LLK's own sort."""
+
+    mask = int(os.environ.get("QWEN38_ROUTER_TAIL_TOPK_PASS_MASK", "0"))
+    if not 0 <= mask < (1 << PASSES):
+        raise ValueError(f"QWEN38_ROUTER_TAIL_TOPK_PASS_MASK must be 0..{(1 << PASSES) - 1}, got {mask}")
+    return mask
 
 
 def router_tail(logits, *, top_k: int = TOP_K, compute_kernel_config=None, memory_config=ttnn.DRAM_MEMORY_CONFIG):

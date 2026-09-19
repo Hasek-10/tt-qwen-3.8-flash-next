@@ -6,7 +6,8 @@
 // top-k sum expect, the 16 pre-transposed uint32 index tiles (a constant tensor: row k of tile w holds w*32+k), and
 // the two in-place transforms the composed chain does as device ops: the zero fill of the top-k tile's padding
 // (fill_implicit_tile_padding) on the values tile and the column-0 broadcast of the denominator (binary_ng's
-// col-bcast reader) on the sums tile, each signalled to the compute kernel through a one-entry token CB.
+// col-bcast reader) on the sums tile, each signalled to the compute kernel through a one-entry token CB.  Runtime
+// arg 4 (token_mask) names the rows this core produces (the lane form gives each core eight tokens).
 
 #include <cstdint>
 
@@ -21,6 +22,7 @@ void kernel_main() {
     const uint32_t index_addr = get_arg_val<uint32_t>(1);
     const uint32_t tile_row = get_arg_val<uint32_t>(2);
     const uint32_t rows_in_tile = get_arg_val<uint32_t>(3);
+    const uint32_t token_mask = get_arg_val<uint32_t>(4);  // bit r: this core produces row r (all ones: one core per tile)
 
     constexpr uint32_t cb_in0 = get_named_compile_time_arg_val("cb_in0");
     constexpr uint32_t cb_max_scaler = get_named_compile_time_arg_val("cb_max_scaler");
@@ -72,7 +74,8 @@ void kernel_main() {
     index.push_back(Wt);
 
     // fill_implicit_tile_padding(scores, 0) in place: columns >= top_k (faces 1 and 3 whole; columns top_k..15 of
-    // faces 0 and 2) and rows >= rows_in_tile of the [token, k] tile; the compute kernel pops the tile after its sum
+    // faces 0 and 2) and rows >= rows_in_tile of the [token, k] tile (and the rows this core does not produce, like
+    // padding); the compute kernel pops the tile after its sum
     DataflowBuffer vals(cb_vals);
     DataflowBuffer vals_ready(cb_vals_ready);
     vals.wait_front(1);
@@ -85,7 +88,7 @@ void kernel_main() {
         for (uint32_t row = 0; row < 32; ++row) {
             const uint32_t face = (row >> 4) * 2;
             const uint32_t base = face * 256 + (row & 15) * 16;
-            const uint32_t first_zero = row < rows_in_tile ? top_k : 0u;
+            const uint32_t first_zero = (row < rows_in_tile && ((token_mask >> row) & 1u)) ? top_k : 0u;
             for (uint32_t col = first_zero; col < 16; ++col) {
                 tile[base + col] = 0u;
             }

@@ -5,6 +5,7 @@
 // Router tail, writer: the top-k of one 32-row tile as ROW_MAJOR rows of top_k bf16 scores and top_k uint16
 // indices (the untilize + uint16 typecast of the composed chain).  The scores tile is [token, k]; the index tile
 // is the sort's transposed [k, token] uint32 tile.  Rows are staged at a 64-byte pitch before the NoC write.
+// Runtime arg 4 (token_mask) names the rows this core writes (the lane form gives each core eight tokens).
 
 #include <cstdint>
 
@@ -18,6 +19,7 @@ void kernel_main() {
     const uint32_t indices_addr = get_arg_val<uint32_t>(1);
     const uint32_t tile_row = get_arg_val<uint32_t>(2);
     const uint32_t rows_in_tile = get_arg_val<uint32_t>(3);
+    const uint32_t token_mask = get_arg_val<uint32_t>(4);  // bit r: this core writes row r (all ones: one core per tile)
 
     constexpr uint32_t cb_idx_t = get_named_compile_time_arg_val("cb_idx_t");
     constexpr uint32_t cb_scores = get_named_compile_time_arg_val("cb_scores");
@@ -46,6 +48,9 @@ void kernel_main() {
     volatile tt_l1_ptr uint32_t* idx = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(idx_t.get_read_ptr());
     volatile tt_l1_ptr uint16_t* sc = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scores.get_read_ptr());
     for (uint32_t row = 0; row < rows_in_tile; ++row) {
+        if (((token_mask >> row) & 1u) == 0) {
+            continue;  // another core's token
+        }
         volatile tt_l1_ptr uint16_t* srow =
             reinterpret_cast<volatile tt_l1_ptr uint16_t*>(stage_scores + row * stage_pitch);
         volatile tt_l1_ptr uint16_t* irow =
