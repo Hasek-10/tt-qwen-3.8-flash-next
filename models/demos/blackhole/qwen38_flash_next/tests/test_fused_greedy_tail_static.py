@@ -220,7 +220,10 @@ def test_lm_head_hook_and_dataclass_field_are_pinned():
 
 
 def test_manifest_lists_the_files():
-    manifest = json.loads((HERE / "tools" / "release" / "manifest.json").read_text())["public"]
+    manifest_path = HERE / "tools" / "release" / "manifest.json"
+    if not manifest_path.exists():
+        pytest.skip("tools/release/manifest.json is not in this tree (the public tree ships without tools/release/)")
+    manifest = json.loads(manifest_path.read_text())["public"]
     for path in ("tests/test_fused_greedy_tail_static.py", "ttnn/fused/greedy_tail/__init__.py") + tuple(
         f"ttnn/fused/greedy_tail/kernels/{name}.cpp" for name in ("scan", "merge", "resolve")
     ):

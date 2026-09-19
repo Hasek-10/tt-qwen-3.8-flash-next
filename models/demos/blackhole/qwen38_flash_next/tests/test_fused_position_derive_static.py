@@ -170,7 +170,9 @@ def test_advance_is_registered_and_is_the_chains_in_place_add():
     assert named == {"cb_stage", "count"}
     source = inspect.getsource(pd.advance)
     assert set(re.findall(r'"([a-z_0-9]+)": ', source.split("named={")[1].split("}")[0])) == named
-    assert "words[0] = words[0] + ADVANCE_COUNT;" in ADVANCE_SOURCE  # the uint32 add of the chain's ttnn.add(scalar, count)
+    assert (
+        "words[0] = words[0] + ADVANCE_COUNT;" in ADVANCE_SOURCE
+    )  # the uint32 add of the chain's ttnn.add(scalar, count)
     assert "noc.async_write(stage, position, SCALAR_BYTES," in ADVANCE_SOURCE  # in place, the 4-byte page
     assert "\n        [position, position]," in source  # the resident scalar is the input and the output (in place)
     composed = inspect.getsource(pd.advance_composed)
@@ -197,7 +199,10 @@ def test_advance_hook_is_pinned_in_contracts():
     fused_body = fused_body[: fused_body.index("    def advance_by(")]
     assert "written = self._fused_advance(self.scalar, count)" in fused_body
     assert 'raise RuntimeError("device position advance did not write the resident scalar in place")' in fused_body
-    manifest = json.loads((Path(__file__).resolve().parents[1] / "tools" / "release" / "manifest.json").read_text())
+    manifest_path = Path(__file__).resolve().parents[1] / "tools" / "release" / "manifest.json"
+    if not manifest_path.exists():
+        pytest.skip("tools/release/manifest.json is not in this tree (the public tree ships without tools/release/)")
+    manifest = json.loads(manifest_path.read_text())
     assert "ttnn/fused/position_derive/kernels/advance.cpp" in manifest["public"]
 
 

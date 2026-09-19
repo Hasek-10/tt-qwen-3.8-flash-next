@@ -11,7 +11,8 @@ flashed or reset; the mesh is opened once and closed):
   3. cluster descriptor: copied into the log directory; chips_with_mmio over the
      expected device nodes; the ethernet graph classified as line or ring; the
      route derived with ``physical_route.derive_canonical_line_route`` when the
-     graph is a line, else a recorded ring walk from the lowest chip ID;
+     graph is a line, else the fabric's line order (``derive_fabric_line_route``,
+     the ring walk from the lowest chip ID recorded next to it);
   4. SystemMeshDescriptor local shape (one local 4x1 line, all_local);
   5. fabric FABRIC_1D / STRICT_INIT, ``open_mesh_device`` with the server's
      arguments (l1_small_size 24576, trace_region_size 0), reshape to 1x4,
@@ -242,11 +243,19 @@ def main() -> int:
         report["topology"]["route_derivation"] = "physical_route.derive_canonical_line_route"
     except physical_route.PhysicalRouteError as error:
         report["topology"]["line_route_error"] = str(error)
-        route = _ring_walk(adjacency)
-        report["topology"][
-            "route_derivation"
-        ] = "ring walk from the lowest chip ID (line derivation refused: see line_route_error)"
-        print(f"[info] line route refused: {error}; ring walk route {route}", flush=True)
+        route = physical_route.derive_fabric_line_route(
+            document,
+            chips_with_mmio,
+            lambda mesh_id, chip_id: int(ttnn.cluster.get_chip_unique_id_from_fabric_node_id(mesh_id, chip_id)),
+        )
+        walk = _ring_walk(adjacency)
+        report["topology"]["ring_walk_route"] = list(walk)
+        report["topology"]["ring_walk_agrees"] = walk == route
+        report["topology"]["route_derivation"] = (
+            "physical_route.derive_fabric_line_route (line derivation refused: see line_route_error; "
+            "the ring walk from the lowest chip ID is recorded as ring_walk_route)"
+        )
+        print(f"[info] line route refused: {error}; fabric line order {route}; ring walk {walk}", flush=True)
     checks.expect("route covers four chips", sorted(route), sorted(chips_with_mmio))
     route_nodes = physical_route.route_device_nodes(route, chips_with_mmio)
     report["topology"].update(

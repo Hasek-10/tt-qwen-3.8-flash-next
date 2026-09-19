@@ -31,7 +31,7 @@ class ResidentHardwareProfile:
 
     ``partition`` names the lane on the host (``"qb"``: the whole box; ``"a"``/``"b"``: four chips of a larger
     host, ``"0"``/``"1"`` the same on a QuietBox 2 class host).  ``ethernet_graph`` selects the route derivation:
-    ``"line"`` is ``physical_route.derive_canonical_line_route``, ``"ring"`` is ``derive_ring_walk_route`` (chips in
+    ``"line"`` is ``physical_route.derive_canonical_line_route``, ``"ring"`` is ``derive_fabric_line_route`` (chips in
     an ethernet ring, opened as a 1x4 LINE through a mesh graph descriptor).  ``route`` / ``route_nodes`` pin the
     derived order; ``None`` means the route is derived at start (``qwen38_chat_session.resolve_route``) and
     recorded, not pinned.  ``boards`` (serial per node), ``bdfs`` and ``numa_node`` are
@@ -76,7 +76,8 @@ class ResidentHardwareProfile:
 
 
 # QuietBox: 4x p150b, KMD nodes 0-3 on one NUMA node, chips in an ethernet ring; the 1x4 LINE mesh graph
-# descriptor opens them in ring-walk order (0, 2, 1, 3) = nodes (1, 3, 2, 0).  Verified 2026-09-04 (fw 19.4.1.0).
+# descriptor opens them in the fabric's line order (0, 2, 1, 3) = nodes (1, 3, 2, 0), which is also the ring walk
+# from chip 0 there.  Verified 2026-09-04 (fw 19.4.1.0); the fabric-order derivation re-checked 2026-09-18.
 QUIETBOX = ResidentHardwareProfile(
     host="tt-quietbox",
     partition="qb",
@@ -114,7 +115,9 @@ def _quietbox_2_instance(instance: int) -> ResidentHardwareProfile:
     QuietBox 2 (2x p300c = nodes 0-3) has one ring over the on-card links and the two Warp400 links, so it is one
     instance.  A four-card host (8 dies) is two instances of four consecutive nodes.  ttnn classifies a p300
     cluster that is not exactly 2 or 4 dies as CUSTOM and refuses to open without a mesh graph descriptor, so the
-    launcher always exports the descriptor.  The route is unpinned: the first run prints the derived one."""
+    launcher always exports the descriptor.  The route is unpinned: derived at start from the order in which the
+    fabric embedded the LINE descriptor onto the ring (``physical_route.derive_fabric_line_route``; a QuietBox 2 on
+    2026-09-18: (1, 0, 3, 2), not the ring walk (0, 1, 2, 3)) and recorded."""
 
     first = 4 * instance
     nodes = (first, first + 1, first + 2, first + 3)

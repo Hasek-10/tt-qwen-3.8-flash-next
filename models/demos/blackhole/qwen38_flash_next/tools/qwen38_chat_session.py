@@ -1139,8 +1139,9 @@ def template_decoder(template: Any) -> Callable[[list[int]], str]:
 
 
 def resolve_route(hardware_profile: ResidentHardwareProfile) -> tuple[ResidentHardwareProfile, dict]:
-    """The profile with its route: derived from the cluster descriptor (no device is opened) and adopted when the
-    profile leaves it ``None`` (the p150 line: recorded, not pinned), checked against the pinned one otherwise."""
+    """The profile with its route: derived from the cluster descriptor (no device is opened; a ring also asks the
+    fabric's control plane for its line order) and adopted when the profile leaves it ``None`` (the p150 line and the
+    QuietBox 2: recorded, not pinned), checked against the pinned one otherwise."""
 
     import yaml
 
@@ -1150,11 +1151,24 @@ def resolve_route(hardware_profile: ResidentHardwareProfile) -> tuple[ResidentHa
     chips_with_mmio = physical_route.parse_chips_with_mmio(
         document, expected_device_nodes=set(hardware_profile.device_nodes)
     )
-    derive_route = {
-        "line": physical_route.derive_canonical_line_route,
-        "ring": physical_route.derive_ring_walk_route,
-    }[hardware_profile.ethernet_graph]
-    route = derive_route(document, chips_with_mmio)
+    derivation: dict[str, Any] = {"cluster_descriptor": str(descriptor_path), "chips_with_mmio": chips_with_mmio}
+    if hardware_profile.ethernet_graph == "line":
+        route = physical_route.derive_canonical_line_route(document, chips_with_mmio)
+        derivation["route_derivation"] = physical_route.derive_canonical_line_route.__name__
+    else:
+        # A ring under the 1x4 LINE descriptor: the fabric's topology solver chose which three of the four links
+        # carry the line, and the mesh must open in that order (QuietBox (0, 2, 1, 3) = its ring walk; QuietBox 2
+        # (1, 0, 3, 2), 2026-09-18, where the ring walk (0, 1, 2, 3) put a mesh neighbour pair on the unused link
+        # and the first all_gather failed).  The walk is recorded next to the route for comparison.
+        route = physical_route.derive_fabric_line_route(
+            document,
+            chips_with_mmio,
+            lambda mesh_id, chip_id: int(ttnn.cluster.get_chip_unique_id_from_fabric_node_id(mesh_id, chip_id)),
+        )
+        ring_walk = physical_route.derive_ring_walk_route(document, chips_with_mmio)
+        derivation["route_derivation"] = physical_route.derive_fabric_line_route.__name__
+        derivation["ring_walk_route"] = list(ring_walk)
+        derivation["ring_walk_agrees"] = ring_walk == route
     route_nodes = physical_route.route_device_nodes(route, chips_with_mmio)
     if hardware_profile.route is None:
         hardware_profile = replace(hardware_profile, route=route, route_nodes=route_nodes)
@@ -1163,11 +1177,7 @@ def resolve_route(hardware_profile: ResidentHardwareProfile) -> tuple[ResidentHa
             f"{lane} route actual=(logical={route}, nodes={route_nodes}) "
             f"expected=(logical={hardware_profile.route}, nodes={hardware_profile.route_nodes})"
         )
-    return hardware_profile, {
-        "cluster_descriptor": str(descriptor_path),
-        "chips_with_mmio": chips_with_mmio,
-        "route_derivation": derive_route.__name__,
-    }
+    return hardware_profile, derivation
 
 
 def open_partition_b_mesh(marker: Marker, hardware_profile: ResidentHardwareProfile) -> tuple[Any, dict]:
@@ -1178,8 +1188,8 @@ def open_partition_b_mesh(marker: Marker, hardware_profile: ResidentHardwareProf
     host (its partition-B values are the profile's defaults, hence the
     name; a partition-A profile brings its own nodes, route and locks; both
     are a 4x1 line reshaped to 1x4, ``derive_canonical_line_route``).  A ring
-    profile (the QuietBox) opens the 1x4 its mesh graph descriptor reports in
-    ``derive_ring_walk_route`` order.  Every check before the fabric enable
+    profile (the QuietBox, the QuietBox 2) opens the 1x4 in the order the fabric
+    embedded its LINE descriptor, ``derive_fabric_line_route``.  Every check before the fabric enable
     raises with the fabric untouched; a failure after it disables the fabric
     before re-raising, so the caller owns the fabric only once this returns.
     """
@@ -1233,6 +1243,8 @@ def open_partition_b_mesh(marker: Marker, hardware_profile: ResidentHardwareProf
         "canonical_logical_route": list(route),
         "canonical_device_node_route": list(route_nodes),
         "route_derivation": derivation["route_derivation"],
+        "ring_walk_route": derivation.get("ring_walk_route"),
+        "ring_walk_agrees": derivation.get("ring_walk_agrees"),
         "cluster_descriptor": derivation["cluster_descriptor"],
         "fabric_config": "FABRIC_1D",
         "collective_topology": "Linear",

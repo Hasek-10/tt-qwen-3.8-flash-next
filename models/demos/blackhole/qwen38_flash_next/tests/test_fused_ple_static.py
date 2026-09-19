@@ -12,6 +12,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 from models.demos.blackhole.qwen38_flash_next.ttnn import fused
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import ple
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import program as fp
@@ -166,7 +168,10 @@ def test_every_chain_attribute_the_fused_ple_uses_exists():
 
 
 def test_manifest_lists_the_files():
-    manifest = json.loads((HERE / "tools" / "release" / "manifest.json").read_text())["public"]
+    manifest_path = HERE / "tools" / "release" / "manifest.json"
+    if not manifest_path.exists():
+        pytest.skip("tools/release/manifest.json is not in this tree (the public tree ships without tools/release/)")
+    manifest = json.loads(manifest_path.read_text())["public"]
     for path in ["tests/test_fused_ple_static.py", "ttnn/fused/ple/__init__.py"] + [
         f"ttnn/fused/ple/kernels/{k}"
         for k in (

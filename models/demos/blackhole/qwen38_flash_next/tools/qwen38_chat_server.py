@@ -1666,6 +1666,9 @@ def main() -> int:
         "route": list(hardware_profile.route),
         "route_nodes": list(hardware_profile.route_nodes),
         "route_derivation": route_derivation["route_derivation"],
+        # a ring: the ring walk from the lowest chip next to the fabric's line order the mesh opens in (QuietBox: equal)
+        "route_ring_walk": route_derivation.get("ring_walk_route"),
+        "route_ring_walk_agrees": route_derivation.get("ring_walk_agrees"),
         "allocated_context": resident_context.allocated_context,
         "context_limit": resident_context.context_limit,
         "source": {
@@ -1929,6 +1932,8 @@ def main() -> int:
                 "mtp": report["chain"]["mtp"],
                 "fused_kernels": sorted(fused.enabled_names()),
                 "dram_workers_per_bank": report["chain"]["dram_workers_per_bank"],
+                "route": list(hardware_profile.route),
+                "route_derivation": route_derivation["route_derivation"],
             }
             ready_marker.write_text(json.dumps(ready, sort_keys=True) + "\n", encoding="utf-8")
             marker("chat-server-ready")
