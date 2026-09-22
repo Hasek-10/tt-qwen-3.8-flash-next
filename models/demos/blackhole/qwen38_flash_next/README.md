@@ -143,6 +143,7 @@ The run directory (`<cache-root>/runs/<stamp>/`) holds `READY`, `phase-markers.j
 | `--prepare-only --bf4-stage-limit N` | convert at most N missing expert layers into the BF4 cache and stop |
 | `--long-chunks` | 128-row prefill chunks where the prompt allows (section 6); off by default, not combined with `--mtp` |
 | `--prefill-slab 2048` | prefill slabs of 2048 rows ahead of the 128-row chunks: one matmul per dense linear, tolerance-class against the chunk bodies (`docs/PREFILL.md`); off by default, not combined with `--mtp` |
+| `--draft-source mtp\|hybrid\|ngram` | who drafts a pass (needs `--mtp`): the MTP head (default); the host's prompt-lookup drafter when the last n tokens recur in the request's text and the MTP head otherwise (`hybrid`); the host alone (`ngram`, the A/B arm). A host-drafted pass skips the k - 1 device draft rows; acceptance decides what commits either way |
 | `--mtp K[,K...]` (K in 3..7) | speculative drafting on greedy requests (section 6); off by default; a comma list opens one arm per K, the first the default: a request's `speculative_drafts` picks an arm, a request with tools takes the largest; 3 and 4 measured, 5..7 admitted for the QuietBox 2 sweep |
 | `--port`, `--host` | the listening port; `--host` default `0.0.0.0`: the QuietBox and p150-line profiles serve the LAN |
 | `--serve-seconds N` | stop after N seconds (a drain: the request in flight gets its reply) |
@@ -209,6 +210,11 @@ contract (hang-ups, stalled readers, deadlines, the stall watchdog, `/health` fi
   `speculative_drafts` picks an arm, a request with tools takes the largest, and `/health.mtp` lists `arms` and
   `default_k`.  The arms share the MTP layer's caches; each further arm costs its rows-dependent states and three
   traces (`MTP_ARM_BYTES_PER_BANK_UPPER_BOUND`, 12 MB per bank in the admission).  Unrun on silicon.
+- Host drafting (`--draft-source hybrid`): when the last 2..4 tokens have occurred before in the prompt or the generated
+  text, the host proposes the k tokens that followed that occurrence (prompt lookup) in microseconds and the pass skips
+  the device's k - 1 draft rows (about 4 ms each); otherwise the MTP head drafts as usual.  Acceptance decides what
+  commits either way, so the committed stream is unchanged; `qwen38.mtp.host_drafted_passes` counts the host passes.
+  `ngram` is the host-alone arm for measuring the drafter by itself.  Unrun on silicon.
 
 ## 7. QuietBox 2
 

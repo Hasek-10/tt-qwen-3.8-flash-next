@@ -66,11 +66,15 @@ next step is per-request k (section 4), not a larger default.
    and `default_k`, the response's `qwen38.mtp.k` is the arm used. Admission adds `MTP_ARM_BYTES_PER_BANK_UPPER_BOUND`
    (12 MB per bank) per further arm and the open measures the growth against it; the warm pass runs every residue
    per arm. Unrun on silicon: the first `--mtp 4,7 --acceptance` start is its proof.
-2. **A cheaper draft row.** Each draft row runs the MTP layer in its 32-row verify form on one real row, the 1-row
-   MoE, the final mixer, the full LM head (0.64 GB bf8) and the on-device resolve: ~4 ms. The draft's numerics do
-   not affect losslessness (verify decides), so a bf4 LM head for drafting alone (90 MB per device; 3.8 GB per
-   device is free at 32k) or a 1-row decode form of the MTP layer are both legal. Measure the row first with the
-   `draft:*` observer stages.
+2. **A cheaper draft row — the host half is on this branch.** `--draft-source hybrid` runs the pass loop in a
+   host-first form (`ttnn/mtp_v2.py`, `Qwen38TTNNMTPChain(host_drafter=...)`): after the verify row is read, a
+   prompt-lookup drafter (`ttnn/ngram_draft.py`: the tokens that followed the most recent earlier occurrence of the
+   last 2..4 tokens) proposes the next pass's k ids in microseconds and the k - 1 device draft rows (~4 ms each)
+   are skipped; when nothing recurs, the device draft trace replays as before. Lossless by construction (the
+   accept rule reads only the target's argmaxes). Expected: structured output, code and copy-heavy replies at
+   close to verify-only pass time (~55 ms for up to k + 1 tokens); chat unchanged. `ngram` is the host-alone A/B
+   arm. Still open on the device side: a bf4 LM head for the MTP draft (90 MB per device) or a 1-row decode form
+   of the MTP layer for the fallback rows.
 3. **`gdn_step` on by default** if step 3.5 passes: ~1,760 programs and up to ~7 ms per token.
 4. **Batched decode**: the largest lever (under 10% of roofline, B=8 is ~5-7x aggregate) and a redesign of the
    traced chain, sampler and server. Not before the numbers above exist.
@@ -85,6 +89,7 @@ does one host-to-device copy; no extra round trip) and GDN state precision (fp32
 | base `545cb29d` | 1,641 | 1,458 | 38 | 16 | 86 |
 | this branch | 1,706 | 1,523 | 38 | 16 | 86 |
 | + per-request draft length | 1,725 | 1,542 | 38 | 16 | 86 |
+| + host drafting (hybrid / ngram) | 1,754 | 1,614 | 38 | 16 | 86 |
 
 The 65 added tests are the rows 7/8 and k 6/7 parametrizations. The failing and erroring set is identical on both
 trees: the checkpoint-reading tests (`QWEN38_CHECKPOINT` unset) and `test_ttnn_bf4_static`, which pins the

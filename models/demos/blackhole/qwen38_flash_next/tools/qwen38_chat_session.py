@@ -84,7 +84,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_prefill_driver import
     alignment_steps,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn import gdn as gdn_module
-from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_v2
+from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_v2, ngram_draft
 from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import (
     BF4_TILE_BYTES,
     BLACKHOLE_RING_SIZES,
@@ -144,6 +144,10 @@ THINK_END_ID = protocol.THINK_END_ID
 # 1-row fp32 step recurrence over the committed rows), the bootstrap pass's placeholder drafts, the resident expert
 # pairs with the MTP layer's.
 MTP_DRAFTS = (3, 4, 5, 6, 7)
+# Who drafts a pass's k ids: the MTP head on the device (``mtp``), the host's prompt-lookup drafter when the last
+# n tokens recur in the request's text and the MTP head otherwise (``hybrid``), or the host alone, fill tokens when
+# nothing recurs (``ngram``: the A/B arm that measures the drafter by itself).
+DRAFT_SOURCES = ("mtp", "hybrid", "ngram")
 MTP_GDN_ANCHORS = ("off", "layer0")
 MTP_GDN_ANCHOR_LAYERS = {"off": (), "layer0": (0,)}
 MTP_BOOTSTRAP_DRAFT_TOKEN = 0
@@ -704,7 +708,8 @@ class Qwen38ChatSession:
                 with self.chain.loop_guard():
                     record = self.chain.mtp_step()
             else:
-                record = self.chain.mtp_enter(pending, self.ple_context)  # the eager seed, then the bootstrap pass
+                # The eager seed, then the bootstrap pass; the committed ids seed a host drafter.
+                record = self.chain.mtp_enter(pending, self.ple_context, history=self.committed)
                 entered = True
             accepted = record.accepted
             emitted = [int(token) for token in record.argmaxes[: accepted + 1]]
@@ -928,7 +933,11 @@ class Qwen38ChatSession:
             finish: str | None = chunked.stopped if chunk_stopped else None
             hook_stopped = chunk_stopped
             first_ns = last_ns = started_ns
-            mtp_before = None if not drafting else (self.mtp.passes, self.mtp.accepted_drafts)
+            mtp_before = (
+                None
+                if not drafting
+                else (self.mtp.passes, self.mtp.accepted_drafts, self.mtp.host_drafted_passes)
+            )
 
             def consume(steps) -> None:
                 nonlocal finish, hook_stopped, first_ns, last_ns
@@ -1047,7 +1056,9 @@ class Qwen38ChatSession:
                 None
                 if not drafting
                 else self.mtp.summary(
-                    passes=self.mtp.passes - mtp_before[0], accepted_drafts=self.mtp.accepted_drafts - mtp_before[1]
+                    passes=self.mtp.passes - mtp_before[0],
+                    accepted_drafts=self.mtp.accepted_drafts - mtp_before[1],
+                    host_drafted_passes=self.mtp.host_drafted_passes - mtp_before[2],
                 )
             ),
         )
@@ -1296,6 +1307,7 @@ class Qwen38ChainMTPArm:
     verify_output: mtp_v2.Qwen38TTNNVerifyOutput | None = None
     passes: int = 0
     accepted_drafts: int = 0
+    host_passes: int = 0  # passes whose next drafts the host drafter proposed
     capture_ms: dict[str, float] = field(default_factory=dict)
     trace_dram_bytes_per_bank: dict[str, int] = field(default_factory=dict)
 
@@ -1328,6 +1340,7 @@ class Qwen38ChainMTP:
     step_inputs: mtp_v2.Qwen38TTNNMTPStepInputs
     chunk_extension: mtp_v2.Qwen38TTNNMTPChunkExtension | None
     active_drafts: int | None = None
+    draft_source: str = "mtp"
     chain: mtp_v2.Qwen38TTNNMTPChain | None = None
     step_written: bool = False
     admission: dict[str, Any] = field(default_factory=dict)  # mtp_capacity_admission at the build's context
@@ -1353,6 +1366,8 @@ class Qwen38ChainMTP:
             self.active_drafts = self.default_drafts
         elif self.active_drafts not in self.arms:
             raise ValueError(f"active drafts {self.active_drafts!r} is not an arm of {sorted(self.arms)}")
+        if self.draft_source not in DRAFT_SOURCES:
+            raise ValueError(f"draft_source must be one of {DRAFT_SOURCES}, got {self.draft_source!r}")
 
     # -- the active arm ----------------------------------------------------------------------
 
@@ -1409,6 +1424,10 @@ class Qwen38ChainMTP:
         return sum(arm.accepted_drafts for arm in self.arms.values())
 
     @property
+    def host_drafted_passes(self) -> int:
+        return sum(arm.host_passes for arm in self.arms.values())
+
+    @property
     def capture_ms(self) -> dict[str, float]:
         return {f"{name}@k{k}": ms for k, arm in sorted(self.arms.items()) for name, ms in arm.capture_ms.items()}
 
@@ -1430,22 +1449,29 @@ class Qwen38ChainMTP:
         arm = self.active
         arm.passes += 1
         arm.accepted_drafts += pass_record.accepted
+        if getattr(pass_record, "source", "device") == "host":
+            arm.host_passes += 1
         return pass_record
 
-    def summary(self, *, passes: int | None = None, accepted_drafts: int | None = None) -> dict[str, Any]:
-        """The ``qwen38.mtp`` object: k (the active arm's), the admitted arms and the default, anchor, passes,
-        accepted drafts and tokens per pass (``a + 1`` per pass), cumulative (health) or over the counts a request
-        added."""
+    def summary(
+        self, *, passes: int | None = None, accepted_drafts: int | None = None, host_drafted_passes: int | None = None
+    ) -> dict[str, Any]:
+        """The ``qwen38.mtp`` object: k (the active arm's), the admitted arms and the default, anchor, the draft
+        source, passes, accepted drafts, the passes the host drafted, and tokens per pass (``a + 1`` per pass),
+        cumulative (health) or over the counts a request added."""
 
         passes = self.passes if passes is None else passes
         accepted_drafts = self.accepted_drafts if accepted_drafts is None else accepted_drafts
+        host_drafted_passes = self.host_drafted_passes if host_drafted_passes is None else host_drafted_passes
         return {
             "k": self.active_drafts,
             "arms": sorted(self.arms),
             "default_k": self.default_drafts,
             "anchor": self.anchor,
+            "draft_source": self.draft_source,
             "passes": passes,
             "accepted_drafts": accepted_drafts,
+            "host_drafted_passes": host_drafted_passes,
             "tokens_per_pass": None if not passes else round((passes + accepted_drafts) / passes, 4),
         }
 
@@ -1650,11 +1676,17 @@ class Qwen38TracedChain:
         ttnn._ttnn_execute_trace(self.mesh, trace_id, cq_id=0, blocking=False)
 
     def mtp_enter(
-        self, first_token: int, ple_context: tuple[int, int] | None, *, drafts: int | None = None
+        self,
+        first_token: int,
+        ple_context: tuple[int, int] | None,
+        *,
+        drafts: int | None = None,
+        history: Sequence[int] = (),
     ) -> mtp_v2.Qwen38TTNNMTPPassRecord:
         """Eager switch into verify mode at the device position (the host's committed count), then the bootstrap
         pass whose row 0 is ``first_token`` (placeholder drafts).  ``drafts`` selects the arm (``None`` keeps the
-        active one, the default or the request's choice).  Returns the pass record."""
+        active one, the default or the request's choice); ``history`` (the committed ids before ``first_token``)
+        seeds the host drafter of a ``hybrid`` / ``ngram`` chain.  Returns the pass record."""
 
         mtp = self.mtp
         model = self.built_target.model
@@ -1662,6 +1694,14 @@ class Qwen38TracedChain:
             raise Qwen38ChatChainError("the MTP pass loop is already active")
         if drafts is not None:
             mtp.select(drafts)
+        host_drafter = None
+        if mtp.draft_source != "mtp":
+            host_drafter = ngram_draft.Qwen38NgramDrafter(
+                mtp.drafts,
+                history=history,
+                fill_token=MTP_BOOTSTRAP_DRAFT_TOKEN,
+                decline=mtp.draft_source == "hybrid",
+            )
         position = self.state.position.read()
         mtp_v2.enter_verify_mode(model, self.state, mtp.verify, position=position, ple_context=ple_context)
         mtp.chain = mtp_v2.Qwen38TTNNMTPChain(
@@ -1673,6 +1713,7 @@ class Qwen38TracedChain:
             replay=self._replay,
             position=position,
             enqueue=self._enqueue,
+            host_drafter=host_drafter,
         )
         return mtp.record(mtp.chain.bootstrap([first_token] + [MTP_BOOTSTRAP_DRAFT_TOKEN] * mtp.drafts))
 
@@ -1714,6 +1755,7 @@ class Qwen38TracedChain:
         long_chunks: bool = False,
         mtp: int | Sequence[int] | None = None,
         mtp_gdn_anchor: str = "off",
+        draft_source: str = "mtp",
         device_sampler: bool = False,
         slab_rows: int | None = None,
     ) -> Qwen38TracedChain:
@@ -1756,6 +1798,8 @@ class Qwen38TracedChain:
                 raise ValueError(f"mtp drafts must be draft counts in {MTP_DRAFTS} or None, got {mtp!r}")
             if len(set(mtp_arms)) != len(mtp_arms):
                 raise ValueError(f"mtp draft counts must be distinct, got {mtp!r}")
+        if draft_source not in DRAFT_SOURCES or (draft_source != "mtp" and mtp is None):
+            raise ValueError(f"draft_source must be one of {DRAFT_SOURCES} (and needs mtp), got {draft_source!r}")
         if mtp_gdn_anchor not in MTP_GDN_ANCHORS:
             raise ValueError(f"mtp_gdn_anchor must be one of {MTP_GDN_ANCHORS}, got {mtp_gdn_anchor!r}")
         if long_chunks and mtp is not None:
@@ -1867,6 +1911,7 @@ class Qwen38TracedChain:
                 arms=arms,
                 default_drafts=mtp_arms[0],
                 anchor=mtp_gdn_anchor,
+                draft_source=draft_source,
                 components=mtp_components,
                 step_inputs=mtp_v2.Qwen38TTNNMTPStepInputs.allocate(mesh, model.mesh_contract),
                 chunk_extension=(

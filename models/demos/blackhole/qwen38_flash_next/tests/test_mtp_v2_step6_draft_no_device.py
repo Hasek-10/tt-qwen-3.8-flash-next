@@ -1003,3 +1003,123 @@ def test_pass_loop_step_order_and_the_verify_body_are_pinned() -> None:
         "Qwen38TTNNDraftState",
     }
     assert exported <= set(mtp_v2.__all__)
+
+
+# --------------------------------------------------------------------------- the host-first pass form (a host drafter)
+
+
+class _OracleHostDrafter:
+    """The oracle drafter run on the host: proposes the next pass's k ids on the passes ``propose_on`` names and
+    declines on the others (the device draft trace then runs), over a history the chain extends per pass."""
+
+    def __init__(self, drafter, prompt: list[int], *, k: int, propose_on) -> None:
+        self.drafter, self.k, self.propose_on = drafter, k, propose_on
+        self.history = list(prompt[:-1])  # the bootstrap's t_P is prompt[-1]: appended when its pass commits
+        self.calls = 0
+
+    def extend(self, tokens) -> None:
+        self.history.extend(int(token) for token in tokens)
+
+    def propose(self, next_token: int):
+        index, self.calls = self.calls, self.calls + 1
+        if not self.propose_on(index):
+            return None
+        stream = self.history + [int(next_token)]
+        drafts: list[int] = []
+        for _ in range(self.k):
+            drafts.append(self.drafter(stream + drafts))
+        return tuple(drafts)
+
+
+@pytest.mark.parametrize("mode", ("host", "hybrid"))
+@pytest.mark.parametrize("enqueue", (False, True))
+@pytest.mark.parametrize("k", (3, 4, 7))
+def test_pass_loop_with_a_host_drafter_commits_the_same_stream_and_skips_the_device_draft(
+    fake, monkeypatch, k, enqueue, mode
+) -> None:
+    """A host drafter that proposes what the device oracle would: the committed stream is the fixed-five stream
+    (acceptance decides, whoever drafted), the device draft trace never runs for a host-drafted pass, and the
+    hybrid loop replays it exactly on the passes the host declines."""
+
+    prompt = [5, 9, 2]
+    propose_on = (lambda index: True) if mode == "host" else (lambda index: index % 2 == 0)
+    patterns = list(itertools.product(range(k + 1), repeat=2)) + [(a,) * 3 for a in range(k + 1)]
+    for pattern in patterns:
+        target, drafter = _oracles(pattern, k)
+        passes = len(pattern)
+        segments_seen: list[str] = []
+        chain, device, ple = _chain(
+            fake, monkeypatch, k=k, target=target, drafter=drafter, prompt=prompt, split=True, enqueue=enqueue,
+            observer=segments_seen.append,
+        )
+        host = _OracleHostDrafter(drafter, prompt, k=k, propose_on=propose_on)
+        chain.host_drafter = host
+        first_drafts = []
+        for _ in range(k):
+            first_drafts.append(drafter(prompt + first_drafts))
+        emitted = list(chain.bootstrap([prompt[-1], *first_drafts]).committed)
+        for _ in range(passes - 1):
+            emitted.extend(chain.step().committed)
+        assert emitted == _fixed_five_stream(target, drafter, prompt, k=k, passes=passes), (k, mode, pattern)
+        assert [record.accepted for record in chain.records] == list(pattern), (k, mode, pattern)
+        sources = ["host" if propose_on(index) else "device" for index in range(passes)]
+        assert [record.source for record in chain.records] == sources
+        assert chain.host_passes == sources.count("host") == host.proposals if hasattr(host, "proposals") else True
+        assert chain.host_passes == sources.count("host")
+        # The device draft replays only on the passes the host declined; the verify and (from pass 1) the commit
+        # replay on every pass.
+        suffix = "-enqueued" if enqueue else ""
+        expected_replays: list[str] = []
+        for index, source in enumerate(sources):
+            expected_replays += (["commit" + suffix] if index else []) + ["verify" + suffix]
+            if source == "device":
+                expected_replays.append("draft" + suffix)
+        assert device.replays == expected_replays, (k, mode, pattern)
+        # Every pass's tokens were looked up for the PLE rows and start at the previous pass's t' and first draft.
+        assert len(ple.calls) == passes
+        for index, (tokens, _context) in enumerate(ple.calls):
+            record = chain.records[index]
+            assert tokens == record.tokens and tokens[0] == (prompt[-1] if index == 0 else chain.records[index - 1].next_token)
+            if index:
+                assert tokens[1] == chain.records[index - 1].first_draft
+        # The segments of a host-drafted pass and of a declined one.
+        launch = "enqueue" if enqueue else "replay"
+        for index, record in enumerate(chain.records):
+            steady = {"ple_rows", f"commit_{launch}"} if index else {"host_inputs"}
+            wanted = {f"verify_{launch}", "verify_readback", "host_draft"}
+            wanted |= {"host_tokens"} if record.source == "host" else {f"draft_{launch}", "readback"}
+            assert set(record.segments_ns) == wanted | steady, (index, record.source)
+        # The host's history is the committed stream: the prompt and every committed row.
+        assert host.history == prompt[:-1] + [token for record in chain.records for token in record.tokens[: record.accepted + 1]]
+        assert chain.next_tokens[0] == chain.records[-1].next_token
+
+
+def test_a_host_drafted_chain_cuts_at_eos_without_proposing_and_validates_its_drafter(fake, monkeypatch) -> None:
+    k = 4
+    target, drafter = _oracles((2, 4, 1, 0), k)
+    prompt = [5, 9, 2]
+    reference = _fixed_five_stream(target, drafter, prompt, k=k, passes=4)
+    eos = (reference[4],)  # inside pass 1's committed run
+    chain, device, _ = _chain(fake, monkeypatch, k=k, target=target, drafter=drafter, prompt=prompt, split=True, eos=eos)
+    host = _OracleHostDrafter(drafter, prompt, k=k, propose_on=lambda index: True)
+    chain.host_drafter = host
+    first_drafts = []
+    for _ in range(k):
+        first_drafts.append(drafter(prompt + first_drafts))
+    emitted = chain.run(40, bootstrap_drafts=[prompt[-1], *first_drafts])
+    assert emitted == _fixed_five_stream(target, drafter, prompt, k=k, passes=4, eos=eos)
+    assert chain.finished and chain.records[-1].finished and chain.next_tokens is None
+    # Every pass but the finishing one proposed for its successor; the EOS pass asked nothing.
+    assert host.calls == chain.host_passes == len(chain.records) - 1
+    assert "draft" not in device.replays
+    # A drafter must carry propose and extend; a wrong-length proposal is refused; no commit queue with a drafter.
+    with pytest.raises(TypeError):  # allow-pytest.raises: the drafter protocol
+        mtp_v2.Qwen38TTNNMTPChain(
+            chain.model, chain.verify, chain.draft, chain.traces, chain.verify_output, replay=chain.replay,
+            position=0, host_drafter=object(),
+        )
+    bad = _OracleHostDrafter(drafter, prompt, k=k - 1, propose_on=lambda index: True)
+    chain2, _, _ = _chain(fake, monkeypatch, k=k, target=target, drafter=drafter, prompt=prompt, split=True)
+    chain2.host_drafter = bad
+    with pytest.raises(RuntimeError):  # allow-pytest.raises: k - 1 ids for a k-draft pass
+        chain2.bootstrap([prompt[-1], *first_drafts])

@@ -79,6 +79,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     DEFAULT_PREFILL_MODE,
     MAX_TOKENS_BOUND,
+    DRAFT_SOURCES,
     MTP_DRAFTS,
     MTP_GDN_ANCHORS,
     PREFILL_MODES,
@@ -1625,6 +1626,14 @@ def _parser() -> argparse.ArgumentParser:
         default="off",
         help="MTP: the GDN state re-anchor (layer0 = layer 0's commits run the 1-row fp32 step recurrence)",
     )
+    parser.add_argument(
+        "--draft-source",
+        choices=DRAFT_SOURCES,
+        default="mtp",
+        help="MTP: who drafts a pass's k ids: the MTP head on the device (mtp); the host's prompt-lookup drafter when "
+        "the last n tokens recur in the request's text, the MTP head otherwise (hybrid); the host alone, fill "
+        "tokens when nothing recurs (ngram, the A/B arm); default mtp",
+    )
     return parser
 
 
@@ -1634,6 +1643,8 @@ def main() -> int:
         raise SystemExit(f"--prefill-slab takes a multiple of 128 in 256..4096, got {args.prefill_slab}")
     if args.prefill_slab is not None and args.mtp is not None:
         raise SystemExit("--prefill-slab and --mtp are alternatives (the MTP chain prefills in 32-row chunks)")
+    if args.draft_source != "mtp" and args.mtp is None:
+        raise SystemExit(f"--draft-source {args.draft_source} needs --mtp")
     try:
         hardware_profile = hardware_profiles.resolve_hardware_profile(args.hardware_profile)
     except hardware_profiles.HardwareProfileError as error:
@@ -1777,6 +1788,7 @@ def main() -> int:
         "mtp": {
             "k": args.mtp,
             "anchor": args.mtp_gdn_anchor if args.mtp is not None else None,
+            "draft_source": args.draft_source if args.mtp is not None else None,
             "admission": mtp_admission,
         },
         "system_fingerprint": f"{runtime['head'][:12]}-{runtime['extension_sha256'][:12]}",
@@ -1866,6 +1878,7 @@ def main() -> int:
             slab_rows=args.prefill_slab,
             mtp=args.mtp,
             mtp_gdn_anchor=args.mtp_gdn_anchor,
+            draft_source=args.draft_source,
             device_sampler=bool(args.device_sampler),
         )
         if chain.allocated_context != resident_context.allocated_context:
@@ -1910,6 +1923,7 @@ def main() -> int:
                     "k": chain.mtp.default_drafts,
                     "arms": sorted(chain.mtp.arms),
                     "anchor": chain.mtp.anchor,
+                    "draft_source": chain.mtp.draft_source,
                     "traces": len(chain.mtp.captured_trace_ids()),
                     "capture_ms": chain.mtp.capture_ms,
                     "trace_dram_bytes_per_bank": chain.mtp.trace_dram_bytes_per_bank,

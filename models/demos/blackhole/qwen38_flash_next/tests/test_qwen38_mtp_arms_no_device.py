@@ -133,6 +133,11 @@ def test_extension_counts_passes_per_arm_and_reports_the_active_one() -> None:
     assert summary["passes"] == 3 and summary["accepted_drafts"] == 9 and summary["tokens_per_pass"] == 4.0
     assert extension.summary(passes=2, accepted_drafts=6)["tokens_per_pass"] == 4.0
     assert extension.summary(passes=0, accepted_drafts=0)["tokens_per_pass"] is None
+    # Host-drafted passes are counted per arm from the record's source; records without one are the device's.
+    extension.record(SimpleNamespace(accepted=2, source="host"))
+    assert extension.arms[7].host_passes == 1 and extension.host_drafted_passes == 1
+    assert summary["draft_source"] == "mtp" and extension.summary()["host_drafted_passes"] == 1
+    assert extension.summary(passes=1, accepted_drafts=2, host_drafted_passes=1)["host_drafted_passes"] == 1
 
 
 def test_extension_merges_per_arm_capture_and_trace_records() -> None:
@@ -164,6 +169,12 @@ def test_extension_construction_is_fail_closed() -> None:
         )
     with pytest.raises(ValueError):  # allow-pytest.raises: the default is not an arm
         _extension(4, 7, default=5)
+    with pytest.raises(ValueError):  # allow-pytest.raises: an unknown draft source
+        session_module.Qwen38ChainMTP(
+            arms={4: _arm(4, generic)}, default_drafts=4, anchor="off", components=None, step_inputs=None,
+            chunk_extension=None, draft_source="lookahead",
+        )
+    assert session_module.DRAFT_SOURCES == ("mtp", "hybrid", "ngram")
     with pytest.raises(ValueError):  # allow-pytest.raises: two MTP layer caches
         session_module.Qwen38ChainMTP(
             arms={4: _arm(4, object()), 7: _arm(7, object())}, default_drafts=4, anchor="off", components=None,

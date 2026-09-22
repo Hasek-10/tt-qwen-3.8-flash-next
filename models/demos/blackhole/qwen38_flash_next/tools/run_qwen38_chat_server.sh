@@ -16,6 +16,8 @@
 #   --allocated-context N   32768 (default) | 65536 | 131072 | 262144
 #   --mtp K[,K...]          multi-token-prediction drafting depth(s), 3..7 (off by default; greedy chunked-mode requests draft;
 #                           a comma list opens one arm per K, the first the default, a request's speculative_drafts picks one;
+#   --draft-source SRC      mtp (the MTP head, default) | hybrid (the host's prompt-lookup drafter when the last n tokens
+#                           recur in the request's text, the MTP head otherwise) | ngram (the host alone; the A/B arm); needs --mtp
 #                           3 and 4 measured on 4x p150, 5..7 admitted for the QuietBox 2 sweep)
 #   --long-chunks           prefill in 128-row chunks where the prompt allows (off by default; not with --mtp)
 #   --prefill-slab ROWS     prefill in slabs of ROWS rows (a multiple of 128, 256..4096; 2048 is the measured form)
@@ -52,7 +54,7 @@ die() { printf 'run_qwen38_chat_server: %s\n' "$*" >&2; exit 2; }
 usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 profile= instance=0 devices= checkpoint= cache_root= allocated_context=32768 mtp= port=8000 host=0.0.0.0 long_chunks=
-prefill_slab=
+prefill_slab= draft_source=
 acceptance= acceptance_prompts= require_json_96= prepare_only= bf4_stage_limit= bf4_corpus= bf4_corpus_verification=
 serve_seconds= python= validate_only= prefill_mode=chunked sampling=1 stall_seconds=300
 while [[ $# -gt 0 ]]; do
@@ -64,6 +66,7 @@ while [[ $# -gt 0 ]]; do
         --cache-root) cache_root=${2-}; shift 2 ;;
         --allocated-context) allocated_context=${2-}; shift 2 ;;
         --mtp) mtp=${2-}; shift 2 ;;
+        --draft-source) draft_source=${2-}; shift 2 ;;
         --long-chunks) long_chunks=1; shift ;;
         --prefill-slab) prefill_slab=${2-}; shift 2 ;;
         --no-sampling) sampling=; shift ;;
@@ -164,6 +167,11 @@ args=(
 if [[ -n "$mtp" ]]; then
     [[ "$mtp" =~ ^[3-7](,[3-7])*$ ]] || die "--mtp takes K[,K...] with K in 3..7, got $mtp"
     args+=(--mtp "$mtp")
+fi
+if [[ -n "$draft_source" ]]; then
+    [[ "$draft_source" =~ ^(mtp|hybrid|ngram)$ ]] || die "--draft-source takes mtp, hybrid or ngram, got $draft_source"
+    [[ -n "$mtp" ]] || die "--draft-source needs --mtp"
+    args+=(--draft-source "$draft_source")
 fi
 [[ -z "$long_chunks" || -z "$mtp" ]] || die "--long-chunks and --mtp are alternatives (the MTP chain prefills in 32-row chunks)"
 [[ -z "$long_chunks" ]] || args+=(--long-chunks)
