@@ -75,3 +75,16 @@ next step is per-request k (section 4), not a larger default.
 
 Not levers: the n-gram lookup (`refresh_ple_row` computes the row on the host from the token it already read back and
 does one host-to-device copy; no extra round trip) and GDN state precision (fp32 by construction).
+
+## 5. No-device suite, this branch vs its base (2026-09-22, pip `ttnn` wheel, no checkpoint)
+
+| tree | tests | passed | failed | errors | skipped |
+|---|---|---|---|---|---|
+| base `545cb29d` | 1,641 | 1,458 | 38 | 16 | 86 |
+| this branch | 1,706 | 1,523 | 38 | 16 | 86 |
+
+The 65 added tests are the rows 7/8 and k 6/7 parametrizations. The failing and erroring set is identical on both
+trees: the checkpoint-reading tests (`QWEN38_CHECKPOINT` unset) and `test_ttnn_bf4_static`, which pins the
+checkout's patched `ttnn.load_tensor` that the pip wheel does not carry. Recipe: `PYTHONPATH=$PWD TT_METAL_HOME=$PWD
+python -m pytest models/demos/blackhole/qwen38_flash_next/tests --confcutdir=models/demos/blackhole/qwen38_flash_next/tests`
+with the checkout's `ttnn/ttnn/unsafe_allocation_tracker.py` and `trace_allocation_config.py` on the wheel's path.
