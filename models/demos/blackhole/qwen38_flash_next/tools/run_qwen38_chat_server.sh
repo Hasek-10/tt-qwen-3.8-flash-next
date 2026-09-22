@@ -7,7 +7,8 @@
 #                           mesh graph descriptor)
 #   --profile p150-line     4x p150 in one host as an ethernet line, ttnn's default descriptor; the route is
 #                           derived at start
-#   --profile qb2           p300-based box (QuietBox 2, or a 4x p300 host with --instance 0|1) -- UNTESTED, see README
+#   --profile qb2           p300-based box (QuietBox 2, or a 4x p300 host with --instance 0|1); dies harvested in
+#                           different columns run one DRAM reader per bank (chosen at start, README section 7)
 #   --devices A,B,C,D       run p150-line on these four KMD device nodes (four chips of a larger host)
 #   --checkpoint DIR        the ModelScope checkpoint directory (tools/download_checkpoint.py)
 #   --cache-root DIR        the converted weights, the BF4 expert cache, the model I/O cache, the JIT cache and the run
@@ -111,7 +112,7 @@ case "$profile" in
         hardware_profile=p150-line visible_devices=${devices:-0,1,2,3} descriptor= ;;
     qb2)
         [[ -z "$devices" ]] || die "--devices applies to --profile p150-line"
-        printf 'run_qwen38_chat_server: the qb2 profile is UNTESTED (no QuietBox 2 was available); the first run prints the derived route to pin\n' >&2
+        printf 'run_qwen38_chat_server: qb2 profile: the route follows the fabric order, and differently harvested dies run one DRAM reader per bank (READY dram_workers_fallback)\n' >&2
         if [[ "$instance" == 0 ]]; then hardware_profile=tt-quietbox-2 visible_devices=0,1,2,3; else hardware_profile=tt-quietbox-2-instance-1 visible_devices=4,5,6,7; fi
         descriptor="$HERE/qb2_p300_1x4_line_mesh_graph_descriptor.textproto" ;;
     *) die "--profile must be tt-quietbox, p150-line or qb2" ;;

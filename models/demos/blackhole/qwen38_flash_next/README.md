@@ -206,7 +206,7 @@ contract (hang-ups, stalled readers, deadlines, the stall watchdog, `/health` fi
   1-row recurrence.  MTP does not fit at 256k (94 MB free per bank against the 128 MiB contiguous it needs); 32k, 64k
   and 128k fit.
 
-## 7. QuietBox 2 (untested)
+## 7. QuietBox 2
 
 A p300 card is two Blackhole dies joined on the card; a QuietBox 2 (2x p300c) has four dies in one ring (the two
 on-card links and the two Warp400 links), so it is one 1x4 instance:
@@ -216,7 +216,17 @@ on-card links and the two Warp400 links), so it is one 1x4 instance:
 The profile exports `tools/qb2_p300_1x4_line_mesh_graph_descriptor.textproto` (a 1x4 LINE over three of the four ring
 links, two channels per link as in tt-metal's `p300_x2` descriptor); tt-metal classifies a p300 cluster that is not
 exactly two or four dies as CUSTOM and refuses to open without a descriptor, so the launcher always exports one.  The
-route is derived from the cluster descriptor at start and recorded.  A QuietBox 2 (2x p300c) ran it from a fresh clone on 2026-09-07 (`docs/PROOFS.md`); we have not run p300 hardware ourselves.
+route is derived at start from the order in which the fabric embedded the line onto the ring and recorded.  A
+QuietBox 2 (2x p300c) ran it from a fresh clone on 2026-09-07 (`docs/PROOFS.md`); on qb2 (fw 19.13.1.0) this tree
+passed the startup acceptance on 2026-09-18 (json 96/96, the table equal to the pins) and served under vllm-tt-plugin
+through the tt-model package on 2026-09-21.
+
+The dies of a p300 card can be harvested in different Tensix columns, so their DRAM banks are served from different
+worker columns.  tt-metal's DRAM-sharded matmul then refuses two readers per bank ("Multiple readers per DRAM bank
+require identical local device geometry and primary readers"), which the serving default asks for; the builder now
+checks the four assignments before it builds and runs one reader per bank on such a mesh, recording the reason in
+`READY` (`dram_workers_fallback`) and `/health`.  A uniformly harvested mesh keeps two readers.  `QWEN38_DRAM_WORKERS=1`
+still forces one reader everywhere.
 
 ## 8. Layout
 
