@@ -86,6 +86,10 @@ def test_two_readers_need_one_bank_to_worker_assignment_on_every_device(monkeypa
     assert workers == 1 and "[(0, 1), (0, 2), (0, 3)]" in reason
     (workers, reason), calls = _qualify([QB2_COLUMN_6, QB2_COLUMN_5, QB2_COLUMN_6, QB2_COLUMN_6], 1, monkeypatch)
     assert (workers, reason, calls) == (1, None, [])  # one reader asks the mesh nothing
+    # a seven-bank Blackhole ring (BLACKHOLE_RING_SIZES admits 7): the two-reader table is an eight-bank table
+    seven = SimpleNamespace(shape=(1, 4), dram_grid_size=lambda: ttnn.CoreCoord(7, 1))
+    workers, reason = dm.qualify_decode_dram_workers(seven, 2)
+    assert workers == 1 and "qualified on 8 DRAM banks, this mesh has 7" in reason
     with pytest.raises(ValueError):
         dm.qualify_decode_dram_workers(SimpleNamespace(shape=(1, 4)), 3)
 

@@ -98,12 +98,18 @@ def qualify_decode_dram_workers(mesh_device, requested: int) -> tuple[int, str |
     every device to report the same bank -> worker assignment (tt-metal ``get_dram_bank_reader_assignments``: "identical
     local device geometry and primary readers", a TT_FATAL after the weights are on the device).  Dies harvested in
     different columns (a QuietBox 2, 2026-09-18) serve their banks from different worker columns, so they run one
-    reader per bank; the caller records the reason.
+    reader per bank; the caller records the reason.  The two-reader table (``TWO_WORKER_PROJECTIONS``) was qualified on
+    eight banks, so a board with another bank count (a seven-bank Blackhole DRAM ring) runs one reader too.
     """
 
     validate_decode_dram_workers(requested)
     if requested == 1:
         return 1, None
+    banks = _dram_bank_count(mesh_device)
+    if banks != 8:
+        return 1, (
+            f"one reader per DRAM bank: the two-reader projections were qualified on 8 DRAM banks, this mesh has {banks}"
+        )
     signatures = mesh_dram_bank_worker_signatures(mesh_device)
     if len(set(signatures.values())) == 1:
         return requested, None
