@@ -143,7 +143,7 @@ The run directory (`<cache-root>/runs/<stamp>/`) holds `READY`, `phase-markers.j
 | `--prepare-only --bf4-stage-limit N` | convert at most N missing expert layers into the BF4 cache and stop |
 | `--long-chunks` | 128-row prefill chunks where the prompt allows (section 6); off by default, not combined with `--mtp` |
 | `--prefill-slab 2048` | prefill slabs of 2048 rows ahead of the 128-row chunks: one matmul per dense linear, tolerance-class against the chunk bodies (`docs/PREFILL.md`); off by default, not combined with `--mtp` |
-| `--mtp 3..7` | speculative drafting on greedy requests (section 6); off by default; 3 and 4 measured, 5..7 admitted for the QuietBox 2 sweep |
+| `--mtp K[,K...]` (K in 3..7) | speculative drafting on greedy requests (section 6); off by default; a comma list opens one arm per K, the first the default: a request's `speculative_drafts` picks an arm, a request with tools takes the largest; 3 and 4 measured, 5..7 admitted for the QuietBox 2 sweep |
 | `--port`, `--host` | the listening port; `--host` default `0.0.0.0`: the QuietBox and p150-line profiles serve the LAN |
 | `--serve-seconds N` | stop after N seconds (a drain: the request in flight gets its reply) |
 | `--sampling` / `--no-sampling` | the launcher passes `--sampling`: sampled requests are served, a request naming no sampling field is still the bitwise greedy stream; `--no-sampling` refuses sampling fields with HTTP 400 (+0.3 ms per token saved) |
@@ -205,6 +205,10 @@ contract (hang-ups, stalled readers, deadlines, the stall watchdog, `/health` fi
   indices and the pinned table).  `--mtp-gdn-anchor layer0` (server flag) re-anchors the layer-0 GDN state from the
   1-row recurrence.  MTP does not fit at 256k (94 MB free per bank against the 128 MiB contiguous it needs); 32k, 64k
   and 128k fit.
+- Per-request draft length: `--mtp 4,7` opens one arm per draft count (the first the default); a request's
+  `speculative_drafts` picks an arm, a request with tools takes the largest, and `/health.mtp` lists `arms` and
+  `default_k`.  The arms share the MTP layer's caches; each further arm costs its rows-dependent states and three
+  traces (`MTP_ARM_BYTES_PER_BANK_UPPER_BOUND`, 12 MB per bank in the admission).  Unrun on silicon.
 
 ## 7. QuietBox 2
 

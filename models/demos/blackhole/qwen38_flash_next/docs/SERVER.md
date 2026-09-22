@@ -89,7 +89,8 @@ with the seconds since its last completed step.
 mode, free DRAM after the captures, the runtime identity).  Requests: `messages`, `max_tokens` or
 `max_completion_tokens` (default and limit: the remaining context, the context limit less the prompt), `stream`,
 `stop`, `tools` / `tool_choice` (OpenAI shape; `tool_calls` finish reason), `enable_thinking` (default true;
-reasoning streams as `reasoning_content`), `reasoning_effort`, `thinking_budget`, `ignore_eos`, `seed`,
+reasoning streams as `reasoning_content`), `reasoning_effort`, `thinking_budget`, `ignore_eos`, `speculative_drafts`
+(the `--mtp` arm to draft at; absent, a request with tools takes the largest arm, the rest the default), `seed`,
 `temperature` / `top_p` / `top_k` / `min_p` / `presence_penalty` / `frequency_penalty` / `repetition_penalty` /
 `logprobs`.  Sampling: a request that names none of the sampling fields is greedy, the argmax stream bitwise equal to
 the greedy loop the acceptance replay and the evaluations measure, on the launcher's `--sampling` server too

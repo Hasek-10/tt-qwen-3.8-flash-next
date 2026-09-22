@@ -14,7 +14,8 @@
 #   --cache-root DIR        the converted weights, the BF4 expert cache, the model I/O cache, the JIT cache and the run
 #                           directories (about 23 GB for 32k plus 107 GB of BF4 experts on the first start)
 #   --allocated-context N   32768 (default) | 65536 | 131072 | 262144
-#   --mtp K                 multi-token-prediction drafting depth, 3..7 (off by default; greedy chunked-mode requests draft;
+#   --mtp K[,K...]          multi-token-prediction drafting depth(s), 3..7 (off by default; greedy chunked-mode requests draft;
+#                           a comma list opens one arm per K, the first the default, a request's speculative_drafts picks one;
 #                           3 and 4 measured on 4x p150, 5..7 admitted for the QuietBox 2 sweep)
 #   --long-chunks           prefill in 128-row chunks where the prompt allows (off by default; not with --mtp)
 #   --prefill-slab ROWS     prefill in slabs of ROWS rows (a multiple of 128, 256..4096; 2048 is the measured form)
@@ -161,7 +162,7 @@ args=(
 )
 [[ -z "$devices" ]] || args+=(--device-nodes "$devices")
 if [[ -n "$mtp" ]]; then
-    [[ "$mtp" =~ ^[3-7]$ ]] || die "--mtp takes 3..7, got $mtp"
+    [[ "$mtp" =~ ^[3-7](,[3-7])*$ ]] || die "--mtp takes K[,K...] with K in 3..7, got $mtp"
     args+=(--mtp "$mtp")
 fi
 [[ -z "$long_chunks" || -z "$mtp" ]] || die "--long-chunks and --mtp are alternatives (the MTP chain prefills in 32-row chunks)"

@@ -143,6 +143,7 @@ KNOWN_REQUEST_FIELDS = frozenset(
         "thinking_budget",
         "ignore_eos",
         "prefill_mode",
+        "speculative_drafts",
     )
     + sampling_step.SAMPLING_REQUEST_FIELDS
 )
@@ -164,6 +165,33 @@ def _log(event: str, **fields: Any) -> None:
 
 
 # -- requests and responses ----------------------------------------------------------------------
+
+
+def parse_mtp_drafts(text: str) -> tuple[int, ...]:
+    """``--mtp K[,K...]``: the draft counts the server opens one arm each for, the first the default; each in
+    ``MTP_DRAFTS``, distinct."""
+
+    parts = [part.strip() for part in str(text).split(",")]
+    if not parts or any(not part.isdigit() for part in parts):
+        raise argparse.ArgumentTypeError(f"--mtp takes draft counts in {MTP_DRAFTS} separated by commas, got {text!r}")
+    drafts = tuple(int(part) for part in parts)
+    if any(k not in MTP_DRAFTS for k in drafts):
+        raise argparse.ArgumentTypeError(f"--mtp draft counts must be in {MTP_DRAFTS}, got {text!r}")
+    if len(set(drafts)) != len(drafts):
+        raise argparse.ArgumentTypeError(f"--mtp draft counts must be distinct, got {text!r}")
+    return drafts
+
+
+def choose_speculative_drafts(request: Mapping[str, Any], arms: Sequence[int], default: int) -> int:
+    """The arm a request drafts at: its ``speculative_drafts`` when given; else the largest arm when the request
+    carries tools (tool calls are structured output, where more drafts are accepted per pass); else the default."""
+
+    explicit = request.get("speculative_drafts")
+    if explicit is not None:
+        return int(explicit)
+    if request.get("tools") and len(arms) > 1:
+        return max(arms)
+    return int(default)
 
 
 def parse_chat_request(document: Any, *, seed: int | None = None, sampling_available: bool = True) -> dict[str, Any]:
@@ -271,6 +299,12 @@ def parse_chat_request(document: Any, *, seed: int | None = None, sampling_avail
         raise Qwen38ChatRequestRejected(
             f"prefill_mode must be one of {PREFILL_MODES} when given, got {prefill_mode!r}", param="prefill_mode"
         )
+    speculative_drafts = document.get("speculative_drafts")
+    if speculative_drafts is not None and (type(speculative_drafts) is not int or speculative_drafts not in MTP_DRAFTS):
+        raise Qwen38ChatRequestRejected(
+            f"speculative_drafts must be one of {MTP_DRAFTS} when given, got {speculative_drafts!r}",
+            param="speculative_drafts",
+        )
     try:
         sampling = sampling_step.parameters_from_request(
             document, enable_thinking=enable_thinking, seed=secrets.randbits(SEED_BITS) if seed is None else seed
@@ -306,6 +340,7 @@ def parse_chat_request(document: Any, *, seed: int | None = None, sampling_avail
         "stop": protocol.validate_stop(document.get("stop")),
         "ignore_eos": ignore_eos,
         "prefill_mode": prefill_mode,
+        "speculative_drafts": speculative_drafts,
         "sampling": sampling,
         "logprobs": logprobs,
         "top_logprobs": top_logprobs,
@@ -687,7 +722,8 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                         "answer_reserve_tokens": protocol.ANSWER_RESERVE_TOKENS,
                     },
                     "supports": ["tools", "streaming", "reasoning_content", "stop", "thinking_budget", "ignore_eos"]
-                    + (["sampling", "seed", "logprobs"] if session.sampling is not None else []),
+                    + (["sampling", "seed", "logprobs"] if session.sampling is not None else [])
+                    + (["speculative_drafts"] if session.mtp is not None else []),
                     "sampling": (
                         "greedy"
                         if session.sampling is None
@@ -777,6 +813,29 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 else None
             ),
         }
+        # The arm the request drafts at (an --mtp server): its speculative_drafts, else tools -> the largest arm,
+        # else the default; refused with 400 when it names an arm the server did not open, or any arm without --mtp.
+        drafts = None
+        if session.mtp is not None:
+            drafts = choose_speculative_drafts(request, sorted(session.mtp.arms), session.mtp.default_drafts)
+            if not session.mtp.admitted(drafts):
+                self._send_error_json(
+                    400,
+                    f"speculative_drafts must be one of {sorted(session.mtp.arms)} on this server, got {drafts!r}",
+                    "invalid_request_error",
+                    code="bad_request",
+                    param="speculative_drafts",
+                )
+                return
+        elif request["speculative_drafts"] is not None:
+            self._send_error_json(
+                400,
+                "speculative_drafts needs a server opened with --mtp",
+                "invalid_request_error",
+                code="bad_request",
+                param="speculative_drafts",
+            )
+            return
         received_utc = utc_now()
         request_id = _completion_id()
         created = int(time.time())
@@ -966,6 +1025,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 should_stop=should_stop,
                 prefill_mode=request["prefill_mode"],
                 sampling=sampling,
+                drafts=drafts,
             )
             final_deltas = assembler.finish()
         except Exception as error:  # noqa: BLE001  the device loop failed: report, then end the server
@@ -1552,11 +1612,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mtp",
-        type=int,
-        choices=MTP_DRAFTS,
+        type=parse_mtp_drafts,
         default=None,
-        help="draft K tokens per pass with the MTP layer (verify / draft / commit traces; greedy chunked-mode "
-        "requests generate through the pass loop); default off",
+        metavar="K[,K...]",
+        help=f"draft K tokens per pass with the MTP layer (verify / draft / commit traces; greedy chunked-mode "
+        f"requests generate through the pass loop), K in {MTP_DRAFTS}; a comma list opens one arm per K, the first "
+        "the default, and a request's speculative_drafts (a request with tools: the largest arm) picks one; default off",
     )
     parser.add_argument(
         "--mtp-gdn-anchor",
@@ -1648,7 +1709,11 @@ def main() -> int:
     records = load_acceptance_records(args.acceptance_prompts) if args.acceptance_prompts is not None else []
     resident_context = Qwen38ResidentContext(args.allocated_context)
     # MTP is refused where the resident build's admission table says its pair, state and chain do not fit.
-    mtp_admission = None if args.mtp is None else mtp_capacity_admission(resident_context.allocated_context)
+    mtp_admission = (
+        None
+        if args.mtp is None
+        else mtp_capacity_admission(resident_context.allocated_context, arms=len(args.mtp))
+    )
     if mtp_admission is not None and not mtp_admission["fits"]:
         raise SystemExit(
             f"--mtp {args.mtp} does not fit at --allocated-context {resident_context.allocated_context}: the resident "
@@ -1842,7 +1907,8 @@ def main() -> int:
                 None
                 if chain.mtp is None
                 else {
-                    "k": chain.mtp.drafts,
+                    "k": chain.mtp.default_drafts,
+                    "arms": sorted(chain.mtp.arms),
                     "anchor": chain.mtp.anchor,
                     "traces": len(chain.mtp.captured_trace_ids()),
                     "capture_ms": chain.mtp.capture_ms,

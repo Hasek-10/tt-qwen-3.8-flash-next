@@ -59,11 +59,13 @@ next step is per-request k (section 4), not a larger default.
 
 ## 4. Next levers, in order, with the touch points
 
-1. **Per-request draft length.** One `mtp` extension per admitted k allocated at open (`self.mtp` is a single
-   extension today: verify + draft states and three traces, ~8 MB at 32k), `mtp_enter(first_token, ple_context,
-   drafts=k)` selecting one, `--mtp 4,7`, and a request-level choice: `response_format` / `tools` present -> the
-   larger k, else the smaller. Admission: the per-bank bound in `MTP_CHAIN_BYTES_PER_BANK_UPPER_BOUND` times the
-   number of chains. Turns the k = 7 gain into a pure win.
+1. **Per-request draft length — on this branch.** `--mtp 4,7` opens one arm per draft count (the rows-dependent
+   verify / draft states and three traces per arm; the MTP layer's caches and the TAIL step inputs shared through
+   `allocate_verify_state(alignment_generic_state=...)`), the first the default; a request's `speculative_drafts`
+   picks an arm, a request with tools takes the largest (`choose_speculative_drafts`), `/health.mtp` lists `arms`
+   and `default_k`, the response's `qwen38.mtp.k` is the arm used. Admission adds `MTP_ARM_BYTES_PER_BANK_UPPER_BOUND`
+   (12 MB per bank) per further arm and the open measures the growth against it; the warm pass runs every residue
+   per arm. Unrun on silicon: the first `--mtp 4,7 --acceptance` start is its proof.
 2. **A cheaper draft row.** Each draft row runs the MTP layer in its 32-row verify form on one real row, the 1-row
    MoE, the final mixer, the full LM head (0.64 GB bf8) and the on-device resolve: ~4 ms. The draft's numerics do
    not affect losslessness (verify decides), so a bf4 LM head for drafting alone (90 MB per device; 3.8 GB per
@@ -82,6 +84,7 @@ does one host-to-device copy; no extra round trip) and GDN state precision (fp32
 |---|---|---|---|---|---|
 | base `545cb29d` | 1,641 | 1,458 | 38 | 16 | 86 |
 | this branch | 1,706 | 1,523 | 38 | 16 | 86 |
+| + per-request draft length | 1,725 | 1,542 | 38 | 16 | 86 |
 
 The 65 added tests are the rows 7/8 and k 6/7 parametrizations. The failing and erroring set is identical on both
 trees: the checkpoint-reading tests (`QWEN38_CHECKPOINT` unset) and `test_ttnn_bf4_static`, which pins the

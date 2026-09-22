@@ -350,6 +350,9 @@ class Qwen38TTNNVerifyAlignment:
     generic_state: Qwen38TTNNDecoderLayerGenericState
     verify_state: Qwen38TTNNVerifyLayerState
     residual: Any
+    # False: the generic state is another verify state's (a further draft-count arm shares the MTP layer's caches
+    # with the first one, which releases them).
+    owns_generic_state: bool = True
 
 
 @dataclass(frozen=True)
@@ -598,6 +601,7 @@ def allocate_verify_state(
     mtp_components=None,
     moe_rows: int | None = None,
     gdn_step_anchor_layers: Sequence[int] = (),
+    alignment_generic_state=None,
 ) -> Qwen38TTNNVerifyState:
     """Allocate the verify constants and every layer's verify buffers beside ``state`` (before any capture).
 
@@ -605,11 +609,15 @@ def allocate_verify_state(
     alignment rows; without it the pass reports ``first_draft = None`` and skips the MTP layer.  ``moe_rows``
     overrides every layer's verify MoE row count (:func:`resolve_moe_rows`); ``gdn_step_anchor_layers`` names
     the GDN layers whose commits run the committed rows through the 1-row FP32 step recurrence (the state
-    re-anchor) instead of the chunk kernel.
+    re-anchor) instead of the chunk kernel.  ``alignment_generic_state`` (a further draft-count arm) reuses the MTP
+    layer's generic state of an earlier verify state instead of allocating one: the caches are one, the arm owns
+    only its rows-dependent alignment verify state and residual.
     """
 
     if drafts not in SUPPORTED_DRAFTS:
         raise ValueError(f"MTP v2 verify admits k in {SUPPORTED_DRAFTS}, got {drafts!r}")
+    if alignment_generic_state is not None and mtp_components is None:
+        raise ValueError("alignment_generic_state is the MTP layer's shared generic state: it needs mtp_components")
     if not isinstance(state, Qwen38TTNNTextModelGenericState) or state._owner is not model._state_owner:
         raise ValueError("generic text-model state was not allocated by this model owner")
     if model.rope_table is None or model.qsa_position_constants is None:
@@ -684,8 +692,14 @@ def allocate_verify_state(
         alignment = None
         if mtp is not None:
             mtp_layer, input_mixer, final_mixer = mtp
-            generic_state = mtp_layer.allocate_generic_state()
-            actions.append(("MTP layer generic state", lambda: mtp_layer.release_generic_state(generic_state)))
+            if alignment_generic_state is None:
+                generic_state = mtp_layer.allocate_generic_state()
+                actions.append(("MTP layer generic state", lambda: mtp_layer.release_generic_state(generic_state)))
+            else:
+                # A further draft-count arm: the MTP layer's caches are the first arm's (the prefill chunk extension
+                # and every 1-row TAIL advance one state); only the rows-dependent verify state and the residual are
+                # this arm's own.
+                generic_state = alignment_generic_state
             mtp_verify = _allocate_layer_verify_state(mtp_layer, rows, rows_constants, moe_rows=moe_rows)
             actions.append(("MTP layer verify state", lambda: _release_layer_verify_state(mtp_layer, mtp_verify)))
             residual = _allocate_hidden_sharded_zeros(
@@ -693,7 +707,13 @@ def allocate_verify_state(
             )
             actions.append(("MTP alignment residual", lambda: _deallocate(residual)))
             alignment = Qwen38TTNNVerifyAlignment(
-                mtp_layer, input_mixer, final_mixer, generic_state, mtp_verify, residual
+                mtp_layer,
+                input_mixer,
+                final_mixer,
+                generic_state,
+                mtp_verify,
+                residual,
+                owns_generic_state=alignment_generic_state is None,
             )
         verify = Qwen38TTNNVerifyState(
             drafts=drafts,
@@ -728,9 +748,10 @@ def release_verify_state(model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifySta
         actions.append(
             ("MTP layer verify state", lambda: _release_layer_verify_state(alignment.layer, alignment.verify_state))
         )
-        actions.append(
-            ("MTP layer generic state", lambda: alignment.layer.release_generic_state(alignment.generic_state))
-        )
+        if alignment.owns_generic_state:
+            actions.append(
+                ("MTP layer generic state", lambda: alignment.layer.release_generic_state(alignment.generic_state))
+            )
     actions.append(("verify PLE rows", verify.ple_rows.release))
     actions.append(("verify accept scalar", lambda: _deallocate(verify.accepted)))
     actions.append(("verify draft lanes", lambda: _deallocate(verify.draft_lanes)))
