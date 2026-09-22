@@ -269,7 +269,7 @@ def test_driver_source_pins() -> None:
     assert "ttnn._ttnn_execute_trace(self.mesh, trace_id, cq_id=0, blocking=blocking)" in chunk
     assert (
         "self.model.forward_prefill_chunk_generic(\n"
-        "            chunk_state, self.state, gdn_step_anchor=self.gdn_step_anchor and short, mtp=self.mtp if short else None\n"
+        "            chunk_state, self.state, gdn_step_anchor=self.gdn_step_anchor and short, mtp=self.mtp_by_kind[kind]\n"
         "        )"
     ) in chunk
     assert 'short = kind == "short"' in chunk

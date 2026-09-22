@@ -1641,8 +1641,6 @@ def main() -> int:
     args = _parser().parse_args()
     if args.prefill_slab is not None and not is_slab_rows(args.prefill_slab):
         raise SystemExit(f"--prefill-slab takes a multiple of 128 in 256..4096, got {args.prefill_slab}")
-    if args.prefill_slab is not None and args.mtp is not None:
-        raise SystemExit("--prefill-slab and --mtp are alternatives (the MTP chain prefills in 32-row chunks)")
     if args.draft_source != "mtp" and args.mtp is None:
         raise SystemExit(f"--draft-source {args.draft_source} needs --mtp")
     try:
@@ -1723,7 +1721,11 @@ def main() -> int:
     mtp_admission = (
         None
         if args.mtp is None
-        else mtp_capacity_admission(resident_context.allocated_context, arms=len(args.mtp))
+        else mtp_capacity_admission(
+            resident_context.allocated_context,
+            arms=len(args.mtp),
+            chunk_kinds=1 + int(bool(args.long_chunks) or args.prefill_slab is not None) + int(args.prefill_slab is not None),
+        )
     )
     if mtp_admission is not None and not mtp_admission["fits"]:
         raise SystemExit(

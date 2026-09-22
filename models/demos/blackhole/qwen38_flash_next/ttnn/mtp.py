@@ -645,8 +645,9 @@ class Qwen38TTNNMTPInput:
             _cleanup_after_failure([output], label="MTP input fusion output", primary=error)
         return output
 
-    def rows(self, input_embedding_rows, hidden_residual_rows):
-        """:meth:`__call__` for 32 token rows (the MTP alignment rows of an MTP v2 verify pass).
+    def rows(self, input_embedding_rows, hidden_residual_rows, *, rows: int = ttnn.TILE_SIZE):
+        """:meth:`__call__` for ``rows`` token rows: 32 (the MTP alignment rows of an MTP v2 verify pass, the 32-row
+        prefill chunk), 128 (the long prefill chunk) or a slab.
 
         ``input_embedding_rows`` ``[1,1,32,640]`` and the branch-major ``hidden_residual_rows`` ``[1,4,32,640]``
         give the fused ``[1,4,32,640]`` rows.  The hidden norm keeps its 10,240-wide per-token contract: the
@@ -656,7 +657,8 @@ class Qwen38TTNNMTPInput:
 
         if self.weights.released:
             raise RuntimeError("cannot run MTP input fusion after its weights were deallocated")
-        rows = ttnn.TILE_SIZE
+        if isinstance(rows, bool) or type(rows) is not int or rows < ttnn.TILE_SIZE or rows % ttnn.TILE_SIZE:
+            raise ValueError(f"MTP input rows must be a positive multiple of {ttnn.TILE_SIZE}, got {rows!r}")
         embedding_shape = (1, 1, rows, LOCAL_HIDDEN_SIZE)
         residual_shape = (1, RESIDUAL_BRANCHES, rows, LOCAL_HIDDEN_SIZE)
         flat_shape = (1, 1, rows, RESIDUAL_BRANCHES * LOCAL_HIDDEN_SIZE)

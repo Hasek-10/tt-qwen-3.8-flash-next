@@ -163,6 +163,9 @@ MTP_CHAIN_BYTES_PER_BANK_UPPER_BOUND = 24 << 20
 # row and three traces; the MTP layer's caches and the TAIL step inputs are the first arm's.  One arm's states and
 # traces measured 8.2 MB per bank at 32,768 (above); the bound leaves room for the k = 7 draft trace.
 MTP_ARM_BYTES_PER_BANK_UPPER_BOUND = 12 << 20
+# A further prefill chunk kind with MTP (the 128-row chunk, a slab): the MTP layer's chunk state of that kind (its
+# QSA staging for the rows, the rows-form MoE instance over the shared combine buffer) and a rows-sized token row.
+MTP_PREFILL_EXTENSION_BYTES_PER_BANK_UPPER_BOUND = 8 << 20
 RESIDENT_DRAM_BANKS = 8
 RESIDENT_MIN_CONTIGUOUS_BYTES_PER_BANK = 128 << 20
 RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES = {
@@ -174,7 +177,7 @@ RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES = {
 
 
 def mtp_capacity_admission(
-    allocated_context: int, *, ring_size: int = max(BLACKHOLE_RING_SIZES), arms: int = 1
+    allocated_context: int, *, ring_size: int = max(BLACKHOLE_RING_SIZES), arms: int = 1, chunk_kinds: int = 1
 ) -> dict[str, Any]:
     """Whether the MTP chain fits beside the resident build at ``allocated_context``: the 49th BF4 pair (its two
     payloads interleaved over the banks, needing their contiguous room), the MTP layer's QSA state at that context and
@@ -184,6 +187,8 @@ def mtp_capacity_admission(
 
     if isinstance(arms, bool) or type(arms) is not int or arms < 1:
         raise ValueError(f"arms must be a positive int, got {arms!r}")
+    if isinstance(chunk_kinds, bool) or type(chunk_kinds) is not int or not 1 <= chunk_kinds <= 3:
+        raise ValueError(f"chunk_kinds must be an int in [1, 3], got {chunk_kinds!r}")
 
     free, largest = RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES[
         Qwen38ResidentContext(allocated_context).allocated_context
@@ -198,6 +203,7 @@ def mtp_capacity_admission(
         + qsa_state
         + MTP_CHAIN_BYTES_PER_BANK_UPPER_BOUND
         + (arms - 1) * MTP_ARM_BYTES_PER_BANK_UPPER_BOUND
+        + (chunk_kinds - 1) * MTP_PREFILL_EXTENSION_BYTES_PER_BANK_UPPER_BOUND
     )
     contiguous = max(w01_per_bank, w2_per_bank, RESIDENT_MIN_CONTIGUOUS_BYTES_PER_BANK)
     return {
@@ -211,6 +217,8 @@ def mtp_capacity_admission(
         "mtp_chain_bytes_per_bank_upper_bound": MTP_CHAIN_BYTES_PER_BANK_UPPER_BOUND,
         "arms": arms,
         "mtp_arm_bytes_per_bank_upper_bound": MTP_ARM_BYTES_PER_BANK_UPPER_BOUND,
+        "chunk_kinds": chunk_kinds,
+        "mtp_prefill_extension_bytes_per_bank_upper_bound": MTP_PREFILL_EXTENSION_BYTES_PER_BANK_UPPER_BOUND,
         "required_free_bytes_per_bank": required,
         "required_largest_contiguous_bytes_per_bank": contiguous,
         "headroom_bytes_per_bank": free - required,
@@ -1341,6 +1349,9 @@ class Qwen38ChainMTP:
     chunk_extension: mtp_v2.Qwen38TTNNMTPChunkExtension | None
     active_drafts: int | None = None
     draft_source: str = "mtp"
+    # The MTP layer's chunk extensions of the other prefill chunk kinds (the 32-row one is ``chunk_extension``).
+    long_chunk_extension: mtp_v2.Qwen38TTNNMTPChunkExtension | None = None
+    slab_extension: mtp_v2.Qwen38TTNNMTPChunkExtension | None = None
     chain: mtp_v2.Qwen38TTNNMTPChain | None = None
     step_written: bool = False
     admission: dict[str, Any] = field(default_factory=dict)  # mtp_capacity_admission at the build's context
@@ -1398,6 +1409,15 @@ class Qwen38ChainMTP:
     @property
     def alignment(self) -> mtp_v2.Qwen38TTNNVerifyAlignment:
         return self.active.verify.alignment
+
+    def chunk_extensions(self) -> tuple[Any, ...]:
+        """The chunk extensions present, the 32-row base first (the order they are reset in; released reversed)."""
+
+        return tuple(
+            extension
+            for extension in (self.chunk_extension, self.long_chunk_extension, self.slab_extension)
+            if extension is not None
+        )
 
     def admitted(self, drafts: Any) -> bool:
         return not isinstance(drafts, bool) and type(drafts) is int and drafts in self.arms
@@ -1656,6 +1676,8 @@ class Qwen38TracedChain:
             mtp=None if self.mtp is None else self.mtp.chunk_extension,
             slab_state=self.slab_state,
             slab_trace_id=self.slab_trace_id,
+            long_mtp=None if self.mtp is None else self.mtp.long_chunk_extension,
+            slab_mtp=None if self.mtp is None else self.mtp.slab_extension,
         ).run(
             token_ids,
             start_position=start_position,
@@ -1802,10 +1824,7 @@ class Qwen38TracedChain:
             raise ValueError(f"draft_source must be one of {DRAFT_SOURCES} (and needs mtp), got {draft_source!r}")
         if mtp_gdn_anchor not in MTP_GDN_ANCHORS:
             raise ValueError(f"mtp_gdn_anchor must be one of {MTP_GDN_ANCHORS}, got {mtp_gdn_anchor!r}")
-        if long_chunks and mtp is not None:
-            raise ValueError(
-                "long chunks and MTP drafting are alternatives: the MTP chunk extension is a 32-row chunk option"
-            )
+        # The long chunks and the slab combine with MTP drafting: one MTP chunk extension per chunk kind (below).
         if slab_rows is not None and (not is_slab_rows(slab_rows) or not long_chunks):
             raise ValueError(f"a prefill slab needs a slab row count and the long chunks, got {slab_rows!r}")
         started_ns = clock_ns()
@@ -1852,7 +1871,10 @@ class Qwen38TracedChain:
             # The admission's table row for this context (the server refused an unfit --mtp before the mesh opened);
             # the measured growth of the MTP build, its states and its traces is checked against its estimate.
             mtp_admission = mtp_capacity_admission(
-                model.allocated_context, ring_size=builder.identity.ring_size, arms=len(mtp_arms)
+                model.allocated_context,
+                ring_size=builder.identity.ring_size,
+                arms=len(mtp_arms),
+                chunk_kinds=1 + int(long_chunks) + int(slab_rows is not None),
             )
             if not mtp_admission["fits"]:
                 raise Qwen38ChatChainError(
@@ -1907,6 +1929,19 @@ class Qwen38TracedChain:
                     drafts=drafts, verify=verify, draft=mtp_v2.allocate_draft_state(model, verify)
                 )
             default_verify = arms[mtp_arms[0]].verify
+            # One chunk extension per chunk kind the prefill runs (the MTP layer's rows of a 32-row chunk, a 128-row
+            # chunk, a slab); the 32-row one owns the MTP layer's chunk histories, the others share them through it.
+            chunk_extension = long_chunk_extension = slab_extension = None
+            if chunk_state is not None:
+                chunk_extension = mtp_v2.Qwen38TTNNMTPChunkExtension.allocate(model, default_verify, chunk_state)
+                if long_chunk_state is not None:
+                    long_chunk_extension = mtp_v2.Qwen38TTNNMTPChunkExtension.allocate(
+                        model, default_verify, long_chunk_state, base=chunk_extension
+                    )
+                if slab_state is not None:
+                    slab_extension = mtp_v2.Qwen38TTNNMTPChunkExtension.allocate(
+                        model, default_verify, slab_state, base=chunk_extension
+                    )
             chain_mtp = Qwen38ChainMTP(
                 arms=arms,
                 default_drafts=mtp_arms[0],
@@ -1914,11 +1949,9 @@ class Qwen38TracedChain:
                 draft_source=draft_source,
                 components=mtp_components,
                 step_inputs=mtp_v2.Qwen38TTNNMTPStepInputs.allocate(mesh, model.mesh_contract),
-                chunk_extension=(
-                    None
-                    if chunk_state is None
-                    else mtp_v2.Qwen38TTNNMTPChunkExtension.allocate(model, default_verify, chunk_state)
-                ),
+                chunk_extension=chunk_extension,
+                long_chunk_extension=long_chunk_extension,
+                slab_extension=slab_extension,
                 admission=mtp_admission,
                 dram_bytes_per_bank=mtp_dram_bytes_per_bank,
             )
@@ -2110,11 +2143,16 @@ class Qwen38TracedChain:
             model.reset_generic_state_inplace(state)
             model.reset_chunk_state_inplace(state, chunk_state)
             model.reset_chunk_state_inplace(state, slab_state)
-            model.write_chunk_inputs(
-                slab_state, list(WARM_LONG_CHUNK_TOKEN_IDS) * (slab_rows // LONG_CHUNK_ROWS), ple_context=None
-            )
+            warm_slab_ids = list(WARM_LONG_CHUNK_TOKEN_IDS) * (slab_rows // LONG_CHUNK_ROWS)
+            model.write_chunk_inputs(slab_state, warm_slab_ids, ple_context=None)
+            slab_extension = None if chain_mtp is None else chain_mtp.slab_extension
+            if slab_extension is not None:
+                chain_mtp.alignment.layer.reset_generic_state_inplace(chain_mtp.alignment.generic_state)
+                chain_mtp.chunk_extension.reset_chunk()
+                slab_extension.reset_chunk()
+                slab_extension.write_tokens(model, [*warm_slab_ids[1:], warm_slab_ids[0]])
             synchronize()
-            model.forward_prefill_chunk_generic(slab_state, state)
+            model.forward_prefill_chunk_generic(slab_state, state, mtp=slab_extension)
             synchronize()
             actual = state.position.read()
             if actual != slab_rows:
@@ -2127,8 +2165,14 @@ class Qwen38TracedChain:
             model.reset_chunk_state_inplace(state, chunk_state)
             model.reset_chunk_state_inplace(state, long_chunk_state)
             model.write_chunk_inputs(long_chunk_state, list(WARM_LONG_CHUNK_TOKEN_IDS), ple_context=None)
+            long_chunk_extension = None if chain_mtp is None else chain_mtp.long_chunk_extension
+            if long_chunk_extension is not None:
+                chain_mtp.alignment.layer.reset_generic_state_inplace(chain_mtp.alignment.generic_state)
+                chain_mtp.chunk_extension.reset_chunk()
+                long_chunk_extension.reset_chunk()
+                long_chunk_extension.write_tokens(model, [*WARM_LONG_CHUNK_TOKEN_IDS[1:], WARM_LONG_CHUNK_TOKEN_IDS[0]])
             synchronize()
-            model.forward_prefill_chunk_generic(long_chunk_state, state)
+            model.forward_prefill_chunk_generic(long_chunk_state, state, mtp=long_chunk_extension)
             synchronize()
             actual = state.position.read()
             if actual != LONG_CHUNK_ROWS:
@@ -2218,9 +2262,9 @@ class Qwen38TracedChain:
                     arm.draft.pass_row,
                 ):
                     ttnn.mark_corruptible(tensor)
-            if chain_mtp.chunk_extension is not None:
-                chain_mtp.chunk_extension.reset_chunk()
-                ttnn.mark_corruptible(chain_mtp.chunk_extension.token_row)
+            for extension in chain_mtp.chunk_extensions():
+                extension.reset_chunk()
+                ttnn.mark_corruptible(extension.token_row)
         chain.program_cache_entries = resident_decode.program_cache_count(mesh)
         if chain.program_cache_entries <= 0:
             raise Qwen38ChatChainError("program cache is empty after the warm pass")
@@ -2361,6 +2405,7 @@ class Qwen38TracedChain:
                 state,
                 guard=lambda label: resident_decode.forbid_trace_body_host_io_and_sync(phase=f"chat long {label}"),
                 cq_id=0,
+                mtp=None if chain_mtp is None else chain_mtp.long_chunk_extension,
             )
             chain.long_chunk_capture_ms = (clock_ns() - long_chunk_capture_started_ns) / 1e6
             synchronize()
@@ -2374,6 +2419,7 @@ class Qwen38TracedChain:
                 state,
                 guard=lambda label: resident_decode.forbid_trace_body_host_io_and_sync(phase=f"chat slab {label}"),
                 cq_id=0,
+                mtp=None if chain_mtp is None else chain_mtp.slab_extension,
             )
             chain.slab_capture_ms = (clock_ns() - slab_capture_started_ns) / 1e6
             synchronize()
@@ -2496,11 +2542,13 @@ class Qwen38TracedChain:
         if self.mtp is not None:
             # The MTP states before the chunk and generic states they sit beside.
             model = self.built_target.model
-            if self.mtp.chunk_extension is not None:
-                self.mtp.chunk_extension.release()
+            for extension in reversed(self.mtp.chunk_extensions()):  # the derived kinds before their 32-row base
+                extension.release()
             self.mtp.step_inputs.deallocate()
-            mtp_v2.release_draft_state(model, self.mtp.verify, self.mtp.draft)
-            mtp_v2.release_verify_state(model, self.mtp.verify)
+            # Every arm; the arm that owns the MTP layer's generic state releases it last.
+            for arm in sorted(self.mtp.arms.values(), key=lambda arm: arm.verify.alignment.owns_generic_state):
+                mtp_v2.release_draft_state(model, arm.verify, arm.draft)
+                mtp_v2.release_verify_state(model, arm.verify)
         if self.chunk_state is not None:
             self.built_target.model.release_chunk_state(self.chunk_state)
             self.chunk_state = None

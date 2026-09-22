@@ -82,7 +82,34 @@ next step is per-request k (section 4), not a larger default.
 Not levers: the n-gram lookup (`refresh_ple_row` computes the row on the host from the token it already read back and
 does one host-to-device copy; no extra round trip) and GDN state precision (fp32 by construction).
 
-## 5. No-device suite, this branch vs its base (2026-09-22, pip `ttnn` wheel, no checkpoint)
+## 5. The step-back audit (2026-09-22): what was missed, ranked
+
+| # | Lever | Evidence in the tree | Expected effect | Status |
+|---|---|---|---|---|
+| 1 | `--mtp` forced the slowest prefill | the driver ran the MTP chunk extension only for 32-row chunks, so MTP servers prefilled at 3.3 ms/token, not the slab's 0.87 | TTFT 3.8x in the mode that matters (a 4k prompt: 13.5 s -> 3.6 s) | **on this branch** (below) |
+| 2 | verify rows to 16 (k <= 15) | with host drafting the matched drafts are free; the QSA chunk constants carry 8 `row_selects` and `derive_qsa_chunk_inputs` admits up to 8 completed blocks | structured output 11.2 tokens/pass at k = 15 vs 7.0 at k = 7 | next |
+| 3 | slab prefill re-streams the experts 16x per layer | `_routed_partial_blocks`: one 128-token `moe_compute` call per 128-row block, each touching ~92% of the 512 experts: 48 x 16 x 1.3 GB per slab = 0.26 ms/token, the measured 0.25-0.31 | 512 tokens per call: the MoE stream / 3.7, prefill -20..25% | hardware A/B (`routed_tokens_per_call` admits (rows, 32, 128) only) |
+| 4 | the verify commit reruns the GDN chunk kernel | `commit_rows` "reruns the kernel over the committed prefix": two runs x 36 layers per pass | part of the verify's 1.5x; #55548's per-token-state op makes the commit a slot copy | port the C++ op |
+| 5 | dense weights are bf16 | every GDN / QSA / GR / MoE-dense upload is `bfloat16`: ~5.5 GB + a 1.27 GB LM head per token | floor 4.1 -> 2.6 ms; ~4% today, ~30% of the ceiling once fused | a precision decision |
+| 6 | the host drafter transfers to the 27B branch | its K = 11 draft is ~18 ms of an 86 ms iteration | up to ~20% on copy-heavy output | later |
+| 7 | defaults | the launcher runs the slowest prefill unless `--prefill-slab 2048`; `TT_METAL_TRACE_ALLOC_TRACKING=1` in production | free TTFT; the tracker's replay cost is unmeasured | A/B on the box |
+
+Measure first: the verify pass's +18 ms composition, the collectives per decode token, the 55% of the slab prefill
+that is not MoE / attention / GDN, the 256k decode slowdown.
+
+### Item 1 on this branch: MTP drafting with the 128-row chunks and the slab
+
+`Qwen38TTNNMTPChunkExtension` is one per chunk kind: the 32-row one owns the MTP layer's chunk histories, the
+128-row and slab ones share them through `base` (the layer's own `allocate_chunk_state` contract) and take the
+backbone's shared MoE combine buffer of their form; the MTP input mixer's `rows()` takes the row count; the prefill
+driver routes every chunk to its kind's extension and writes rows-sized token rows one position ahead; the session
+allocates, warms (every kind at its own residue) and captures the three chunk traces with their extensions and
+releases them derived-first; the admission adds `MTP_PREFILL_EXTENSION_BYTES_PER_BANK_UPPER_BOUND` (8 MB) per
+further kind. `--mtp` now combines with `--long-chunks` and `--prefill-slab`. Unrun on silicon: the first
+`--mtp 4 --prefill-slab 2048 --acceptance` start is its proof (acceptance replays a 130-token prompt: the 128-row
+kind runs there; a slab needs a prompt of 2,048+).
+
+## 6. No-device suite, this branch vs its base (2026-09-22, pip `ttnn` wheel, no checkpoint)
 
 | tree | tests | passed | failed | errors | skipped |
 |---|---|---|---|---|---|
@@ -90,6 +117,7 @@ does one host-to-device copy; no extra round trip) and GDN state precision (fp32
 | this branch | 1,706 | 1,523 | 38 | 16 | 86 |
 | + per-request draft length | 1,725 | 1,542 | 38 | 16 | 86 |
 | + host drafting (hybrid / ngram) | 1,754 | 1,614 | 38 | 16 | 86 |
+| + MTP with the 128-row chunks and the slab | 1,766 | 1,626 | 38 | 16 | 86 |
 
 The 65 added tests are the rows 7/8 and k 6/7 parametrizations. The failing and erroring set is identical on both
 trees: the checkpoint-reading tests (`QWEN38_CHECKPOINT` unset) and `test_ttnn_bf4_static`, which pins the

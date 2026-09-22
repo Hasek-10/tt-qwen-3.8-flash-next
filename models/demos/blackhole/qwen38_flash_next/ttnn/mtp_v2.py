@@ -2184,29 +2184,49 @@ def forward_mtp_step_row(
 
 @dataclass(frozen=True)
 class Qwen38TTNNMTPChunkExtension:
-    """The MTP layer's 32 rows of a prefill chunk (the model's ``mtp`` keyword): its own chunk state over the
-    alignment layer and ``token_row`` FP32 TILE ``[1,1,1,32]`` (lane j = the token at P + j + 1, host-written per
-    chunk); the rows take the chunk's layer-47 residual rows as roots.  ``reset_chunk`` / ``finish_chunk`` are the per-layer
-    chunk seed and hand-off of the MTP layer's generic state."""
+    """The MTP layer's rows of a prefill chunk (the model's ``mtp`` keyword), one extension per chunk kind (32-row
+    chunk, 128-row chunk, slab): its own chunk state over the alignment layer (the 32-row one owns the MTP layer's
+    chunk histories; the 128-row and slab ones share them through ``base``, as the backbone's chunk states do) and
+    ``token_row`` FP32 TILE ``[1,1,tiles,32]`` (lane j = the token at P + j + 1, host-written per chunk); the rows
+    take the chunk's layer-47 residual rows as roots.  ``reset_chunk`` is the per-kind chunk seed; ``finish_chunk``
+    is the hand-off of the MTP layer's generic state after the last chunk, run on the 32-row extension whatever
+    kinds ran (the hand-off reads the shared histories and the positional caches, as the backbone's does)."""
 
     alignment: Qwen38TTNNVerifyAlignment
     layer_chunk_state: Any
     token_row: Any
+    rows: int = CHUNK_ROWS
 
     @classmethod
     def allocate(
-        cls, model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState, chunk_state
+        cls,
+        model: Qwen38TTNNTextModel,
+        verify: Qwen38TTNNVerifyState,
+        chunk_state,
+        *,
+        base: "Qwen38TTNNMTPChunkExtension | None" = None,
     ) -> "Qwen38TTNNMTPChunkExtension":
         _validate_verify_state(model, verify)
         if verify.alignment is None:
             raise ValueError("the MTP chunk extension needs the verify state's MTP alignment components")
-        layer_chunk_state = verify.alignment.layer.allocate_chunk_state(chunk_state.rows_constants)
+        rows = int(chunk_state.rows)
+        if (base is None) != (rows == CHUNK_ROWS):
+            raise ValueError(
+                f"a {rows}-row MTP chunk extension {'needs' if rows != CHUNK_ROWS else 'takes no'} 32-row base extension"
+            )
+        if base is not None and (base.rows != CHUNK_ROWS or base.alignment is not verify.alignment):
+            raise ValueError("the base must be the 32-row MTP chunk extension of the same alignment")
+        layer_chunk_state = verify.alignment.layer.allocate_chunk_state(
+            chunk_state.rows_constants,
+            base=None if base is None else base.layer_chunk_state,
+            local_combine_output=None if base is None else chunk_state.local_combine_output,
+        )
         try:
-            token_row = model.model_io.embedding.upload_token_row(0)
+            token_row = model.model_io.embedding.upload_token_rows(rows)
         except BaseException:
             verify.alignment.layer.release_chunk_state(layer_chunk_state)
             raise
-        return cls(verify.alignment, layer_chunk_state, token_row)
+        return cls(verify.alignment, layer_chunk_state, token_row, rows)
 
     def release(self) -> None:
         _run_cleanup(
@@ -2221,11 +2241,11 @@ class Qwen38TTNNMTPChunkExtension:
         self.alignment.layer.reset_chunk_state_inplace(self.layer_chunk_state, self.alignment.generic_state)
 
     def write_tokens(self, model: Qwen38TTNNTextModel, token_ids: Sequence[int]) -> None:
-        """Host write of the chunk's 32 MTP tokens (the tokens at P + 1 .. P + 32) into the token row."""
+        """Host write of the chunk's MTP tokens (the tokens at P + 1 .. P + rows) into the token rows."""
 
         token_ids = [int(token) for token in token_ids]
-        if len(token_ids) != CHUNK_ROWS:
-            raise ValueError(f"an MTP chunk takes {CHUNK_ROWS} tokens, got {len(token_ids)}")
+        if len(token_ids) != self.rows:
+            raise ValueError(f"a {self.rows}-row MTP chunk takes {self.rows} tokens, got {len(token_ids)}")
         ttnn.copy_host_to_device_tensor(
             ttnn.from_torch(
                 model.model_io.embedding.host_token_rows(token_ids),
@@ -2242,12 +2262,14 @@ class Qwen38TTNNMTPChunkExtension:
         """The MTP layer's rows at the chunk's positions: the token rows' embedding mixed with the chunk's layer-47
         residual rows (not consumed), through the layer's chunk body on the MTP generic and chunk states."""
 
-        if _shape(residual_rows) != RESIDUAL_ROWS_SHAPE:
-            raise RuntimeError(f"MTP chunk roots must be {RESIDUAL_ROWS_SHAPE}, got {tensor_metadata(residual_rows)}")
+        residual_shape = (1, RESIDUAL_BRANCHES, self.rows, LOCAL_HIDDEN_SIZE)
+        rows_shape = (1, 1, self.rows, LOCAL_HIDDEN_SIZE)
+        if _shape(residual_rows) != residual_shape:
+            raise RuntimeError(f"MTP chunk roots must be {residual_shape}, got {tensor_metadata(residual_rows)}")
         embedding_rows = model.model_io.embedding.embed_device_token_rows(self.token_row)
-        if _shape(embedding_rows) != BLOCK_ROWS_SHAPE:
-            raise RuntimeError(f"MTP chunk embedding rows must be {BLOCK_ROWS_SHAPE}, got {_shape(embedding_rows)}")
-        mixed = self.alignment.input_mixer.rows(embedding_rows, residual_rows)
+        if _shape(embedding_rows) != rows_shape:
+            raise RuntimeError(f"MTP chunk embedding rows must be {rows_shape}, got {_shape(embedding_rows)}")
+        mixed = self.alignment.input_mixer.rows(embedding_rows, residual_rows, rows=self.rows)
         _deallocate(embedding_rows)
         out = self.alignment.layer.forward_chunk_generic(
             mixed,
@@ -2262,8 +2284,11 @@ class Qwen38TTNNMTPChunkExtension:
         _deallocate(out)
 
     def finish_chunk(self, model: Qwen38TTNNTextModel, *, prefilled: int) -> None:
-        """The MTP layer's hand-off after the last chunk (the model's ``finish_prefill`` form for one layer)."""
+        """The MTP layer's hand-off after the last chunk (the model's ``finish_prefill`` form for one layer): the
+        32-row extension's, whatever chunk kinds the prefill ran."""
 
+        if self.rows != CHUNK_ROWS:
+            raise RuntimeError(f"the MTP hand-off runs on the {CHUNK_ROWS}-row extension, not the {self.rows}-row one")
         ring_select = ttnn.from_torch(
             qsa_module.chunk_handoff_ring_select_rows(prefilled),
             dtype=ttnn.bfloat16,

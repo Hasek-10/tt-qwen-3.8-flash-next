@@ -19,9 +19,9 @@
 #   --draft-source SRC      mtp (the MTP head, default) | hybrid (the host's prompt-lookup drafter when the last n tokens
 #                           recur in the request's text, the MTP head otherwise) | ngram (the host alone; the A/B arm); needs --mtp
 #                           3 and 4 measured on 4x p150, 5..7 admitted for the QuietBox 2 sweep)
-#   --long-chunks           prefill in 128-row chunks where the prompt allows (off by default; not with --mtp)
+#   --long-chunks           prefill in 128-row chunks where the prompt allows (off by default; combines with --mtp)
 #   --prefill-slab ROWS     prefill in slabs of ROWS rows (a multiple of 128, 256..4096; 2048 is the measured form)
-#                           ahead of the 128-row chunks (off by default; implies --long-chunks; not with --mtp)
+#                           ahead of the 128-row chunks (off by default; implies --long-chunks; combines with --mtp)
 #   --no-sampling           serve greedy requests only (the default server takes --sampling: a request naming no
 #                           sampling field is still the bitwise greedy stream, temperature > 0 samples)
 #   --stall-seconds N       a request with no completed device step for N seconds ends the server with exit 1 so a
@@ -173,12 +173,10 @@ if [[ -n "$draft_source" ]]; then
     [[ -n "$mtp" ]] || die "--draft-source needs --mtp"
     args+=(--draft-source "$draft_source")
 fi
-[[ -z "$long_chunks" || -z "$mtp" ]] || die "--long-chunks and --mtp are alternatives (the MTP chain prefills in 32-row chunks)"
 [[ -z "$long_chunks" ]] || args+=(--long-chunks)
 if [[ -n "$prefill_slab" ]]; then
     [[ "$prefill_slab" =~ ^[0-9]+$ && $((prefill_slab % 128)) == 0 && "$prefill_slab" -ge 256 && "$prefill_slab" -le 4096 ]] \
         || die "--prefill-slab takes a multiple of 128 in 256..4096, got $prefill_slab"
-    [[ -z "$mtp" ]] || die "--prefill-slab and --mtp are alternatives (the MTP chain prefills in 32-row chunks)"
     args+=(--prefill-slab "$prefill_slab")
 fi
 [[ -z "$sampling" ]] || args+=(--sampling)
