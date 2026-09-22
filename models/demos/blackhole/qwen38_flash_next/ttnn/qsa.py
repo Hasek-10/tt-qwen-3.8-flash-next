@@ -1465,10 +1465,15 @@ def verify_handoff_ring_select_rows(position: int) -> torch.Tensor:
 # The verify body runs the R rows P .. P + R - 1 of one pass on the chunk path's 32-row operands at an
 # arbitrary P (rows R .. 31 of every tile are padding: zero hidden rows, geometry of row R - 1).  Two
 # facts bound the state it touches: R <= VERIFY_MAX_ROWS rows complete at most two compressed blocks
-# (P // 4 and P // 4 + 1) and span at most two 32-row KV blocks (P & ~31 and the next one).  Both blocks of
-# each kind are written every pass, so the op sequence never depends on P.
-VERIFY_MAX_ROWS = 6
+# (P // 4 and P // 4 + 1: a pass of R rows at P % 4 = r completes (r + R) // 4 blocks, at most (R + 3) // 4,
+# which is 2 for every R up to 8) and span at most two 32-row KV blocks (P & ~31 and the next one, for every
+# R up to 32).  Both blocks of each kind are written every pass, so the op sequence never depends on P.
+# Rows 7 and 8 (k = 6 and 7) are admitted on the same two invariants as rows 4..6: the pool select below
+# pools only the rows that fall in those two blocks, and a third, partial block is left to the pass that
+# completes it (the garbage-hiding rule rows 6 already relies on at P % 4 = 3).
+VERIFY_MAX_ROWS = 8
 VERIFY_COMPLETED_BLOCKS = 2
+assert (VERIFY_MAX_ROWS + COMPRESS_RATIO - 1) // COMPRESS_RATIO == VERIFY_COMPLETED_BLOCKS, "R rows complete <= 2 blocks"
 RAW_HISTORY_ROWS = COMPRESS_RATIO - 1
 RAW_WINDOW_TILE_ROWS = 2 * CACHE_WRITE_ROWS
 STAGE_LANE_BIAS = CACHE_WRITE_ROWS

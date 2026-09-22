@@ -88,7 +88,7 @@ def _cat(tensor: FakeTensor) -> torch.Tensor:
 # --------------------------------------------------------------------------- the draft raw history
 
 
-@pytest.mark.parametrize("rows", (4, 5, 6))
+@pytest.mark.parametrize("rows", (4, 5, 6, 7, 8))
 def test_commit_verify_into_the_draft_state_leaves_the_alignment_window_and_advances_by_one(fake, rows: int) -> None:
     module = _qsa_module(fake)
     alignment_state, draft_state = module.allocate_verify_state(), module.allocate_verify_state()
@@ -361,7 +361,7 @@ def _eager_rows(world: _World, residual: FakeTensor, tokens: list[int], steps: i
     return ids
 
 
-@pytest.mark.parametrize("drafts", (3, 4, 5))
+@pytest.mark.parametrize("drafts", (3, 4, 5, 6, 7))
 @pytest.mark.parametrize("position,accepted", ((5, 0), (29, 2), (31, 1), (32, 3), (60, 0), (100, 2)))
 def test_forward_draft_matches_eager_rows_and_assembles_the_host_images(fake, monkeypatch, drafts, position, accepted):
     accepted = min(accepted, drafts)
@@ -410,8 +410,11 @@ def test_forward_draft_matches_eager_rows_and_assembles_the_host_images(fake, mo
     derived = torch.zeros(32, 128, dtype=torch.bfloat16)
     derived[:3] = window[accepted + 1 : accepted + 4]
     advances = drafts - 2
+    # Three history rows: from k = 5 every advance past the third shifts in another zero row (the stub layer writes
+    # no raw rows), so the surviving prefix is empty and the history is all zeros.
+    shift = min(advances, 3)
     expected_history = torch.zeros(32, 128, dtype=torch.bfloat16)
-    expected_history[: 3 - advances] = derived[advances:3]
+    expected_history[: 3 - shift] = derived[shift:3]
     assert _same_zero(draft.qsa_state.raw_history.torch_shards()[0][0, 0], expected_history)
     # The position scalar is untouched (the verify body owns P).
     assert state.position.read() == position
@@ -625,7 +628,7 @@ def _oracles(pattern: tuple[int, ...], k: int):
 
 
 @pytest.mark.parametrize("form", ("single", "split", "enqueue"))
-@pytest.mark.parametrize("k", (3, 4, 5))
+@pytest.mark.parametrize("k", (3, 4, 5, 6, 7))
 def test_pass_loop_commits_the_fixed_five_stream_for_every_acceptance_pattern(fake, monkeypatch, k, form) -> None:
     """The three pass forms: single trace (verify with catch-up -> the next draft), split (blocking commit -> verify
     -> draft) and the production form (commit enqueued non-blocking -> PLE lookup -> verify and the next pass's draft

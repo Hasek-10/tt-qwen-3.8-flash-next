@@ -75,7 +75,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.ple import (
     Qwen38TTNNPLERowsState,
 )
 
-SUPPORTED_DRAFTS = (3, 4, 5)
+SUPPORTED_DRAFTS = (3, 4, 5, 6, 7)
 DEFAULT_DRAFTS = 4
 RESIDUAL_ROWS_SHAPE = (1, RESIDUAL_BRANCHES, CHUNK_ROWS, LOCAL_HIDDEN_SIZE)
 BLOCK_ROWS_SHAPE = (1, 1, CHUNK_ROWS, LOCAL_HIDDEN_SIZE)
@@ -404,9 +404,9 @@ class Qwen38TTNNVerifyReadback:
 
 
 def moe_rows_for(rows: int) -> int:
-    """The smallest admitted MoE row count that holds ``rows`` (5 for k = 3 and 4; 32 for k = 5 until rows 6 is
-    admitted in ``moe.SUPPORTED_ROWS``); a verify pass is one 32-row tile, so the 128-row prefill form is not a
-    candidate."""
+    """The smallest admitted MoE row count that holds ``rows`` (5 for k = 3 and 4; the exact 6, 7 or 8 for k = 5, 6
+    and 7, which ``moe.SUPPORTED_ROWS`` admits on the rows-5 path); a verify pass is one 32-row tile, so the 128-row
+    prefill form is not a candidate."""
 
     admitted = [count for count in SUPPORTED_ROWS if rows <= count <= CHUNK_ROWS]
     if not admitted:

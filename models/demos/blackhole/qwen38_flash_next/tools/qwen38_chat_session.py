@@ -32,7 +32,7 @@ TAIL's epilogue also writes a candidate row, and a request with ``temperature > 
 runs the sampled loop (read the row after TAIL, sample on the host, write the token
 into the row before HEAD).  Greedy requests take the loop above untouched.
 
-MTP drafting is opt-in (``mtp=K``, K in 3 or 4; ``ttnn/mtp_v2.py``): the chain also
+MTP drafting is opt-in (``mtp=K``, K in 3..7; ``ttnn/mtp_v2.py``): the chain also
 holds the verify / draft / commit traces and, in every TAIL and in the chunk body, the
 MTP layer's rows, so the MTP layer follows the target through prefill.  A greedy
 request on such a chain runs its prefill as above, reads the first token, switches
@@ -138,11 +138,12 @@ REASONING_EFFORT = "low"
 RESIDUE_CLASSES = resident_decode.SINGLE_TRACE_RESIDUE_CLASS_TRACES
 SEED_TOKEN_ID = IM_START_ID
 THINK_END_ID = protocol.THINK_END_ID
-# MTP drafting: the draft counts a server may be opened with (the chain timing tool's measured arms), the GDN state
+# MTP drafting: the draft counts a server may be opened with (3 and 4 are the chain timing tool's measured arms on
+# 4x p150; 5..7 are admitted for the QuietBox 2 sweep and unmeasured), the GDN state
 # re-anchor settings (off = every GDN layer commits through the chunk kernel; layer0 = layer 0's commits run the
 # 1-row fp32 step recurrence over the committed rows), the bootstrap pass's placeholder drafts, the resident expert
 # pairs with the MTP layer's.
-MTP_DRAFTS = (3, 4)
+MTP_DRAFTS = (3, 4, 5, 6, 7)
 MTP_GDN_ANCHORS = ("off", "layer0")
 MTP_GDN_ANCHOR_LAYERS = {"off": (), "layer0": (0,)}
 MTP_BOOTSTRAP_DRAFT_TOKEN = 0

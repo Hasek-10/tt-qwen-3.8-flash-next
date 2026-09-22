@@ -143,7 +143,7 @@ The run directory (`<cache-root>/runs/<stamp>/`) holds `READY`, `phase-markers.j
 | `--prepare-only --bf4-stage-limit N` | convert at most N missing expert layers into the BF4 cache and stop |
 | `--long-chunks` | 128-row prefill chunks where the prompt allows (section 6); off by default, not combined with `--mtp` |
 | `--prefill-slab 2048` | prefill slabs of 2048 rows ahead of the 128-row chunks: one matmul per dense linear, tolerance-class against the chunk bodies (`docs/PREFILL.md`); off by default, not combined with `--mtp` |
-| `--mtp 3\|4` | speculative drafting on greedy requests (section 6); off by default |
+| `--mtp 3..7` | speculative drafting on greedy requests (section 6); off by default; 3 and 4 measured, 5..7 admitted for the QuietBox 2 sweep |
 | `--port`, `--host` | the listening port; `--host` default `0.0.0.0`: the QuietBox and p150-line profiles serve the LAN |
 | `--serve-seconds N` | stop after N seconds (a drain: the request in flight gets its reply) |
 | `--sampling` / `--no-sampling` | the launcher passes `--sampling`: sampled requests are served, a request naming no sampling field is still the bitwise greedy stream; `--no-sampling` refuses sampling fields with HTTP 400 (+0.3 ms per token saved) |
@@ -197,7 +197,7 @@ contract (hang-ups, stalled readers, deadlines, the stall watchdog, `/health` fi
 - `--long-chunks` prefills in 128-row chunks where the prompt allows (the remainder in 32-row chunks): 1.55 ms per prompt
   token through the server (a 6942-token prompt in 10.8 s) against 3.3 with 32-row chunks alone, the same tokens (bitwise on
   all 48 layers); off by default and not combined with `--mtp`, whose chain prefills in 32-row chunks.
-- MTP drafting (`--mtp 3|4`, 31-37 tokens/s on 4x p150) is off by default; greedy requests in the chunked prefill
+- MTP drafting (`--mtp 3..7`; 3 and 4 measured at 31-37 tokens/s on 4x p150, 5..7 unmeasured) is off by default; greedy requests in the chunked prefill
   mode draft K tokens per pass with exact acceptance.  The MTP path is not bitwise with plain decode on 4 of the 12
   acceptance prompts (measured 2026-09-06): the committed stream leaves the CPU reference at a different token on
   `chat`, `list`, `math` and `summary`, at the plain-decode token on the other eight (`json` 96/96), and every gate

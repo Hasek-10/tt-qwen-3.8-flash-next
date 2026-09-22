@@ -294,7 +294,7 @@ def _qsa_constants(rows: int):
     return position_constants, chunk_constants, verify_constants
 
 
-@pytest.mark.parametrize("rows", (4, 5, 6))
+@pytest.mark.parametrize("rows", (4, 5, 6, 7, 8))
 @pytest.mark.parametrize("position", POSITIONS)
 def test_verify_inputs_match_the_torch_reference_at_every_position(fake, position: int, rows: int) -> None:
     position_constants, _, verify_constants = _qsa_constants(rows)
@@ -350,7 +350,7 @@ def test_verify_inputs_match_the_torch_reference_at_every_position(fake, positio
 
 
 def test_verify_constants_are_exact_zero_one_selects() -> None:
-    for rows in (4, 5, 6):
+    for rows in range(4, qsa_module.VERIFY_MAX_ROWS + 1):
         host = qsa_module.qsa_verify_constant_rows(rows, BLOCKS)
         assert host["row_index_blocks"][0, 0, :, 0].tolist() == [min(j, rows - 1) for j in range(32)]
         assert torch.equal(host["row_index_slots"][0, 0, :, 0], host["row_index_blocks"][0, 0, :, 0])
@@ -365,9 +365,14 @@ def test_verify_constants_are_exact_zero_one_selects() -> None:
         stack = host["pool_select_stack"][0, 0]
         assert torch.count_nonzero(stack[4:]) == 0 and torch.equal(stack.to(torch.bfloat16).float(), stack)
     with pytest.raises(ValueError):  # allow-pytest.raises: the row bound is a contract
-        qsa_module.qsa_verify_constant_rows(7, BLOCKS)
+        qsa_module.qsa_verify_constant_rows(qsa_module.VERIFY_MAX_ROWS + 1, BLOCKS)
     assert (
-        qsa_module.VERIFY_MAX_ROWS == 6 and qsa_module.VERIFY_COMPLETED_BLOCKS == 2 and qsa_module.RAW_HISTORY_ROWS == 3
+        qsa_module.VERIFY_MAX_ROWS == 8 and qsa_module.VERIFY_COMPLETED_BLOCKS == 2 and qsa_module.RAW_HISTORY_ROWS == 3
+    )
+    # R rows at P % 4 = r complete (r + R) // 4 blocks: at most 2 for every admitted R, 3 from R = 9.
+    assert (
+        max((r + qsa_module.VERIFY_MAX_ROWS) // 4 for r in range(4)) == 2
+        and max((r + qsa_module.VERIFY_MAX_ROWS + 1) // 4 for r in range(4)) == 3
     )
 
 
@@ -479,7 +484,7 @@ def _run_pass(
     verify.deallocate()
 
 
-@pytest.mark.parametrize("rows", (4, 5, 6))
+@pytest.mark.parametrize("rows", (4, 5, 6, 7, 8))
 @pytest.mark.parametrize("position", (5, 29, 30, 31, 32, 60, 63, 100))
 def test_kv_and_compressed_writes_commit_the_accepted_prefix_for_every_accept(fake, position: int, rows: int) -> None:
     """Pass N at P writes rows P .. P + R - 1; the host accepts a drafts; pass N + 1 at P' = P + a + 1 writes its own
@@ -639,7 +644,7 @@ def _pattern_rows(pattern: tuple[int, ...], ids: tuple[int, ...]):
     return targets, drafts, alignment
 
 
-@pytest.mark.parametrize("drafts", (3, 4, 5))
+@pytest.mark.parametrize("drafts", (3, 4, 5, 6, 7))
 def test_accept_rows_is_exact_for_every_pattern_and_large_ids(fake, drafts: int) -> None:
     constants = mtp_v2.Qwen38TTNNAcceptConstants.build("mesh", FakeContract(), drafts=drafts)
     assert constants.sentinel_tail.shape == (1, 1, 1, 31 - drafts)
@@ -877,14 +882,15 @@ def test_verify_token_rows_pad_with_the_zero_embedding_token_and_readback_parses
 
 
 def test_moe_row_admission_and_flags_are_untouched() -> None:
-    assert moe_module.SUPPORTED_ROWS == (1, 5, 32, 128)
+    assert moe_module.SUPPORTED_ROWS == (1, 5, 6, 7, 8, 32, 128)
     assert moe_module.ROWS5_HARDWARE_PROVEN is True and moe_module.ROWS32_HARDWARE_PROVEN is True
-    assert [mtp_v2.moe_rows_for(k + 1) for k in mtp_v2.SUPPORTED_DRAFTS] == [5, 5, 32]
-    assert mtp_v2.SUPPORTED_DRAFTS == (3, 4, 5) and mtp_v2.DEFAULT_DRAFTS == 4
+    assert moe_module.ROWS6TO8_HARDWARE_PROVEN is False  # flips with the first QuietBox 2 acceptance replay at k >= 5
+    assert [mtp_v2.moe_rows_for(k + 1) for k in mtp_v2.SUPPORTED_DRAFTS] == [5, 5, 6, 7, 8]
+    assert mtp_v2.SUPPORTED_DRAFTS == (3, 4, 5, 6, 7) and mtp_v2.DEFAULT_DRAFTS == 4
     with pytest.raises(ValueError):  # allow-pytest.raises: the row bound is a contract
         mtp_v2.moe_rows_for(33)
     # An explicit override (the runner's argument) is admitted for the instance it constructs, nothing else.
-    assert [mtp_v2.resolve_moe_rows(k + 1, None) for k in mtp_v2.SUPPORTED_DRAFTS] == [5, 5, 32]
+    assert [mtp_v2.resolve_moe_rows(k + 1, None) for k in mtp_v2.SUPPORTED_DRAFTS] == [5, 5, 6, 7, 8]
     assert mtp_v2.resolve_moe_rows(6, 6) == 6 and mtp_v2.resolve_moe_rows(4, 5) == 5
     source = inspect.getsource(mtp_v2._allocate_layer_verify_state)
     assert "admitted_rows=SUPPORTED_ROWS if moe_rows in SUPPORTED_ROWS else (moe_rows,)," in source

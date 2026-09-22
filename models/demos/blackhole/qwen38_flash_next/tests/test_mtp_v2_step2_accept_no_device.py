@@ -47,7 +47,7 @@ def _leading_matches(pattern: tuple[int, ...]) -> int:
     return next((j for j, match in enumerate(pattern) if not match), len(pattern))
 
 
-@pytest.mark.parametrize("k", (3, 4, 5))
+@pytest.mark.parametrize("k", (3, 4, 5, 6, 7))
 def test_accept_count_and_gather_select_are_exact_for_every_pattern(k: int) -> None:
     for pattern in itertools.product((0, 1), repeat=k):
         for ids in (SMALL_IDS, LARGE_IDS, SMALL_IDS + LARGE_IDS):
@@ -59,7 +59,7 @@ def test_accept_count_and_gather_select_are_exact_for_every_pattern(k: int) -> N
             assert result["first_draft_gather"] == int(alignment[accepted]), (pattern, ids, result)
 
 
-@pytest.mark.parametrize("k", (3, 4, 5))
+@pytest.mark.parametrize("k", (3, 4, 5, 6, 7))
 def test_sum_select_is_exact_only_below_the_tf32_integer_limit(k: int) -> None:
     """Design 2.6 writes t' = sum(one_hot * argmax rows); through an FPU reduce that is wrong from id 2048."""
 
