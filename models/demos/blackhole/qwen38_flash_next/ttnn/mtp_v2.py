@@ -53,7 +53,15 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     replicate_tensor_2d_mesh_mapper,
     tensor_metadata,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import TOKEN_ROW_SHAPE, ZERO_EMBEDDING_TOKEN
+from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import (
+    LOCAL_VOCAB_SIZE,
+    SAMPLING_CANDIDATE_ROW_SHAPE,
+    TOKEN_ROW_SHAPE,
+    TP_AXIS,
+    VOCAB_SIZE,
+    ZERO_EMBEDDING_TOKEN,
+    Qwen38TTNNSamplingCandidateConstants,
+)
 from models.demos.blackhole.qwen38_flash_next.ttnn.final_mixer import Qwen38TTNNFinalMixer
 from models.demos.blackhole.qwen38_flash_next.ttnn.gdn import Qwen38TTNNGDN, Qwen38TTNNGDNRowsState
 from models.demos.blackhole.qwen38_flash_next.ttnn.layer import (
@@ -74,6 +82,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.ple import (
     Qwen38TTNNPLERowsPreparedInput,
     Qwen38TTNNPLERowsState,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn.sampling import Qwen38CandidateRow
 
 SUPPORTED_DRAFTS = (3, 4, 5, 6, 7)
 DEFAULT_DRAFTS = 4
@@ -153,6 +162,47 @@ def _allocate_hidden_sharded_zeros(
         raise RuntimeError(f"{label} must have local shape {list(local_shape)}, got {tensor_metadata(tensor)}")
     mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
     return tensor
+
+
+def _allocate_vocab_sharded_zeros(mesh_device, mesh_contract: Qwen38MeshContract, rows: int, *, label: str):
+    """A zero BF16 TILE ``[1,1,rows,VOCAB_SIZE]`` buffer vocab-sharded on dim 3 (the LM head's logits placement)."""
+
+    tensor = ttnn.from_torch(
+        torch.zeros((1, 1, rows, VOCAB_SIZE), dtype=torch.bfloat16),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=mesh_device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3)),
+    )
+    if _shape(tensor) != (1, 1, rows, LOCAL_VOCAB_SIZE):
+        raise RuntimeError(
+            f"{label} must have local shape [1, 1, {rows}, {LOCAL_VOCAB_SIZE}], got {tensor_metadata(tensor)}"
+        )
+    mesh_contract.validate_tensor(tensor, placement=TensorPlacement.VOCAB_SHARDED, shard_dim=3)
+    return tensor
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNVerifySampling:
+    """The sampled verify's buffers (``allocate_verify_state(sampling_constants=...)``), trace-written by every
+    verify pass and host-read on a sampled one: ``candidate_rows`` replicated FP32 ROW_MAJOR ``[1,1,R,2 * TP * k]``
+    (row j the candidate row of verify row j, :meth:`Qwen38TTNNLMHead.sampling_candidate_rows`),
+    ``alignment_lanes`` FP32 ROW_MAJOR ``[1,1,1,32]`` (lane j the MTP alignment's argmax at row j: the first draft
+    of a pass that accepts j drafts), ``residual_rows`` BF16 ``[1,4,32,640]`` (the alignment residuals, for the
+    host's re-select of row a) and ``logits_rows`` vocab-sharded BF16 ``[1,1,R,VOCAB]`` (the target's logit rows,
+    the exact fallback's gather source).  ``constants`` is the chain's candidate-row constants, borrowed for the
+    shard rebase scalar."""
+
+    rows: int
+    constants: Qwen38TTNNSamplingCandidateConstants
+    candidate_rows: Any
+    alignment_lanes: Any
+    residual_rows: Any
+    logits_rows: Any
+
+    def deallocate(self) -> None:
+        _deallocate(self.candidate_rows, self.alignment_lanes, self.residual_rows, self.logits_rows)
 
 
 def _pad_rows(tensor, rows: int, *, label: str):
@@ -364,7 +414,9 @@ class Qwen38TTNNVerifyState:
     j = d_{j+1} for j < k, then ``ZERO_EMBEDDING_TOKEN``) and ``ple_rows`` (the R n-gram rows).  Device-written:
     ``accepted`` FP32 TILE ``[1,1,1,1]`` (the pass's accept count, read by the next pass's commits).
     ``moe_rows`` is every layer's verify MoE row count (``moe_rows_for(rows)`` unless the allocation was given
-    an explicit override); ``gdn_step_anchor_layers`` the GDN layers whose commits run the state re-anchor.
+    an explicit override); ``gdn_step_anchor_layers`` the GDN layers whose commits run the state re-anchor;
+    ``sampling`` (allocated with the chain's candidate-row constants) the sampled verify's landed rows
+    (:class:`Qwen38TTNNVerifySampling`), ``None`` on a greedy-only state.
     """
 
     drafts: int
@@ -382,6 +434,7 @@ class Qwen38TTNNVerifyState:
     moe_rows: int
     gdn_step_anchor_layers: frozenset[int]
     _owner: object = field(repr=False, compare=False)
+    sampling: "Qwen38TTNNVerifySampling | None" = None
 
 
 @dataclass
@@ -569,6 +622,19 @@ def _validate_verify_state(model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyS
             raise RuntimeError(
                 f"alignment residual must be {MTP_RESIDUAL_SHAPE}, got {tensor_metadata(verify.alignment.residual)}"
             )
+    if verify.sampling is not None:
+        sampling = verify.sampling
+        if verify.alignment is None or sampling.rows != verify.rows:
+            raise ValueError("verify sampling buffers need the alignment and the verify state's row count")
+        candidate_shape = (1, 1, verify.rows, SAMPLING_CANDIDATE_ROW_SHAPE[3])
+        for name, tensor, shape, dtype, layout in (
+            ("verify candidate rows", sampling.candidate_rows, candidate_shape, ttnn.float32, ttnn.ROW_MAJOR_LAYOUT),
+            ("verify alignment lanes", sampling.alignment_lanes, TOKEN_ROW_SHAPE, ttnn.float32, ttnn.ROW_MAJOR_LAYOUT),
+            ("verify alignment residual rows", sampling.residual_rows, RESIDUAL_ROWS_SHAPE, ttnn.bfloat16, ttnn.TILE_LAYOUT),
+            ("verify logits rows", sampling.logits_rows, (1, 1, verify.rows, LOCAL_VOCAB_SIZE), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+        ):
+            if _shape(tensor) != shape or tensor.dtype != dtype or tensor.layout != layout:
+                raise RuntimeError(f"{name} must be {dtype} {layout} {shape}, got {tensor_metadata(tensor)}")
 
 
 def _validate_mtp_components(model: Qwen38TTNNTextModel, mtp_components) -> tuple[Any, Any, Any]:
@@ -602,6 +668,7 @@ def allocate_verify_state(
     moe_rows: int | None = None,
     gdn_step_anchor_layers: Sequence[int] = (),
     alignment_generic_state=None,
+    sampling_constants: Qwen38TTNNSamplingCandidateConstants | None = None,
 ) -> Qwen38TTNNVerifyState:
     """Allocate the verify constants and every layer's verify buffers beside ``state`` (before any capture).
 
@@ -611,13 +678,19 @@ def allocate_verify_state(
     the GDN layers whose commits run the committed rows through the 1-row FP32 step recurrence (the state
     re-anchor) instead of the chunk kernel.  ``alignment_generic_state`` (a further draft-count arm) reuses the MTP
     layer's generic state of an earlier verify state instead of allocating one: the caches are one, the arm owns
-    only its rows-dependent alignment verify state and residual.
+    only its rows-dependent alignment verify state and residual.  ``sampling_constants`` (a chain with the
+    candidate rows) adds the sampled verify's buffers (:class:`Qwen38TTNNVerifySampling`): every pass then also
+    lands its R candidate rows, the alignment's R argmaxes, the alignment residual rows and the logit rows.
     """
 
     if drafts not in SUPPORTED_DRAFTS:
         raise ValueError(f"MTP v2 verify admits k in {SUPPORTED_DRAFTS}, got {drafts!r}")
     if alignment_generic_state is not None and mtp_components is None:
         raise ValueError("alignment_generic_state is the MTP layer's shared generic state: it needs mtp_components")
+    if sampling_constants is not None and mtp_components is None:
+        raise ValueError("sampling_constants (the sampled verify's buffers) need the MTP alignment: mtp_components")
+    if sampling_constants is not None and not isinstance(sampling_constants, Qwen38TTNNSamplingCandidateConstants):
+        raise TypeError("sampling_constants must be the chain's Qwen38TTNNSamplingCandidateConstants")
     if not isinstance(state, Qwen38TTNNTextModelGenericState) or state._owner is not model._state_owner:
         raise ValueError("generic text-model state was not allocated by this model owner")
     if model.rope_table is None or model.qsa_position_constants is None:
@@ -715,6 +788,35 @@ def allocate_verify_state(
                 residual,
                 owns_generic_state=alignment_generic_state is None,
             )
+        sampling = None
+        if sampling_constants is not None:
+            candidate_rows = _upload_replicated(
+                mesh_device,
+                mesh_contract,
+                torch.zeros((1, 1, rows, SAMPLING_CANDIDATE_ROW_SHAPE[3])),
+                ttnn.float32,
+                ttnn.ROW_MAJOR_LAYOUT,
+                label="verify candidate rows",
+            )
+            actions.append(("verify candidate rows", lambda: _deallocate(candidate_rows)))
+            alignment_lanes = _upload_replicated(
+                mesh_device,
+                mesh_contract,
+                torch.full(TOKEN_ROW_SHAPE, float(ZERO_EMBEDDING_TOKEN)),
+                ttnn.float32,
+                ttnn.ROW_MAJOR_LAYOUT,
+                label="verify alignment lanes",
+            )
+            actions.append(("verify alignment lanes", lambda: _deallocate(alignment_lanes)))
+            residual_rows = _allocate_hidden_sharded_zeros(
+                mesh_device, mesh_contract, RESIDUAL_ROWS_SHAPE, label="verify alignment residual rows"
+            )
+            actions.append(("verify alignment residual rows", lambda: _deallocate(residual_rows)))
+            logits_rows = _allocate_vocab_sharded_zeros(mesh_device, mesh_contract, rows, label="verify logits rows")
+            actions.append(("verify logits rows", lambda: _deallocate(logits_rows)))
+            sampling = Qwen38TTNNVerifySampling(
+                rows, sampling_constants, candidate_rows, alignment_lanes, residual_rows, logits_rows
+            )
         verify = Qwen38TTNNVerifyState(
             drafts=drafts,
             rows=rows,
@@ -730,6 +832,7 @@ def allocate_verify_state(
             alignment=alignment,
             moe_rows=moe_rows,
             gdn_step_anchor_layers=anchor_layers,
+            sampling=sampling,
             _owner=model._state_owner,
         )
         _validate_verify_state(model, verify)
@@ -752,6 +855,8 @@ def release_verify_state(model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifySta
             actions.append(
                 ("MTP layer generic state", lambda: alignment.layer.release_generic_state(alignment.generic_state))
             )
+    if verify.sampling is not None:
+        actions.append(("verify sampling buffers", verify.sampling.deallocate))
     actions.append(("verify PLE rows", verify.ple_rows.release))
     actions.append(("verify accept scalar", lambda: _deallocate(verify.accepted)))
     actions.append(("verify draft lanes", lambda: _deallocate(verify.draft_lanes)))
@@ -917,6 +1022,124 @@ def read_verify_output(output: Qwen38TTNNVerifyOutput, *, rows: int) -> Qwen38TT
     return _verify_readback(ttnn.to_torch(ttnn.get_device_tensors(output.readback)[0]).reshape(-1), rows=rows)
 
 
+# --------------------------------------------------------------------------- the sampled pass's host side
+
+
+def read_verify_candidates(verify: Qwen38TTNNVerifyState) -> tuple[Qwen38CandidateRow, ...]:
+    """Host readback (outside any trace) of a sampled verify's R candidate rows from coordinate 0, each parsed as
+    the single-row form is (:class:`Qwen38CandidateRow` checks every row's shards)."""
+
+    if verify.sampling is None:
+        raise RuntimeError("the verify state carries no sampling buffers")
+    host = ttnn.to_torch(ttnn.get_device_tensors(verify.sampling.candidate_rows)[0])
+    if tuple(host.shape) != (1, 1, verify.rows, SAMPLING_CANDIDATE_ROW_SHAPE[3]):
+        raise RuntimeError(f"verify candidate rows read back as {tuple(host.shape)}")
+    return tuple(
+        Qwen38CandidateRow.from_host_row(host[0, 0, index].reshape(SAMPLING_CANDIDATE_ROW_SHAPE).to(torch.float32))
+        for index in range(verify.rows)
+    )
+
+
+def read_alignment_lanes(verify: Qwen38TTNNVerifyState) -> tuple[int, ...]:
+    """Host readback (outside any trace) of the MTP alignment's R argmaxes: lane j is the first draft of a pass
+    that accepts j drafts (the MTP layer's prediction after the target's argmax at row j)."""
+
+    if verify.sampling is None:
+        raise RuntimeError("the verify state carries no sampling buffers")
+    lanes = ttnn.to_torch(ttnn.get_device_tensors(verify.sampling.alignment_lanes)[0]).reshape(-1)
+    if lanes.numel() != CHUNK_ROWS:
+        raise RuntimeError(f"alignment lanes read back as {lanes.numel()} lanes, expected {CHUNK_ROWS}")
+    values = tuple(int(value) for value in lanes[: verify.rows])
+    if any(value < 0 for value in values):
+        raise RuntimeError(f"alignment lanes hold {values}; every real row resolves an id")
+    return values
+
+
+def read_verify_logits_row(model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState, index: int) -> torch.Tensor:
+    """The exact fallback's source (outside any trace): the target's full-vocabulary logits of verify row ``index``
+    as fp32 ``[VOCAB_SIZE]``, an eager all-gather of the landed logit rows (about 1 MB per row over the host link;
+    a fallback is a boundary-tie event of the candidate guard, not a per-pass cost)."""
+
+    if verify.sampling is None:
+        raise RuntimeError("the verify state carries no sampling buffers")
+    if isinstance(index, bool) or type(index) is not int or not 0 <= index < verify.rows:
+        raise ValueError(f"row index must be an int in [0,{verify.rows}), got {index!r}")
+    gathered = ttnn.all_gather(
+        verify.sampling.logits_rows, dim=3, cluster_axis=TP_AXIS, memory_config=ttnn.DRAM_MEMORY_CONFIG
+    )
+    try:
+        host = ttnn.to_torch(ttnn.get_device_tensors(gathered)[0])
+    finally:
+        _deallocate(gathered)
+    if tuple(host.shape) != (1, 1, verify.rows, VOCAB_SIZE):
+        raise RuntimeError(
+            f"verify logits rows gathered as {tuple(host.shape)}, expected [1, 1, {verify.rows}, {VOCAB_SIZE}]"
+        )
+    return host[0, 0, index].to(torch.float32)
+
+
+def write_verify_readback(
+    model: Qwen38TTNNTextModel, verify_output: Qwen38TTNNVerifyOutput, readback: Qwen38TTNNVerifyReadback
+) -> None:
+    """Host write (outside any trace) of the verify row the draft body reads: ``[a, t', d_1', argmax_0 ..]`` with
+    the host's accept, next token and first draft in the fixed lanes (a sampled pass's), the sentinel past the
+    real rows."""
+
+    if not verify_output.active:
+        raise RuntimeError("verify output tensors were released")
+    host = torch.full((1, 1, 1, READBACK_WIDTH), float(ZERO_EMBEDDING_TOKEN))
+    first_draft = ZERO_EMBEDDING_TOKEN if readback.first_draft is None else readback.first_draft
+    fixed = len(READBACK_FIXED_LANES)
+    host[..., :fixed] = torch.tensor([float(readback.accepted), float(readback.next_token), float(first_draft)])
+    host[..., fixed : fixed + len(readback.argmaxes)] = torch.tensor([float(value) for value in readback.argmaxes])
+    ttnn.copy_host_to_device_tensor(
+        ttnn.from_torch(
+            host,
+            dtype=ttnn.float32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=replicate_tensor_2d_mesh_mapper(model.mesh_device),
+        ),
+        verify_output.readback,
+    )
+
+
+def apply_host_accept(
+    model: Qwen38TTNNTextModel,
+    verify: Qwen38TTNNVerifyState,
+    state,
+    verify_output: Qwen38TTNNVerifyOutput,
+    *,
+    accepted: int,
+    next_token: int,
+    first_draft: int,
+    argmaxes: Sequence[int],
+    position: int,
+) -> Qwen38TTNNVerifyReadback:
+    """A sampled pass's accept, decided on the host, written where the device wrote its own (outside any trace):
+    the accept scalar (the next commit's selectors read it, so does the draft history's), the position
+    ``P <- position`` (the verify body advanced it by the device's count), the readback row's fixed lanes (the
+    draft body's ``t'`` and ``d_1'``), and row ``a`` of the alignment residuals re-selected into
+    ``alignment.residual`` (the draft body's start).  Returns the corrected readback."""
+
+    if verify.sampling is None or verify.alignment is None:
+        raise RuntimeError("a host accept needs the verify state's sampling buffers and alignment")
+    if isinstance(accepted, bool) or type(accepted) is not int or not 0 <= accepted < verify.rows:
+        raise ValueError(f"accept count must be an int in [0,{verify.rows}), got {accepted!r}")
+    for name, token in (("next token", next_token), ("first draft", first_draft)):
+        if isinstance(token, bool) or type(token) is not int or token < 0:
+            raise ValueError(f"{name} must be a non-negative int, got {token!r}")
+    if isinstance(position, bool) or type(position) is not int or position < 0:
+        raise ValueError(f"position must be a non-negative int, got {position!r}")
+    readback = Qwen38TTNNVerifyReadback(accepted, next_token, first_draft, tuple(int(value) for value in argmaxes))
+    write_verify_accepted(model, verify, accepted)
+    state.position.reset(position)
+    write_verify_readback(model, verify_output, readback)
+    select_residual_row(
+        verify.sampling.residual_rows, verify.accepted, verify.accept_constants, output=verify.alignment.residual
+    )
+    return readback
+
+
 # --------------------------------------------------------------------------- the body
 
 
@@ -1042,13 +1265,16 @@ def _embed_rows(model: Qwen38TTNNTextModel, token_row):
     return residual
 
 
-def _resolve_rows(model: Qwen38TTNNTextModel, hidden_rows, *, rows: int, sentinel_tail):
+def _resolve_rows(
+    model: Qwen38TTNNTextModel, hidden_rows, *, rows: int, sentinel_tail, sampling: "Qwen38TTNNVerifySampling | None" = None
+):
     """Final-mixer output rows -> the ``rows`` real rows -> LM head -> the FP32 ROW_MAJOR ``[1,1,1,32]`` row of
     per-row global greedy ids (lanes past ``rows`` hold ``ZERO_EMBEDDING_TOKEN`` from ``sentinel_tail``).
 
     The LM head, the local candidates (the argmax over the vocabulary, the head's cost, scales with the rows) and
     the resolve run on the real rows alone: the 32-row forms' first rows, bitwise.  The row slice at row 0 is a
-    copy on this runtime (the PLE layer's form); the padding rows never reach the head.
+    copy on this runtime (the PLE layer's form); the padding rows never reach the head.  With ``sampling`` (the
+    target head of a sampled verify) the logits also land their candidate rows and themselves before they go.
     """
 
     lm_head = model.model_io.lm_head
@@ -1059,6 +1285,11 @@ def _resolve_rows(model: Qwen38TTNNTextModel, hidden_rows, *, rows: int, sentine
         head_rows = ttnn.slice(hidden_rows, (0, 0, 0, 0), (1, 1, rows, LOCAL_HIDDEN_SIZE), memory_config=dram)
         head_rows.update_tensor_topology(hidden_rows.tensor_topology())
     logits = lm_head(head_rows)
+    if sampling is not None:
+        # The sampled verify's host inputs, landed while the logits live: the R candidate rows (the host sampler's
+        # exact form) and the logit rows themselves (the full-vocabulary fallback's gather source).
+        lm_head.sampling_candidate_rows(logits, sampling.constants, into=sampling.candidate_rows)
+        _land(logits.tensor, sampling.logits_rows, label="verify logits rows")
     candidates = lm_head.greedy_candidates(logits, values_by_gather=True)
     _deallocate(logits.tensor)
     lanes = lm_head.resolve_greedy_rows_on_device(candidates)
@@ -1125,6 +1356,11 @@ def _forward_alignment(
     hidden = alignment.final_mixer.rows(residual, flat_views=True)
     lanes = _resolve_rows(model, hidden, rows=verify.rows, sentinel_tail=constants.sentinel_tail)
     _deallocate(hidden)
+    if verify.sampling is not None:
+        # A sampled pass's host accept picks its first draft and its residual row itself: every row's lane and the
+        # residual rows are landed for it (the device's own select below stands for the greedy pass).
+        _land(lanes, verify.sampling.alignment_lanes, label="alignment lanes")
+        _land(residual, verify.sampling.residual_rows, label="alignment residual rows")
     first_draft = ttnn.gather(lanes, 3, accept.accepted_index, memory_config=dram)
     _deallocate(lanes)
     select_residual_row(residual, accept.accepted_tile, constants, output=alignment.residual)
@@ -1191,7 +1427,7 @@ def forward_verify(
             stage(f"layer-{layer_index}")
         hidden = model.final_mixer.rows(residual, flat_views=True)
         argmax_lanes = _resolve_rows(
-            model, hidden, rows=verify.rows, sentinel_tail=verify.accept_constants.sentinel_tail
+            model, hidden, rows=verify.rows, sentinel_tail=verify.accept_constants.sentinel_tail, sampling=verify.sampling
         )
         _deallocate(hidden)
         stage("head")
@@ -1815,6 +2051,8 @@ class Qwen38TTNNMTPPassRecord:
     finished: bool
     segments_ns: dict[str, int]
     source: str = "device"  # who drafted the NEXT pass's k ids: the device draft body or the host drafter
+    chosen: tuple[int, ...] = ()  # the a + 1 tokens the target chose: its argmaxes, or a sampled pass's samples
+    sampled: bool = False  # the target's tokens were sampled on the host (the request's policy), not resolved
 
 
 class Qwen38TTNNMTPChain:
@@ -1845,6 +2083,17 @@ class Qwen38TTNNMTPChain:
     row and the draft lanes (the device draft body is skipped: its k - 1 sequential rows are the cost this saves),
     a decline replays the device draft as usual.  Acceptance decides what commits either way, so a proposal of any
     quality is lossless.  Not combined with a commit queue or a separate draft-history trace.
+
+    With ``sampler`` (an object with ``choose(index, row, pass_tokens, chosen, *, full_logits) -> id``, e.g.
+    ``qwen38_sampling_step.Qwen38MTPSampler``; needs the verify state's sampling buffers and ``state`` for its
+    position) the target is sampled instead of resolved: after the verify the host reads the R candidate rows,
+    chooses row 0's token under the request's policy, accepts draft 1 only where it equals that choice, chooses row
+    1's, and so on to the first mismatch, so every committed token is a draw from the target's conditional given
+    its committed prefix, whatever the drafts (the stream is a sample of the target; rows past the first mismatch
+    are never drawn for).  The accept, the next token and the first draft (the alignment's argmax at row a) are
+    then written where the device wrote its own (:func:`apply_host_accept`), and the pass continues in the
+    host-first form.  The device's alignment ran on its argmaxes, so a sampled pass's first draft (and the MTP
+    layer's rows past the sample) assume the argmax at row a: draft quality, never the committed stream.
     """
 
     def __init__(
@@ -1863,6 +2112,8 @@ class Qwen38TTNNMTPChain:
         observer: Callable[[str], Any] | None = None,
         commit_queue: Qwen38TTNNCommitQueue | None = None,
         host_drafter: Any | None = None,
+        state: Any | None = None,
+        sampler: Any | None = None,
     ) -> None:
         _validate_draft_state(model, verify, draft)
         if not isinstance(traces, Qwen38TTNNMTPTraces) or not callable(replay):
@@ -1880,6 +2131,13 @@ class Qwen38TTNNMTPChain:
                 raise TypeError("host_drafter needs propose(next_token) and extend(tokens)")
             if commit_queue is not None or traces.draft_history is not None:
                 raise ValueError("a host drafter takes the plain pass form: no commit queue, no separate draft history")
+        if sampler is not None:
+            if not callable(getattr(sampler, "choose", None)):
+                raise TypeError("sampler needs choose(index, row, pass_tokens, chosen, *, full_logits)")
+            if verify.sampling is None or state is None:
+                raise ValueError("a sampler needs the verify state's sampling buffers and the generic state")
+            if commit_queue is not None or traces.draft_history is not None:
+                raise ValueError("a sampled chain takes the plain pass form: no commit queue, no separate draft history")
         self.model, self.verify, self.draft, self.traces = model, verify, draft, traces
         self.verify_output, self.replay, self.clock_ns = verify_output, replay, clock_ns
         self.enqueue, self.observer, self.commit_queue = enqueue, observer, commit_queue
@@ -1892,6 +2150,7 @@ class Qwen38TTNNMTPChain:
         self.finished = False
         self.host_drafter = host_drafter
         self.host_passes = 0  # passes whose next drafts the host proposed
+        self.state, self.sampler = state, sampler
 
     def _require_room(self) -> None:
         if self.finished:
@@ -1910,7 +2169,7 @@ class Qwen38TTNNMTPChain:
         return result
 
     def _finish_pass(self, tokens: Sequence[int], segments: dict[str, int]) -> Qwen38TTNNMTPPassRecord:
-        if self.host_drafter is not None:
+        if self.host_drafter is not None or self.sampler is not None:
             return self._finish_pass_host_first(tokens, segments)
         verify_trace = (
             self.traces.verify_catch_up if self.records and self.traces.commit is None else self.traces.verify_first
@@ -1944,6 +2203,7 @@ class Qwen38TTNNMTPChain:
             first_draft=readback.first_draft,
             finished=self.finished,
             segments_ns=segments,
+            chosen=tuple(readback.argmaxes[: readback.accepted + 1]),
         )
         self.records.append(record)
         self.position += readback.accepted + 1
@@ -1951,10 +2211,13 @@ class Qwen38TTNNMTPChain:
         return record
 
     def _finish_pass_host_first(self, tokens: Sequence[int], segments: dict[str, int]) -> Qwen38TTNNMTPPassRecord:
-        """The pass with a host drafter: the verify, its row read alone (the device idles through the host segment
-        instead of drafting), the drafter told this pass's committed rows and asked for the next pass's k ids, a
-        proposal written into the token row and the draft lanes, or, when the host declines, the device draft
-        replayed as usual (its trace reads the same verify row; nothing ran in between) and the pass row read."""
+        """The pass with a host drafter or a sampler: the verify, its row read alone (the device idles through the
+        host segment instead of drafting); with a sampler the target's tokens are chosen on the host from the R
+        candidate rows and its accept written back (:meth:`_sample_pass`); the drafter, if any, is told the pass's
+        committed rows and asked for the next pass's k ids, a proposal written into the token row and the draft
+        lanes, or, when the host declines (or there is no drafter), the device draft replayed as usual (its trace
+        reads the same verify row, corrected by the host on a sampled pass; nothing else ran in between) and the
+        pass row read."""
 
         verify_trace = (
             self.traces.verify_catch_up if self.records and self.traces.commit is None else self.traces.verify_first
@@ -1966,12 +2229,17 @@ class Qwen38TTNNMTPChain:
         )
         if readback.first_draft is None:
             raise RuntimeError("the verify readback carries no first draft; the chain needs the alignment rows")
-        committed = list(readback.argmaxes[: readback.accepted + 1])
+        if self.sampler is not None:
+            readback, chosen = self._timed(segments, "host_sample", lambda: self._sample_pass(tokens, readback))
+        else:
+            chosen = tuple(readback.argmaxes[: readback.accepted + 1])
+        committed = list(chosen)
         first_eos = next((i for i, token in enumerate(committed) if token in self.eos_token_ids), None)
-        self.host_drafter.extend(tokens[: readback.accepted + 1])  # this pass's rows: t_P and the accepted drafts
         proposal = None
-        if first_eos is None:
-            proposal = self._timed(segments, "host_draft", lambda: self._host_proposal(readback.next_token))
+        if self.host_drafter is not None:
+            self.host_drafter.extend(tokens[: readback.accepted + 1])  # this pass's rows: t_P and the accepted drafts
+            if first_eos is None:
+                proposal = self._timed(segments, "host_draft", lambda: self._host_proposal(readback.next_token))
         if proposal is not None:
             source = "host"
             self.next_tokens = (readback.next_token, *proposal)
@@ -1993,7 +2261,7 @@ class Qwen38TTNNMTPChain:
             committed = committed[: first_eos + 1]
             self.finished = True
         if committed[-1] != readback.next_token and first_eos is None:
-            raise RuntimeError(f"verify readback next token {readback.next_token} is not argmax {readback.accepted}")
+            raise RuntimeError(f"verify readback next token {readback.next_token} is not the chosen row {readback.accepted}")
         record = Qwen38TTNNMTPPassRecord(
             index=len(self.records),
             position=self.position,
@@ -2006,11 +2274,54 @@ class Qwen38TTNNMTPChain:
             finished=self.finished,
             segments_ns=segments,
             source=source,
+            chosen=tuple(chosen),
+            sampled=self.sampler is not None,
         )
         self.records.append(record)
         self.position += readback.accepted + 1
         self.next_token, self.first_draft = readback.next_token, first_draft
         return record
+
+    def _sample_pass(
+        self, tokens: Sequence[int], readback: Qwen38TTNNVerifyReadback
+    ) -> tuple[Qwen38TTNNVerifyReadback, tuple[int, ...]]:
+        """The sampled accept (the class docstring): row by row the sampler chooses the target's token from the
+        row's candidates and a draft is accepted only where it equals that choice; the accept, the next token (the
+        last choice) and the first draft (the alignment's argmax at row a) are written where the device wrote
+        its own.  Returns the corrected readback and the chosen tokens."""
+
+        pass_tokens = tuple(int(token) for token in tokens)
+        drafts = pass_tokens[1:]
+        candidates = read_verify_candidates(self.verify)
+        alignment = read_alignment_lanes(self.verify)
+        chosen: list[int] = []
+        for index in range(self.verify.rows):
+            token = self.sampler.choose(
+                index,
+                candidates[index],
+                pass_tokens,
+                tuple(chosen),
+                full_logits=lambda index=index: read_verify_logits_row(self.model, self.verify, index),
+            )
+            if isinstance(token, bool) or type(token) is not int or token < 0:
+                raise RuntimeError(f"the sampler must choose a non-negative int id, got {token!r}")
+            chosen.append(token)
+            if index < self.verify.drafts and drafts[index] == token:
+                continue  # the draft is the target's own choice: the next row's input stands
+            break
+        accepted = len(chosen) - 1
+        corrected = apply_host_accept(
+            self.model,
+            self.verify,
+            self.state,
+            self.verify_output,
+            accepted=accepted,
+            next_token=chosen[-1],
+            first_draft=alignment[accepted],
+            argmaxes=readback.argmaxes,
+            position=self.position + accepted + 1,
+        )
+        return corrected, tuple(chosen)
 
     def _host_proposal(self, next_token: int) -> tuple[int, ...] | None:
         proposal = self.host_drafter.propose(next_token)
@@ -2388,6 +2699,7 @@ __all__ = [
     "accept_rows",
     "allocate_draft_state",
     "allocate_verify_state",
+    "apply_host_accept",
     "capture_commit",
     "capture_draft",
     "capture_draft_history",
@@ -2415,9 +2727,13 @@ __all__ = [
     "Qwen38TTNNVerifyLayerState",
     "Qwen38TTNNVerifyOutput",
     "Qwen38TTNNVerifyReadback",
+    "Qwen38TTNNVerifySampling",
     "Qwen38TTNNVerifyState",
     "PASS_ROW_WIDTH",
+    "read_alignment_lanes",
     "read_pass_row",
+    "read_verify_candidates",
+    "read_verify_logits_row",
     "read_verify_output",
     "READBACK_WIDTH",
     "release_draft_state",
@@ -2430,4 +2746,5 @@ __all__ = [
     "write_verify_accepted",
     "write_verify_inputs",
     "write_verify_ple_rows",
+    "write_verify_readback",
 ]

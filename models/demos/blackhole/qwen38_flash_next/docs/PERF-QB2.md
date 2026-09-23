@@ -73,6 +73,35 @@ allocates, warms (every kind at its own residue) and captures the three chunk tr
 releases them derived-first; the admission adds `MTP_PREFILL_EXTENSION_BYTES_PER_BANK_UPPER_BOUND` (8 MB) per
 further kind. `--mtp` combines with `--long-chunks` and `--prefill-slab`.
 
+### 2.5 Sampled requests through the pass loop (`--mtp` with `--sampling`)
+
+The pass loop drafted greedy requests only; the model card's defaults are temperature 0.7 / 1.0, so most chat
+traffic ran the 1-row loop at 27 tok/s. Now every verify pass lands, beside its argmax lanes, the R candidate rows
+of the target's logits (`Qwen38TTNNLMHead.sampling_candidate_rows`: the TAIL epilogue's per-shard top-32 with a
+row axis), the MTP alignment's R argmaxes, the alignment residual rows and the logit rows
+(`Qwen38TTNNVerifySampling`, allocated per arm with the chain's candidate-row constants). A sampled request the
+loop admits (`sampling_step.mtp_pass_loop_admits`: `top_k` 1..32, no penalty that raises logits) takes the
+host-first pass form with a sampler (`Qwen38TTNNMTPChain(sampler=..., state=...)`, `_sample_pass`): after the
+verify the host reads the candidate rows and chooses row 0's token under the request's policy
+(`sampling_step.Qwen38MTPSampler`: the same `sample_candidates` as the 1-row loop, the history the committed
+tokens then `t_P` then the rows chosen so far, the request's generator), accepts draft 1 only where it equals that
+choice, chooses row 1's, and so on to the first mismatch; the candidate guard's fallback samples the row's landed
+logits (`read_verify_logits_row`, an eager gather). `apply_host_accept` then writes the accept where the device
+wrote its own: the accept scalar (the next commit's selectors), `P` (the body advanced it by the device's count),
+the readback row's fixed lanes (the draft body's `t'` and `d_1'`, the latter the alignment's argmax at row a) and
+row a of the alignment residuals re-selected into `alignment.residual`; the draft trace then replays unchanged
+(or a host drafter proposes). Exact by construction: every committed token is a draw from the target's
+conditional given its committed prefix, whatever the drafts; rows past the first mismatch are never drawn for, so
+one draw per committed token in row order, and a seed reproduces the 1-row sampled loop's draws up to the verify
+pass's rounding (the no-device suite proves the streams equal, generator state included, for every acceptance
+pattern at k 3/4/7, both launch forms, the fallback and a host drafter on top). The alignment ran on the
+argmaxes, so a sampled pass's first draft and the MTP layer's rows past the sample assume the argmax at row a:
+draft quality, never the stream. The session draws the first token from the last prompt TAIL's candidate row,
+appends every sample before its token is yielded (the logprobs items), keeps the device sampler greedy for such
+requests, and hands the 1-row sampled loop the rest where the greedy loop would hand its own. The buffers cost about 1.2 MB per device per arm (the logit rows are the
+bulk: R x 62,080 bf16), inside the admission's per-arm bound; the verify trace gains the rows epilogue's few ops
+and one 1 MB copy per pass, the greedy pass reads none of it.
+
 ## 3. Expected effect (from the tree's pass costs; measure, do not trust)
 
 Pass time T(k) ~= 54.7 + 4k ms. Tokens per pass = 1 + accepted drafts.
@@ -85,7 +114,10 @@ Pass time T(k) ~= 54.7 + 4k ms. Tokens per pass = 1 + accepted drafts.
 k = 5 is never worse than 4; k = 7 pays on structured output and costs 5-10% on chat. That asymmetry is why the
 draft length is per request (2.2), not a larger default. Host drafting (2.3): structured output, code and copy-heavy
 replies at close to verify-only pass time (~55 ms for up to k + 1 tokens); chat unchanged. The prefill kinds (2.4):
-TTFT of an MTP server at the slab's 0.87 ms per prompt token instead of 3.3.
+TTFT of an MTP server at the slab's 0.87 ms per prompt token instead of 3.3. Sampled requests (2.5): the pass
+loop's rates at the sampled acceptance — a draft is accepted with the probability the policy gives the drafted
+token, so at temperature 0.7 on structured output most of the greedy 0.95 survives and on chat less of the 0.68;
+measure per prompt class.
 
 ## 4. Hardware validation order (QuietBox 2)
 
@@ -104,6 +136,11 @@ TTFT of an MTP server at the slab's 0.87 ms per prompt token instead of 3.3.
    there and the records must reproduce; a slab needs a prompt of 2,048+ tokens (one long request after): TTFT
    against `--mtp 4` alone.
 7. Timing at each k on the twelve acceptance prompts: pass time and tokens per pass, against section 3.
+   Then the sampled arm: `--mtp 4` (the launcher passes `--sampling`) with a `temperature 0.7` request carrying a
+   `seed`, twice, and the same request on `--no-mtp`'s 1-row loop (or `speculative_drafts` absent on a plain
+   server): the two seeded streams must agree until a near-tie of the verify pass's rounding, the pass loop's
+   reply must report `qwen38.mtp.sampled_passes` > 0, and `qwen38.sampling.fallbacks` should stay at 0 on the
+   twelve prompts (a fallback is a boundary tie; each costs an eager 1 MB gather).
 8. A/Bs, one variable each: `QWEN38_FUSED=final_mixer,gdn_step,position_advance` in the launcher's environment (it
    `exec`s the server with the caller's environment; `gdn_step` replaces the 49-program GDN chain with one program per
    layer and is off by default only because its rounding follows the torch oracle rather than the chain, tolerance
@@ -115,7 +152,7 @@ TTFT of an MTP server at the slab's 0.87 ms per prompt token instead of 3.3.
 
 | # | lever | evidence | expected effect | status |
 |---|---|---|---|---|
-| 1 | **sampled requests through the pass loop** | the chain drafts greedy requests only (`drafting = ... sampling is None`); the model card's defaults are temperature 0.7 / 1.0, so most chat traffic runs the 1-row loop at 27 tok/s. Every other port serves sampled requests speculatively (MTPLX: "exact at any temperature") | the MTP rates (39-68 tok/s at k = 4) for temperature > 0, times the sampled acceptance | design below; no-device-testable |
+| 1 | **sampled requests through the pass loop** | the chain drafts greedy requests only (`drafting = ... sampling is None`); the model card's defaults are temperature 0.7 / 1.0, so most chat traffic runs the 1-row loop at 27 tok/s. Every other port serves sampled requests speculatively (MTPLX: "exact at any temperature") | the MTP rates (39-68 tok/s at k = 4) for temperature > 0, times the sampled acceptance | **on this branch** (2.5); the rejection-sampling form stays open |
 | 2 | verify rows to 16 (k <= 15) | with host drafting the matched drafts are free; the QSA chunk constants carry 8 `row_selects` and `derive_qsa_chunk_inputs` admits up to 8 completed blocks; needs `VERIFY_COMPLETED_BLOCKS = (R + 3) // 4`, the pool-select stack for N rows, block-start RoPE rows, MoE rows to 16 | structured output 11.2 tokens per pass at k = 15 against 7.0 at k = 7 | no-device-testable |
 | 3 | **index sharing for the draft rows** | SGLang's IndexShare and vLLM's "index sharing": the draft rows reuse the QSA block selection of the last accepted row instead of running the indexer per row (N + 1 extra columns for the positions drafted since); +3-4% on coding and JSON on the DGX Spark | a cheaper draft row (the k - 1 rows are ~4 ms each of which the MTP layer's indexer is an unmeasured part) | device; measure the draft row's program census first |
 | 4 | **a 64k draft vocabulary and a bf4 draft LM head** | the DGX Spark recipe's `DRAFT_VOCAB=1` (the drafter's head over 65,536 ids); the draft row here re-reads the 1.27 GB bf16 LM head per row. Lossless: a draft outside the subset is a wrong draft, the verify head is the full one | 1.27 GB -> ~80 MB per draft row: ~0.6 ms of the ~4 ms, k - 1 times per pass | the sliced head and the host id remap build offline; silicon proves it |
@@ -133,23 +170,15 @@ that is not MoE / attention / GDN, the 256k decode slowdown, the PLE host segmen
 Not levers: the n-gram lookup's round trip (`refresh_ple_row` computes the row on the host from the token it already
 read back and does one host-to-device copy) and GDN state precision (fp32 by construction).
 
-### Lever 1: sampled requests through the pass loop, the design
+### Lever 1, built (2.5): what stays open
 
-What exists: the sampled 1-row loop (read the candidate row after TAIL, sample on the host, write the token before
-HEAD) and the device sampler composite (`--device-sampler`, the per-request policy written once); the verify pass's
-accept constants compare the draft lanes with the target's argmax rows and read back the accepted count.
-
-The exact rule that needs no draft probabilities: sample t_i ~ p_i at every verify row (a rows form of the sampler
-over the R rows, the request's policy), accept d_i iff d_i = t_i, commit t_a after the a accepted drafts. Every
-committed token is drawn from the target's conditional given the committed prefix, so the stream is a sample of the
-target: the drafts only decide which rows were computed in the same pass. Acceptance per draft is p_i(d_i) (the
-greedy loop's is 1 when d_i is the argmax) instead of the rejection sampler's min(1, p_i(d_i) / q_i(d_i)) with the
-residual correction that MTPLX, vLLM and SGLang implement; that form needs q_i from the draft rows (a second readback
-row per pass) and is the follow-up if the match rule's acceptance disappoints. Touch points: `sampling_step` (the
-policy over R rows), the accept constants (the compare source: the sampled ids in place of the argmaxes), the verify
-readback (the sampled ids), the session's `drafting` predicate (`sampling is None` dropped), the no-device pass-loop
-tests (a seeded sampler oracle in place of the argmax oracle). Bitwise reproducibility with a seed holds as in the
-1-row loop (the same policy, the same draws in the same order).
+The match rule accepts a draft with the probability the policy gives the drafted token; the rejection sampler
+that MTPLX, vLLM and SGLang implement accepts with min(1, p(d) / q(d)) and draws the residual on a rejection, which
+needs the draft's probabilities q from the k - 1 draft rows (a second readback row per pass) and a residual
+distribution per rejected row. It is the follow-up if the match rule's sampled acceptance disappoints on the
+box; the readback and the accept live in `_sample_pass` and would gain a q-row, nothing else moves. A cheaper
+row-0 variant needs no device change: when draft 1 misses, the residual could be drawn on the host from the
+candidate row alone, exactly, because the row carries the target's top-32 per shard.
 
 ## 6. What the other ports do (reviewed 2026-09-23)
 
@@ -208,7 +237,10 @@ PR #27742, unsloth.ai/docs/models/qwen3.8-next, cat5edopeHA/qwen38-flash-next-ai
 | + host drafting (hybrid / ngram) | 1,754 | 1,614 | 38 | 16 | 86 |
 | + MTP with the 128-row chunks and the slab | 1,766 | 1,626 | 38 | 16 | 86 |
 | + the polish pass | 1,766 | 1,626 | 38 | 16 | 86 |
+| + sampled requests through the pass loop | 1,783 | 1,643 | 38 | 16 | 86 |
 
+The 17 tests added last are the sampled pass loop's (the sequential-stream equivalence for every acceptance
+pattern, the fallback, the hybrid composition, the sampler, the readback round trip and the source contracts).
 The failing and erroring set is identical on every row: the checkpoint-reading tests (`QWEN38_CHECKPOINT` unset) and
 `test_ttnn_bf4_static`, which pins the checkout's patched `ttnn.load_tensor` that the pip wheel does not carry.
 Recipe: `PYTHONPATH=$PWD TT_METAL_HOME=$PWD python -m pytest models/demos/blackhole/qwen38_flash_next/tests

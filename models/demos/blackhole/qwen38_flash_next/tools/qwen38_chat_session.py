@@ -41,8 +41,11 @@ draft replay, readback, PLE rows, commit, verify replay, readback, ``a + 1`` tok
 per pass streamed as they commit.  At the end of the request (or before a forced
 token) the last pass's rows are committed as far as the request consumed them and
 the 1-row buffers are rebuilt (``mtp_leave``), so 1-row, sampled and MTP requests
-alternate on one server.  Sampled requests and ``prefill_mode`` ``teacher_forced``
-requests take the loops above.
+alternate on one server.  ``prefill_mode`` ``teacher_forced`` requests, and sampled requests the pass loop does not admit
+(``sampling_step.mtp_pass_loop_admits``: ``top_k`` 0, a penalty that raises logits), take the 1-row loops.
+An admitted sampled request generates through the pass loop with its target sampled on the host row by
+row from the verify's candidate rows (``sampling_step.Qwen38MTPSampler``; a draw per committed token, the
+stream a sample of the target).
 
 ``Qwen38ChatSession`` speaks to the device only through a chain object with the
 per-step primitives; ``Qwen38TracedChain`` is the hardware one, the no-device
@@ -616,6 +619,7 @@ class Qwen38ChatSession:
         stop_ids: Sequence[int],
         think_budget: int | None,
         should_stop: Callable[[], str | None] | None,
+        sampling: sampling_step.Qwen38SamplingRequest | None = None,
     ) -> Iterator[tuple[int | None, str | None]]:
         """The pass loop; yields (x_t, finish) like :meth:`_generate`, ``a + 1`` tokens per pass.
 
@@ -627,9 +631,33 @@ class Qwen38ChatSession:
         consumed and rebuilds the 1-row buffers).  A forced ``</think>`` needs the 1-row chain: the pass loop
         settles, forces the token, reads the model's next token and re-enters.  When the cache has no room for a
         pass the 1-row loop finishes the request.
+
+        ``sampling`` (a request the pass loop admits) samples the target instead of resolving it: the first token
+        is drawn on the host from the last TAIL's candidate row, every pass's tokens from its candidate rows
+        (``sampling_step.Qwen38MTPSampler``), each sample appended to the request before its token is yielded
+        (the logprobs items); the 1-row sampled loop finishes the request where the greedy one would.
         """
 
-        pending = self.chain.read_token_row()  # completes the last TAIL: the model's next token, not consumed
+        prompt_tokens = len(self.committed)
+        sampler = (
+            None if sampling is None else sampling_step.Qwen38MTPSampler(self, sampling, prompt_tokens=prompt_tokens)
+        )
+        pending_sample = None
+
+        def next_pending() -> int:
+            # The model's next token after the last TAIL (not consumed): read from the row (greedy), or drawn on
+            # the host from the row's candidates under the request's policy (sampled: the 1-row loop's first step).
+            nonlocal pending_sample
+            if sampling is None:
+                pending_sample = None
+                return self.chain.read_token_row()
+            row = self.sampling.read_candidate_row()  # completes the last TAIL
+            pending_sample = sampling_step.choose_token(
+                self, row, sampling, tail_residue=(len(self.committed) - 1) % RESIDUE_CLASSES, prompt_tokens=prompt_tokens
+            )
+            return pending_sample.token_id
+
+        pending = next_pending()
         self._require_vocabulary(pending)
         pending_yielded = False  # a pass's t' was streamed with its pass; a token read from the row was not
         produced = 0
@@ -658,15 +686,26 @@ class Qwen38ChatSession:
                 entered = False
             if pending_yielded:
                 self._forced_step(pending)
-            else:
+            elif sampling is None:
                 self.chain.write_token_row(pending)
+            # (a sampled request's unstreamed pending token is dropped: the 1-row sampled loop draws that position
+            # again from the row the last TAIL wrote, as a continuation does)
+            remaining_budget = None if not thinking_open else max(think_budget - reasoning_tokens, 0)
             with self.chain.loop_guard():
-                yield from self._generate(
-                    max_new_tokens - produced,
-                    stop_ids,
-                    None if not thinking_open else max(think_budget - reasoning_tokens, 0),
-                    should_stop,
-                )
+                if sampling is None:
+                    yield from self._generate(max_new_tokens - produced, stop_ids, remaining_budget, should_stop)
+                else:
+                    yield from sampling_step.generate_sampled(
+                        self,
+                        sampling,
+                        max_new_tokens - produced,
+                        stop_ids=stop_ids,
+                        tokenizer_size=TOKENIZER_SIZE,
+                        think_budget=remaining_budget,
+                        should_stop=should_stop,
+                        forced_step=self._forced_step,
+                        clock_ns=self.clock_ns,
+                    )
 
         while True:
             reason = None if should_stop is None else should_stop()
@@ -677,16 +716,20 @@ class Qwen38ChatSession:
                 force_think_end("length")
                 thinking_open = False
                 produced += 1
+                if sampling is not None:
+                    sampling.samples.append(None)  # a forced token has no sample
                 yield THINK_END_ID, "length" if produced == max_new_tokens else None
                 if produced == max_new_tokens:
                     return
-                pending = self.chain.read_token_row()
+                pending = next_pending()
                 self._require_vocabulary(pending)
                 pending_yielded = False
                 continue
             position = len(self.committed)
             if not pending_yielded:
                 if produced + 1 == max_new_tokens:
+                    if sampling is not None:
+                        sampling.samples.append(pending_sample)
                     self.row_token = pending
                     yield pending, "length"
                     return
@@ -697,6 +740,8 @@ class Qwen38ChatSession:
                 if thinking_open:
                     thinking_open = pending != THINK_END_ID
                     reasoning_tokens += 1
+                if sampling is not None:
+                    sampling.samples.append(pending_sample)
                 yield pending, None
                 pending_yielded = True
                 reason = None if should_stop is None else should_stop()
@@ -717,10 +762,12 @@ class Qwen38ChatSession:
                     record = self.chain.mtp_step()
             else:
                 # The eager seed, then the bootstrap pass; the committed ids seed a host drafter.
-                record = self.chain.mtp_enter(pending, self.ple_context, history=self.committed)
+                record = self.chain.mtp_enter(pending, self.ple_context, history=self.committed, sampler=sampler)
                 entered = True
             accepted = record.accepted
-            emitted = [int(token) for token in record.argmaxes[: accepted + 1]]
+            emitted = [int(token) for token in record.chosen]  # [d_1 .. d_a, t']: the target's argmaxes or samples
+            if len(emitted) != accepted + 1 or (sampling is not None and len(sampler.samples) != accepted + 1):
+                raise Qwen38ChatChainError(f"pass record holds {len(emitted)} chosen tokens for {accepted} accepted")
             for token_id in emitted:
                 self._require_vocabulary(token_id)
             run = Qwen38MTPPassRun(position, [pending, *emitted[:accepted]], emitted, 0)
@@ -728,6 +775,8 @@ class Qwen38ChatSession:
             budget_hit = False
             for index, token_id in enumerate(emitted):
                 run.yielded = index + 1
+                if sampling is not None:
+                    sampling.samples.append(sampler.samples[index])  # before the yield: the logprobs item reads it
                 produced += 1
                 if thinking_open:
                     thinking_open = token_id != THINK_END_ID
@@ -751,10 +800,12 @@ class Qwen38ChatSession:
                 force_think_end("budget")
                 thinking_open = False
                 produced += 1
+                if sampling is not None:
+                    sampling.samples.append(None)  # a forced token has no sample
                 yield THINK_END_ID, "length" if produced == max_new_tokens else None
                 if produced == max_new_tokens:
                     return
-                pending = self.chain.read_token_row()
+                pending = next_pending()
                 self._require_vocabulary(pending)
                 pending_yielded = False
                 continue
@@ -894,9 +945,16 @@ class Qwen38ChatSession:
             raise Qwen38ChatRequestError("sampling is unavailable: this chain captured no candidate row (greedy only)")
         if self.poisoned:
             raise Qwen38ChatChainError("session is poisoned by an earlier device failure")
-        # MTP drafting serves the greedy requests of the chunked mode; sampled and teacher-forced requests take the
-        # 1-row loops (speculative=False is the diagnostic form: a greedy request on the 1-row loop of an MTP chain).
-        drafting = self.mtp is not None and speculative and sampling is None and mode == "chunked"
+        # MTP drafting serves the chunked mode's greedy requests and, on a chain with the candidate rows, its sampled
+        # requests whose policy the pass loop admits (the target sampled on the host row by row: the stream is a
+        # sample of the target, section 6 of the README); teacher-forced requests and the rest take the 1-row loops
+        # (speculative=False is the diagnostic form: a greedy request on the 1-row loop of an MTP chain).
+        drafting = (
+            self.mtp is not None
+            and speculative
+            and mode == "chunked"
+            and (sampling is None or self.mtp.sampling_admitted(sampling))
+        )
         # The request's draft count (``speculative_drafts``): an admitted arm, or None for the default arm.
         if drafts is not None:
             if self.mtp is None:
@@ -913,7 +971,9 @@ class Qwen38ChatSession:
         # prompt step: the last prompt TAIL chooses the first token under this request's policy.
         device_loop = False
         if getattr(self.sampling, "sampler", None) is not None:
-            self.sampling.begin_request(sampling)
+            # A sampled request through the pass loop keeps the device sampler greedy: its tokens are drawn on the
+            # host from the candidate rows with the request's generator, the first from the last prompt TAIL's row.
+            self.sampling.begin_request(None if drafting else sampling)
             device_loop = sampling is not None and bool(sampling.uniforms)
         try:
             self.row_token = None
@@ -944,7 +1004,7 @@ class Qwen38ChatSession:
             mtp_before = (
                 None
                 if not drafting
-                else (self.mtp.passes, self.mtp.accepted_drafts, self.mtp.host_drafted_passes)
+                else (self.mtp.passes, self.mtp.accepted_drafts, self.mtp.host_drafted_passes, self.mtp.sampled_passes)
             )
 
             def consume(steps) -> None:
@@ -979,7 +1039,7 @@ class Qwen38ChatSession:
                 first_ns = last_ns = prefill_done_ns
                 if not hook_stopped:
                     finish = "length"
-                    consume(self._generate_mtp(max_tokens, stop_ids, think_budget, should_stop))
+                    consume(self._generate_mtp(max_tokens, stop_ids, think_budget, should_stop, sampling=sampling))
                     self._mtp_settle(finish)
             else:
                 with self.chain.loop_guard():
@@ -1067,6 +1127,7 @@ class Qwen38ChatSession:
                     passes=self.mtp.passes - mtp_before[0],
                     accepted_drafts=self.mtp.accepted_drafts - mtp_before[1],
                     host_drafted_passes=self.mtp.host_drafted_passes - mtp_before[2],
+                    sampled_passes=self.mtp.sampled_passes - mtp_before[3],
                 )
             ),
         )
@@ -1302,6 +1363,27 @@ def open_partition_b_mesh(marker: Marker, hardware_profile: ResidentHardwareProf
     }
 
 
+def _check_verify_candidates(readback, candidates, alignment_lanes, *, label: str) -> None:
+    """The warm pass's check of a sampled verify's landed rows against the pass's own resolve: every real row's
+    argmax is one of its candidates at the row's maximum, and lane a of the alignment lanes is the pass's first
+    draft (the device gathered it from the same lanes)."""
+
+    rows = len(readback.argmaxes)
+    if len(candidates) != rows or len(alignment_lanes) != rows:
+        raise Qwen38ChatChainError(
+            f"{label}: {len(candidates)} candidate rows and {len(alignment_lanes)} alignment lanes for {rows} rows"
+        )
+    for index, (row, argmax) in enumerate(zip(candidates, readback.argmaxes)):
+        ids, values = row.ids.reshape(-1).tolist(), row.values.reshape(-1)
+        if argmax not in ids or float(values[ids.index(argmax)]) != float(values.max()):
+            raise Qwen38ChatChainError(f"{label}: row {index}'s argmax {argmax} is not a maximal candidate of its row")
+    if alignment_lanes[readback.accepted] != readback.first_draft:
+        raise Qwen38ChatChainError(
+            f"{label}: alignment lane {readback.accepted} is {alignment_lanes[readback.accepted]}, the pass's first "
+            f"draft {readback.first_draft}"
+        )
+
+
 @dataclass
 class Qwen38ChainMTPArm:
     """One draft count's rows-dependent half of the MTP extension: the verify state (its rows constants, the 48 + 1
@@ -1316,6 +1398,7 @@ class Qwen38ChainMTPArm:
     passes: int = 0
     accepted_drafts: int = 0
     host_passes: int = 0  # passes whose next drafts the host drafter proposed
+    sampled_passes: int = 0  # passes whose target tokens the host sampled (a sampled request through the pass loop)
     capture_ms: dict[str, float] = field(default_factory=dict)
     trace_dram_bytes_per_bank: dict[str, int] = field(default_factory=dict)
 
@@ -1448,6 +1531,17 @@ class Qwen38ChainMTP:
         return sum(arm.host_passes for arm in self.arms.values())
 
     @property
+    def sampled_passes(self) -> int:
+        return sum(arm.sampled_passes for arm in self.arms.values())
+
+    def sampling_admitted(self, request: sampling_step.Qwen38SamplingRequest) -> bool:
+        """Whether a sampled request generates through the pass loop: the arms carry the sampled verify's buffers
+        (a chain with the candidate rows) and the request's policy samples the candidate rows without a fallback on
+        every row (``sampling_step.mtp_pass_loop_admits``)."""
+
+        return self.active.verify.sampling is not None and sampling_step.mtp_pass_loop_admits(request)
+
+    @property
     def capture_ms(self) -> dict[str, float]:
         return {f"{name}@k{k}": ms for k, arm in sorted(self.arms.items()) for name, ms in arm.capture_ms.items()}
 
@@ -1471,18 +1565,26 @@ class Qwen38ChainMTP:
         arm.accepted_drafts += pass_record.accepted
         if pass_record.source == "host":
             arm.host_passes += 1
+        if pass_record.sampled:
+            arm.sampled_passes += 1
         return pass_record
 
     def summary(
-        self, *, passes: int | None = None, accepted_drafts: int | None = None, host_drafted_passes: int | None = None
+        self,
+        *,
+        passes: int | None = None,
+        accepted_drafts: int | None = None,
+        host_drafted_passes: int | None = None,
+        sampled_passes: int | None = None,
     ) -> dict[str, Any]:
         """The ``qwen38.mtp`` object: k (the active arm's), the admitted arms and the default, anchor, the draft
-        source, passes, accepted drafts, the passes the host drafted, and tokens per pass (``a + 1`` per pass),
-        cumulative (health) or over the counts a request added."""
+        source, passes, accepted drafts, the passes the host drafted, the passes whose target was sampled, and
+        tokens per pass (``a + 1`` per pass), cumulative (health) or over the counts a request added."""
 
         passes = self.passes if passes is None else passes
         accepted_drafts = self.accepted_drafts if accepted_drafts is None else accepted_drafts
         host_drafted_passes = self.host_drafted_passes if host_drafted_passes is None else host_drafted_passes
+        sampled_passes = self.sampled_passes if sampled_passes is None else sampled_passes
         return {
             "k": self.active_drafts,
             "arms": sorted(self.arms),
@@ -1492,6 +1594,7 @@ class Qwen38ChainMTP:
             "passes": passes,
             "accepted_drafts": accepted_drafts,
             "host_drafted_passes": host_drafted_passes,
+            "sampled_passes": sampled_passes,
             "tokens_per_pass": None if not passes else round((passes + accepted_drafts) / passes, 4),
         }
 
@@ -1704,11 +1807,13 @@ class Qwen38TracedChain:
         *,
         drafts: int | None = None,
         history: Sequence[int] = (),
+        sampler: Any | None = None,
     ) -> mtp_v2.Qwen38TTNNMTPPassRecord:
         """Eager switch into verify mode at the device position (the host's committed count), then the bootstrap
         pass whose row 0 is ``first_token`` (placeholder drafts).  ``drafts`` selects the arm (``None`` keeps the
         active one, the default or the request's choice); ``history`` (the committed ids before ``first_token``)
-        seeds the host drafter of a ``hybrid`` / ``ngram`` chain.  Returns the pass record."""
+        seeds the host drafter of a ``hybrid`` / ``ngram`` chain; ``sampler`` (a sampled request's
+        ``Qwen38MTPSampler``) makes every pass sample the target.  Returns the pass record."""
 
         mtp = self.mtp
         model = self.built_target.model
@@ -1736,6 +1841,8 @@ class Qwen38TracedChain:
             position=position,
             enqueue=self._enqueue,
             host_drafter=host_drafter,
+            state=self.state,
+            sampler=sampler,
         )
         return mtp.record(mtp.chain.bootstrap([first_token] + [MTP_BOOTSTRAP_DRAFT_TOKEN] * mtp.drafts))
 
@@ -1908,6 +2015,11 @@ class Qwen38TracedChain:
         if slab_rows is not None:
             slab_state = model.allocate_chunk_state(state, rows=slab_rows, base=chunk_state)
             model.reset_chunk_state_inplace(state, slab_state)
+        # The candidate-row extension before the MTP states: a sampled pass loop reads the R candidate rows the
+        # verify body lands, built with the extension's shard rebase constant.
+        sampling_extension = (
+            sampling_step.Qwen38SamplingChainExtension(lm_head, mesh, device_sampler=device_sampler) if sampling else None
+        )
         # The MTP states sit beside the generic and chunk states, before any capture: every trace bakes their
         # addresses in (the verify / draft states, the TAIL step inputs, the chunk extension).
         chain_mtp = None
@@ -1925,6 +2037,7 @@ class Qwen38TracedChain:
                     mtp_components=mtp_components,
                     gdn_step_anchor_layers=MTP_GDN_ANCHOR_LAYERS[mtp_gdn_anchor],
                     alignment_generic_state=shared_generic_state,
+                    sampling_constants=None if sampling_extension is None else sampling_extension.constants,
                 )
                 if shared_generic_state is None:
                     shared_generic_state = verify.alignment.generic_state
@@ -1987,11 +2100,7 @@ class Qwen38TracedChain:
             open_seconds=0.0,
             misses_forbidden=False,
             chunk_state=chunk_state,
-            sampling=(
-                sampling_step.Qwen38SamplingChainExtension(lm_head, mesh, device_sampler=device_sampler)
-                if sampling
-                else None
-            ),
+            sampling=sampling_extension,
             chunk_gdn_step_anchor=chunk_gdn_step_anchor,
             mtp=chain_mtp,
             snapshot=snapshot,
@@ -2113,6 +2222,13 @@ class Qwen38TracedChain:
                     synchronize()
                     # The pass row: the verify's accept row and the draft's token chain (checked to start at its t', d_1').
                     readback, _ = mtp_v2.read_pass_row(arm.verify, arm.draft)
+                    if arm.verify.sampling is not None:
+                        _check_verify_candidates(
+                            readback,
+                            mtp_v2.read_verify_candidates(arm.verify),
+                            mtp_v2.read_alignment_lanes(arm.verify),
+                            label=f"MTP warm round {residue} of k = {arm.drafts}",
+                        )
                     mtp_v2.commit_verify_host(arm.verify, readback.accepted)
                     output.release_tensors()
                     if state.position.read() != position + readback.accepted + 1:
@@ -2265,6 +2381,14 @@ class Qwen38TracedChain:
                     arm.draft.pass_row,
                 ):
                     ttnn.mark_corruptible(tensor)
+                if verify.sampling is not None:  # trace-written every pass, host-read on a sampled one
+                    for tensor in (
+                        verify.sampling.candidate_rows,
+                        verify.sampling.alignment_lanes,
+                        verify.sampling.residual_rows,
+                        verify.sampling.logits_rows,
+                    ):
+                        ttnn.mark_corruptible(tensor)
             for extension in chain_mtp.chunk_extensions():
                 extension.reset_chunk()
                 ttnn.mark_corruptible(extension.token_row)

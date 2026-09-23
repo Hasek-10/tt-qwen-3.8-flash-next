@@ -1122,3 +1122,342 @@ def test_a_host_drafted_chain_cuts_at_eos_without_proposing_and_validates_its_dr
     chain2.host_drafter = bad
     with pytest.raises(RuntimeError):  # allow-pytest.raises: k - 1 ids for a k-draft pass
         chain2.bootstrap([prompt[-1], *first_drafts])
+
+
+# --------------------------------------------------------------------------- the sampled pass form (a host sampler)
+
+
+def _peaked_logits(peaks: int = 12):
+    """A target distribution per context: ``peaks`` distinct peaked logits on small ids (shard 0), the rest far
+    below (no tie can reach the candidate guard's boundary), as bf16 rows the device epilogue would read."""
+
+    def logits(context) -> torch.Tensor:
+        head = (sum(context) * 7 + len(context) * 3) % VOCAB
+        row = torch.full((embedding_module.VOCAB_SIZE,), -100.0)
+        for i in range(peaks):
+            row[(head + i) % VOCAB] = 12.0 - i
+        return row.to(torch.bfloat16)
+
+    return logits
+
+
+def _flat_logits():
+    """One peak over a flat tail: every row ties at the candidate guard's boundary, so every row falls back to the
+    full-vocabulary sampler (the exact fallback path)."""
+
+    def logits(context) -> torch.Tensor:
+        row = torch.zeros((embedding_module.VOCAB_SIZE,))
+        row[(sum(context) * 7 + len(context) * 3) % VOCAB] = 4.0
+        return row.to(torch.bfloat16)
+
+    return logits
+
+
+def _sample_one(logits_row: torch.Tensor, parameters, *, history, prompt_tokens: int, generator):
+    from models.demos.blackhole.qwen38_flash_next.ttnn import sampling as sampling_module
+
+    row = sampling_module.Qwen38CandidateRow.emulate(logits_row)
+    try:
+        return sampling_module.sample_candidates(
+            row, parameters, token_history=history, prompt_tokens=prompt_tokens, generator=generator
+        )
+    except sampling_module.Qwen38CandidateFallback:
+        return sampling_module.sample_full_vocabulary(
+            logits_row.float(), parameters, token_history=history, prompt_tokens=prompt_tokens, generator=generator
+        )
+
+
+def _sampled_reference(logits, parameters, prompt: list[int], *, tokens: int) -> list[int]:
+    """The 1-row sampled loop's stream: one candidate row per position, one draw per token, the request's seed."""
+
+    generator = torch.Generator(device="cpu").manual_seed(parameters.seed)
+    stream, emitted = list(prompt), []
+    for _ in range(tokens):
+        sample = _sample_one(logits(stream), parameters, history=stream, prompt_tokens=len(prompt), generator=generator)
+        emitted.append(sample.token_id)
+        stream.append(sample.token_id)
+    return emitted
+
+
+def _clairvoyant_drafter(reference: list[int], prompt_length: int, pattern: tuple[int, ...]):
+    """A drafter that knows the sampled stream: on pass n it proposes the reference for the first ``pattern[n]``
+    draft slots and misses on the next, so pass n accepts exactly ``pattern[n]`` drafts (the pass index is the
+    committed count, as in :func:`_oracles`)."""
+
+    boundaries = list(itertools.accumulate(a + 1 for a in pattern))
+
+    def drafter(context):
+        position = len(context) - prompt_length  # the reference index this draft targets
+        committed = position - 1  # pass-emitted tokens plus the drafts so far (reference[0] is the bootstrap's t_P)
+        pass_index = next((n for n, b in enumerate(boundaries) if committed < b), len(pattern))
+        drafts_so_far = committed - (boundaries[pass_index - 1] if pass_index else 0)
+        wanted = pattern[pass_index] if pass_index < len(pattern) else 0
+        value = reference[position] if position < len(reference) else 0
+        return value if drafts_so_far < wanted else (value + 1) % VOCAB
+
+    return drafter
+
+
+class _FakeSampledDevice:
+    """The traces over a target the host samples: the verify trace lands the R candidate rows (the target's logits
+    per row through the epilogue's per-shard top-k), the alignment lanes, the logit rows for the fallback and its
+    own argmax accept (which the host overrules); the draft trace reads the host-corrected readback row.  The
+    device's stream advances by the host's accept when the draft or the next verify reads it, as the real device's
+    caches do through the accept scalar and the readback row."""
+
+    def __init__(self, verify, draft, output, state, logits, drafter, prompt: list[int]) -> None:
+        self.verify, self.draft, self.output, self.state = verify, draft, output, state
+        self.logits, self.drafter = logits, drafter
+        self.stream = list(prompt)
+        self.replays: list[str] = []
+        self.pending = None  # (tokens, alignment lanes) of the pass whose accept the stream has not applied
+        self.full: dict[int, torch.Tensor] = {}
+        self.reselects: list[int] = []
+        self.traces = {1: self._verify, 2: self._draft, 3: self._commit}
+
+    def replay(self, trace_id: int) -> None:
+        self.traces[trace_id]()
+
+    def enqueue(self, trace_id: int) -> None:
+        self.traces[trace_id]()
+        self.replays[-1] += "-enqueued"
+
+    def _apply_pending(self) -> None:
+        if self.pending is None:
+            return
+        tokens, alignment = self.pending
+        row = self.output.readback.torch_shards()[0].reshape(-1)
+        accepted, next_token, first_draft = int(row[0]), int(row[1]), int(row[2])
+        assert int(self.verify.accepted.torch_shards()[0].reshape(-1)[0]) == accepted, "the accept scalar"
+        assert first_draft == alignment[accepted], "the first draft is the alignment lane of the accepted row"
+        self.stream.extend([*tokens[1 : 1 + accepted], next_token])
+        self.pending = None
+
+    def _verify(self) -> None:
+        self.replays.append("verify")
+        self._apply_pending()
+        k = self.verify.drafts
+        tokens = self.verify.token_row.torch_shards()[0].reshape(-1)[: k + 1].long().tolist()
+        drafts = self.verify.draft_lanes.torch_shards()[0].reshape(-1)[:k].long().tolist()
+        assert tokens[0] == self.stream[-1] and tokens[1:] == drafts
+        from models.demos.blackhole.qwen38_flash_next.ttnn.sampling import Qwen38CandidateRow
+
+        rows, argmaxes, alignment = [], [], []
+        self.full = {}
+        for j in range(k + 1):
+            context = self.stream + drafts[:j]
+            logits = self.logits(context)
+            self.full[j] = logits.float()
+            rows.append(Qwen38CandidateRow.emulate(logits).to_host_row().reshape(-1))
+            argmax = int(torch.argmax(logits.float()))
+            argmaxes.append(argmax)
+            alignment.append(self.drafter(context + [argmax]))
+        accepted = 0
+        while accepted < k and drafts[accepted] == argmaxes[accepted]:
+            accepted += 1
+        lanes = [float(accepted), float(argmaxes[accepted]), float(alignment[accepted])] + [float(t) for t in argmaxes]
+        lanes += [-1.0] * (mtp_v2.READBACK_WIDTH - len(lanes))
+        for local in self.output.readback.locals:
+            local.copy_(torch.tensor(lanes).reshape(1, 1, 1, -1))
+        for local in self.verify.accepted.locals:
+            local.fill_(float(accepted))
+        for local in self.verify.sampling.candidate_rows.locals:
+            local.copy_(torch.stack(rows).reshape(1, 1, k + 1, -1))
+        alignment_lanes = torch.full((1, 1, 1, 32), -1.0)
+        alignment_lanes[..., : k + 1] = torch.tensor([float(t) for t in alignment])
+        for local in self.verify.sampling.alignment_lanes.locals:
+            local.copy_(alignment_lanes)
+        self.state.position.value += accepted + 1  # the body's P <- P + a + 1, the device's own count
+        self.pending = (tokens, alignment)
+
+    def _draft(self) -> None:
+        self.replays.append("draft")
+        self._apply_pending()
+        k = self.verify.drafts
+        row = self.output.readback.torch_shards()[0].reshape(-1)
+        next_token, drafts = int(row[1]), [int(row[2])]
+        assert next_token == self.stream[-1]
+        for _ in range(k - 1):
+            drafts.append(self.drafter(self.stream + drafts))
+        token_row = embedding_module.Qwen38TTNNTokenEmbedding.host_verify_token_rows([next_token, *drafts])
+        draft_lanes = torch.full((1, 1, 1, 32), -1.0)
+        draft_lanes[..., :k] = torch.tensor(drafts, dtype=torch.float32)
+        for local in self.verify.token_row.locals:
+            local.copy_(token_row)
+        for local in self.draft.pass_row.locals:
+            local.copy_(torch.cat([row.reshape(1, 1, 1, -1), token_row], dim=3))
+        for local in self.verify.draft_lanes.locals:
+            local.copy_(draft_lanes)
+
+    def _commit(self) -> None:
+        self.replays.append("commit")
+
+
+def _sampled_chain(fake, monkeypatch, *, k: int, logits, drafter, prompt: list[int], sampler, enqueue=False, eos=()):
+    chain, device, ple = _chain(
+        fake, monkeypatch, k=k, target=lambda context: 0, drafter=drafter, prompt=prompt, split=True, eos=eos, enqueue=enqueue
+    )
+    verify, draft, output = chain.verify, chain.draft, chain.verify_output
+    verify.sampling = SimpleNamespace(
+        rows=k + 1,
+        candidate_rows=_replicated(torch.zeros(1, 1, k + 1, embedding_module.SAMPLING_CANDIDATE_ROW_SHAPE[3]), FP32, ROW_MAJOR),
+        alignment_lanes=_lanes([]),
+        residual_rows=object(),
+        logits_rows=object(),
+    )
+    verify.alignment = SimpleNamespace(residual=object())
+    verify.accept_constants = object()
+    state = SimpleNamespace(position=SimpleNamespace(value=len(prompt) - 1))
+    state.position.reset = lambda position: setattr(state.position, "value", position)
+    sampled_device = _FakeSampledDevice(verify, draft, output, state, logits, drafter, prompt)
+
+    def reselect(residual_rows, accepted_tile, constants, *, output):
+        assert residual_rows is verify.sampling.residual_rows and constants is verify.accept_constants
+        assert output is verify.alignment.residual
+        sampled_device.reselects.append(int(accepted_tile.torch_shards()[0].reshape(-1)[0]))
+
+    monkeypatch.setattr(mtp_v2, "select_residual_row", reselect)
+    monkeypatch.setattr(mtp_v2, "read_verify_logits_row", lambda model, verify_, index: sampled_device.full[index])
+    chain.replay = sampled_device.replay
+    chain.enqueue = sampled_device.enqueue if enqueue else None
+    chain.state, chain.sampler = state, sampler
+    return chain, sampled_device, ple
+
+
+def _request(seed: int, **fields):
+    from models.demos.blackhole.qwen38_flash_next.tools import qwen38_sampling_step as sampling_step
+
+    parameters = sampling_step.parameters_from_request(
+        {"temperature": 0.8, "top_k": 8, "top_p": 0.9, "seed": seed, **fields}, enable_thinking=False, seed=seed
+    )
+    return sampling_step.Qwen38SamplingRequest(parameters)
+
+
+@pytest.mark.parametrize("enqueue", (False, True))
+@pytest.mark.parametrize("k", (3, 4, 7))
+def test_sampled_pass_loop_reproduces_the_sequential_sampled_stream_for_every_acceptance_pattern(
+    fake, monkeypatch, k, enqueue
+) -> None:
+    """The exact rule: the target is sampled row by row from the pass's candidate rows and a draft is accepted only
+    where it equals the sample.  With the request's generator drawn once per committed token in row order, the
+    committed stream is the 1-row sampled loop's stream token for token, for every acceptance pattern, and the
+    generator ends in the same state (rows past the first mismatch are never drawn for)."""
+
+    from models.demos.blackhole.qwen38_flash_next.tools import qwen38_sampling_step as sampling_step
+
+    prompt = [5, 9, 2]
+    logits = _peaked_logits()
+    patterns = list(itertools.product(range(k + 1), repeat=2)) + [(a,) * 3 for a in range(k + 1)]
+    for seed, pattern in enumerate(patterns, start=11):
+        request = _request(seed)
+        reference = _sampled_reference(logits, request.parameters, prompt, tokens=sum(pattern) + len(pattern) + 2 * k)
+        drafter = _clairvoyant_drafter(reference, len(prompt), pattern)
+        session = SimpleNamespace(committed=list(prompt))
+        sampler = sampling_step.Qwen38MTPSampler(session, request, prompt_tokens=len(prompt))
+        # The bootstrap's t_P is the reference's first token (the session draws it from the last TAIL's row); the
+        # device holds it as its last input, as the greedy fake holds the prompt's last token.
+        first = _sample_one(
+            logits(prompt), request.parameters, history=prompt, prompt_tokens=len(prompt), generator=request.generator
+        ).token_id
+        assert first == reference[0]
+        session.committed.append(first)
+        chain, device, ple = _sampled_chain(
+            fake, monkeypatch, k=k, logits=logits, drafter=drafter, prompt=prompt + [first], sampler=sampler, enqueue=enqueue
+        )
+        first_drafts = [drafter(prompt + [first] + reference[1 : 1 + i]) for i in range(k)]
+        emitted = [first]
+        record = chain.bootstrap([first, *first_drafts])
+        emitted.extend(record.committed)
+        session.committed.extend(record.tokens[: record.accepted + 1])
+        for _ in range(len(pattern) - 1):
+            record = chain.step()
+            emitted.extend(record.committed)
+            session.committed.extend(record.tokens[: record.accepted + 1])
+        assert emitted == reference[: len(emitted)], (k, pattern, enqueue)
+        assert [record.accepted for record in chain.records] == list(pattern), (k, pattern)
+        assert all(record.sampled and record.chosen == record.committed for record in chain.records)
+        assert all(record.source == "device" for record in chain.records)
+        # One draw per committed token: the request's generator is where the sequential loop's would be.
+        sequential = torch.Generator(device="cpu").manual_seed(request.parameters.seed)
+        for _ in range(len(emitted)):
+            torch.rand((), generator=sequential, dtype=torch.float32)
+        assert torch.equal(request.generator.get_state(), sequential.get_state()), (k, pattern)
+        assert sampler.rows_sampled == len(emitted) - 1 and request.clocks.fallbacks == 0
+        # The host's accept landed: the accept scalar and the position the next verify reads, the residual re-select
+        # per pass at the host's count, and the device's stream (advanced through the corrected row) is the host's.
+        assert device.reselects == list(pattern)
+        assert device.state.position.value == chain.position == len(prompt) - 1 + len(emitted)
+        assert device.stream == prompt + emitted  # the last draft applied the last pass's accept
+        assert all(row.sampled for row in chain.records) and chain.next_tokens[0] == chain.records[-1].next_token
+        suffix = "-enqueued" if enqueue else ""
+        expected_replays = []
+        for index in range(len(pattern)):
+            expected_replays += (["commit" + suffix] if index else []) + ["verify" + suffix, "draft" + suffix]
+        assert device.replays == expected_replays
+        for index, record in enumerate(chain.records):
+            steady = {"ple_rows", "commit_replay" if not enqueue else "commit_enqueue"} if index else {"host_inputs"}
+            launch = "enqueue" if enqueue else "replay"
+            assert set(record.segments_ns) == steady | {f"verify_{launch}", "verify_readback", "host_sample", f"draft_{launch}", "readback"}
+
+
+def test_sampled_pass_loop_takes_the_exact_fallback_and_composes_with_a_host_drafter(fake, monkeypatch) -> None:
+    """Every row of a flat target ties at the candidate guard's boundary: the sampler falls back to the row's full
+    logits (the landed logit rows) and the stream is still the sequential one.  A host drafter on top proposes
+    the next pass's drafts on the passes it takes; the sampled accept is the same."""
+
+    from models.demos.blackhole.qwen38_flash_next.tools import qwen38_sampling_step as sampling_step
+
+    k, prompt = 4, [5, 9, 2]
+    logits = _flat_logits()
+    for mode in ("device", "hybrid"):
+        pattern = (2, 4, 0, 3, 1)
+        request = _request(23)
+        reference = _sampled_reference(logits, request.parameters, prompt, tokens=sum(pattern) + len(pattern) + 2 * k)
+        drafter = _clairvoyant_drafter(reference, len(prompt), pattern)
+        session = SimpleNamespace(committed=list(prompt))
+        sampler = sampling_step.Qwen38MTPSampler(session, request, prompt_tokens=len(prompt))
+        first = _sample_one(
+            logits(prompt), request.parameters, history=prompt, prompt_tokens=len(prompt), generator=request.generator
+        ).token_id
+        session.committed.append(first)
+        chain, device, _ = _sampled_chain(
+            fake, monkeypatch, k=k, logits=logits, drafter=drafter, prompt=prompt + [first], sampler=sampler
+        )
+        host = None
+        if mode == "hybrid":
+            host = _OracleHostDrafter(drafter, prompt + [first], k=k, propose_on=lambda index: index % 2 == 0)
+            chain.host_drafter = host
+        first_drafts = [drafter(prompt + [first] + reference[1 : 1 + i]) for i in range(k)]
+        emitted = [first, *chain.bootstrap([first, *first_drafts]).committed]
+        session.committed.extend(chain.records[-1].tokens[: chain.records[-1].accepted + 1])
+        while len(chain.records) < len(pattern):
+            record = chain.step()
+            emitted.extend(record.committed)
+            session.committed.extend(record.tokens[: record.accepted + 1])
+        assert emitted == reference[: len(emitted)], mode
+        assert [record.accepted for record in chain.records] == list(pattern), mode
+        assert request.clocks.fallbacks == len(emitted) - 1 and sampler.rows_sampled == len(emitted) - 1
+        sources = ["host" if mode == "hybrid" and index % 2 == 0 else "device" for index in range(len(pattern))]
+        assert [record.source for record in chain.records] == sources
+        assert device.replays.count("draft") == sources.count("device")
+        if host is not None:
+            assert host.history == prompt + [token for record in chain.records for token in record.tokens[: record.accepted + 1]]
+    # The chain refuses a sampler without the verify's sampling buffers or the state, and a commit queue beside one.
+    chain, device, _ = _sampled_chain(fake, monkeypatch, k=k, logits=logits, drafter=drafter, prompt=prompt, sampler=None)
+    with pytest.raises(TypeError):  # allow-pytest.raises: the sampler protocol
+        mtp_v2.Qwen38TTNNMTPChain(
+            chain.model, chain.verify, chain.draft, chain.traces, chain.verify_output, replay=chain.replay, position=0,
+            state=chain.state, sampler=object(),
+        )
+    with pytest.raises(ValueError):  # allow-pytest.raises: the sampler needs the state
+        mtp_v2.Qwen38TTNNMTPChain(
+            chain.model, chain.verify, chain.draft, chain.traces, chain.verify_output, replay=chain.replay, position=0,
+            sampler=sampler,
+        )
+    bare = SimpleNamespace(**vars(chain.verify))
+    bare.sampling = None
+    with pytest.raises(ValueError):  # allow-pytest.raises: the sampler needs the sampling buffers
+        mtp_v2.Qwen38TTNNMTPChain(
+            chain.model, bare, chain.draft, chain.traces, chain.verify_output, replay=chain.replay, position=0,
+            state=chain.state, sampler=sampler,
+        )

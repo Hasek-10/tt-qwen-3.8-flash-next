@@ -143,7 +143,7 @@ The run directory (`<cache-root>/runs/<stamp>/`) holds `READY`, `phase-markers.j
 | `--prepare-only --bf4-stage-limit N` | convert at most N missing expert layers into the BF4 cache and stop |
 | `--long-chunks` | 128-row prefill chunks where the prompt allows (section 6); off by default; combines with `--mtp` (one MTP chunk extension per chunk kind) |
 | `--prefill-slab 2048` | prefill slabs of 2048 rows ahead of the 128-row chunks: one matmul per dense linear, tolerance-class against the chunk bodies (`docs/PREFILL.md`); off by default; combines with `--mtp` (one MTP chunk extension per chunk kind) |
-| `--mtp K[,K...]` (K in 3..7) | speculative drafting on greedy requests (section 6); off by default; a comma list opens one arm per K, the first the default: a request's `speculative_drafts` picks an arm, a request with tools takes the largest; 3 and 4 measured, 5..7 admitted for the QuietBox 2 sweep |
+| `--mtp K[,K...]` (K in 3..7) | speculative drafting on greedy requests and, with `--sampling`, on sampled ones (section 6); off by default; a comma list opens one arm per K, the first the default: a request's `speculative_drafts` picks an arm, a request with tools takes the largest; 3 and 4 measured, 5..7 admitted for the QuietBox 2 sweep |
 | `--draft-source mtp\|hybrid\|ngram` | who drafts a pass (needs `--mtp`): the MTP head (default); the host's prompt-lookup drafter when the last n tokens recur in the request's text and the MTP head otherwise (`hybrid`); the host alone (`ngram`, the A/B arm). A host-drafted pass skips the k - 1 device draft rows; acceptance decides what commits either way |
 | `--port`, `--host` | the listening port; `--host` default `0.0.0.0`: the QuietBox and p150-line profiles serve the LAN |
 | `--serve-seconds N` | stop after N seconds (a drain: the request in flight gets its reply) |
@@ -215,6 +215,18 @@ contract (hang-ups, stalled readers, deadlines, the stall watchdog, `/health` fi
   the device's k - 1 draft rows (about 4 ms each); otherwise the MTP head drafts as usual.  Acceptance decides what
   commits either way, so the committed stream is unchanged; `qwen38.mtp.host_drafted_passes` counts the host passes.
   `ngram` is the host-alone arm for measuring the drafter by itself.  Unrun on silicon.
+- Sampled requests through the pass loop: on a `--sampling` server with `--mtp`, a request with `temperature > 0`
+  whose policy the pass loop admits (`top_k` 1..32 and no penalty that raises logits; the others keep the 1-row
+  sampled loop) drafts too.  Every verify pass lands its R candidate rows (the TAIL epilogue's row, one per verify
+  row) and the host samples the target row by row under the request's policy, accepting a draft only where it
+  equals the sample, so every committed token is a draw from the target's conditional given its committed prefix:
+  the stream is a sample of the target, whatever the drafts, and rows past the first mismatch are never drawn for
+  (one draw per committed token, in order, so a `seed` reproduces the 1-row sampled loop's draws up to the verify
+  pass's rounding).  The host's accept is written where the device wrote its own (the accept scalar, the position,
+  the readback row, the alignment residual row) before the draft trace replays; the MTP layer's alignment ran on
+  the argmaxes, so a sampled pass's drafts assume the argmax at the accepted row (draft quality, never the
+  stream).  `logprobs` come from the candidate rows as on the 1-row loop; `qwen38.mtp.sampled_passes` counts the
+  passes.  Unrun on silicon.
 
 ## 7. QuietBox 2
 

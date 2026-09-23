@@ -2076,6 +2076,50 @@ class Qwen38TTNNLMHead:
         ttnn.copy(row, constants.readback_row)
         return row
 
+    def sampling_candidate_rows(
+        self, logits: Qwen38ShardedLogits, constants: Qwen38TTNNSamplingCandidateConstants, *, into
+    ) -> None:
+        """:meth:`sampling_candidates` for ``rows`` logit rows (1 .. 32): the MTP v2 sampled verify's candidate rows,
+        landed in ``into`` (replicated FP32 ROW_MAJOR ``[1,1,rows,2 * TP_SIZE * k]``; row j is the candidate row of
+        verify row j in the single-row layout).  The same ops with a row axis: the per-shard ``ttnn.topk`` over the
+        rows, the SFPU widenings, the rebase, the pack, one all-gather and one landing copy; no id enters an FPU or
+        reduce stage.  The greedy resolve of the same logits is untouched.
+        """
+
+        rows = self._validate_logits(logits)
+        if self.collective_topology != ttnn.Topology.Linear:
+            raise RuntimeError("sampling candidate rows require Linear topology")
+        constants.validate(self.mesh_contract)
+        k = SAMPLING_CANDIDATES_PER_DEVICE
+        landing_shape = (1, 1, rows, 2 * TP_SIZE * k)
+
+        def require(tensor, shape, dtype, layout, label) -> None:
+            if _shape(tensor) != shape or tensor.dtype != dtype or tensor.layout != layout:
+                raise RuntimeError(f"{label} must be {dtype} {layout} {shape}, got {_metadata(tensor)}")
+
+        require(into, landing_shape, ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, "sampling candidate rows landing")
+        local_values, local_ids = ttnn.topk(logits.tensor, k, dim=-1, largest=True, sorted=True)
+        require(local_values, (1, 1, rows, k), ttnn.bfloat16, ttnn.TILE_LAYOUT, "sampling top-k values")
+        require(local_ids, (1, 1, rows, k), ttnn.uint16, ttnn.TILE_LAYOUT, "sampling top-k ids")
+        values = ttnn.typecast(local_values, ttnn.float32, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(local_values)
+        ids_fp32 = ttnn.typecast(local_ids, ttnn.float32, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(local_ids)
+        global_ids = ttnn.add(ids_fp32, constants.shard_vocab_start, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(ids_fp32)
+        require(global_ids, (1, 1, rows, k), ttnn.float32, ttnn.TILE_LAYOUT, "sampling global ids")
+        packed = ttnn.concat([values, global_ids], dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(values, global_ids)
+        pack = ttnn.to_layout(packed, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(packed)
+        require(pack, (1, 1, rows, 2 * k), ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, "sampling shard pack")
+        row = ttnn.all_gather(pack, dim=3, cluster_axis=TP_AXIS, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(pack)
+        require(row, landing_shape, ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, "sampling candidate rows")
+        self.mesh_contract.validate_tensor(row, placement=TensorPlacement.REPLICATED)
+        ttnn.copy(row, into)
+        _deallocate(row)
+
     def resolve_greedy_rows_on_device(self, candidates: Qwen38GreedyCandidates):
         """:meth:`resolve_greedy_on_device` for ``rows`` candidate rows (1 .. 32): one FP32 ROW_MAJOR ``[1,1,1,rows]``
         row whose lane j is the global greedy id of row j (the MTP v2 verify pass's per-row argmaxes).

@@ -508,6 +508,81 @@ def choose_token(
     return sample
 
 
+def mtp_pass_loop_admits(request: Qwen38SamplingRequest) -> bool:
+    """Whether a sampled request may generate through the MTP pass loop (``tools/qwen38_chat_session.py``): its
+    policy must sample the candidate rows without a fallback on every row (``top_k`` 0 and a penalty that raises
+    logits fall back before any draw; those requests keep the 1-row loop, whose fallback gathers TAIL's own
+    logits)."""
+
+    if not isinstance(request, Qwen38SamplingRequest):
+        raise TypeError("mtp_pass_loop_admits needs a Qwen38SamplingRequest")
+    return request.parameters.top_k != 0 and not request.parameters.raises_logits
+
+
+class Qwen38MTPSampler:
+    """The pass loop's host sampler (``mtp_v2.Qwen38TTNNMTPChain(sampler=...)``): one request's policy applied row
+    by row to a pass's candidate rows, exactly as :func:`choose_token` applies it to TAIL's row.
+
+    ``choose(index, row, pass_tokens, chosen, *, full_logits)`` samples verify row ``index`` of the pass whose R
+    tokens are ``pass_tokens`` (``[t_P, d_1 .. d_k]``) after the rows ``chosen`` so far: the penalties' history is
+    the session's committed tokens, then ``t_P`` (the pass's row 0, committed by this pass), then the choices (the
+    accepted drafts).  The generator is the request's, drawn once per chosen token in row order, so a seed
+    reproduces the 1-row sampled loop's draws (the same policy over the same rows, one draw per committed
+    token).  A candidate fallback samples the row's full-vocabulary logits (``full_logits()``), continuing the
+    same stream.  ``samples`` holds the current pass's samples, row 0 first (index-aligned with the chain's
+    ``chosen``); the session appends each to the request as it yields the token.
+    """
+
+    def __init__(self, session: Any, request: Qwen38SamplingRequest, *, prompt_tokens: int) -> None:
+        if not isinstance(request, Qwen38SamplingRequest):
+            raise TypeError("Qwen38MTPSampler needs a Qwen38SamplingRequest")
+        if isinstance(prompt_tokens, bool) or type(prompt_tokens) is not int or prompt_tokens < 0:
+            raise ValueError(f"prompt_tokens must be a non-negative int, got {prompt_tokens!r}")
+        self.session, self.request, self.prompt_tokens = session, request, prompt_tokens
+        self.samples: list[Qwen38CandidateSample] = []
+        self.rows_sampled = 0
+
+    def choose(
+        self,
+        index: int,
+        row: Qwen38CandidateRow,
+        pass_tokens: Sequence[int],
+        chosen: Sequence[int],
+        *,
+        full_logits: Callable[[], torch.Tensor],
+    ) -> int:
+        if index == 0:
+            self.samples = []
+        if index != len(chosen) or index != len(self.samples):
+            raise RuntimeError(f"row {index} sampled out of order ({len(chosen)} chosen, {len(self.samples)} samples)")
+        request = self.request
+        history = [*self.session.committed, int(pass_tokens[0]), *(int(token) for token in chosen)]
+        try:
+            sample = sample_candidates(
+                row,
+                request.parameters,
+                token_history=history,
+                prompt_tokens=self.prompt_tokens,
+                generator=request.generator,
+                top_logprobs=request.top_logprobs,
+            )
+        except Qwen38CandidateFallback:
+            request.clocks.fallbacks += 1
+            sample = sample_full_vocabulary(
+                full_logits(),
+                request.parameters,
+                token_history=history,
+                prompt_tokens=self.prompt_tokens,
+                generator=request.generator,
+                top_logprobs=request.top_logprobs,
+            )
+        if sample.token_id not in row.ids.reshape(-1).tolist():
+            request.clocks.candidate_misses += 1
+        self.samples.append(sample)
+        self.rows_sampled += 1
+        return sample.token_id
+
+
 def generate_sampled(
     session: Any,
     request: Qwen38SamplingRequest,
