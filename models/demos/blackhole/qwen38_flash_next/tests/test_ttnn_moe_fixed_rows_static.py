@@ -123,7 +123,7 @@ def test_builder_owns_one_lazy_ccl_manager(monkeypatch) -> None:
 
 
 def test_fixed_row_contract_is_exact_and_fail_closed() -> None:
-    assert SUPPORTED_ROWS == (1, 5, 6, 7, 8, 32, 128) and PREFILL_CHUNK_ROWS == 32 and moe_module.LONG_PREFILL_CHUNK_ROWS == 128
+    assert SUPPORTED_ROWS == (1, *range(5, 17), 32, 128) and PREFILL_CHUNK_ROWS == 32 and moe_module.LONG_PREFILL_CHUNK_ROWS == 128
     ordinary = Qwen38TTNNMoERowContract(1)
     assert ordinary.hidden_sharded == (1, 1, 1, 640)
     assert ordinary.full_hidden == (1, 1, 1, HIDDEN_SIZE)
@@ -160,7 +160,7 @@ def test_fixed_row_contract_is_exact_and_fail_closed() -> None:
     assert chunk.fast_reduce_scores == (32, 1, 1, TOP_K)
     assert chunk.output_sharded == (1, 1, 32, 640)
 
-    for rows in (False, True, 0, 2, 4, 9, 31, 33, 64, 1.0, "5", "32"):  # 6..8 are the k = 5..7 verifiers now
+    for rows in (False, True, 0, 2, 4, 17, 31, 33, 64, 1.0, "5", "32"):  # 6..16 are the k = 5..15 verifiers now
         with pytest.raises(ValueError, match="rows must be exactly"):  # allow-pytest.raises: pure contract test
             Qwen38TTNNMoERowContract(rows)
 
@@ -173,9 +173,9 @@ def test_row_contract_admits_an_explicit_override_for_one_instance_only() -> Non
     assert six.rows == 6 and six.hidden_sharded == (1, 1, 6, 640) and six.moe_sparse_input == (1, 6, HIDDEN_SIZE)
     assert six.moe_routing == (1, 6, TOP_K) and six.fast_reduce_scores == (6, 1, 1, TOP_K)
     assert Qwen38TTNNMoERowContract(5, (5, 6)).rows == 5
-    assert Qwen38TTNNMoERowContract(1).admitted_rows == SUPPORTED_ROWS == (1, 5, 6, 7, 8, 32, 128)
-    # 9 is the first row count past the admitted verifiers (k = 8 would need a third completed QSA block).
-    for rows, admitted in ((9, SUPPORTED_ROWS), (7, (6,)), (0, (0,)), (129, (129,)), (6, (True, 6)), (6, [6])):
+    assert Qwen38TTNNMoERowContract(1).admitted_rows == SUPPORTED_ROWS == (1, *range(5, 17), 32, 128)
+    # 17 is the first row count past the admitted verifiers (the QSA verify path admits 16 rows).
+    for rows, admitted in ((17, SUPPORTED_ROWS), (7, (6,)), (0, (0,)), (129, (129,)), (6, (True, 6)), (6, [6])):
         with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
             Qwen38TTNNMoERowContract(rows, admitted)
     with pytest.raises(ValueError):  # allow-pytest.raises: an empty admission admits nothing
@@ -183,7 +183,7 @@ def test_row_contract_admits_an_explicit_override_for_one_instance_only() -> Non
     parameter = inspect.signature(Qwen38TTNNMoE.__init__).parameters["admitted_rows"]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY and parameter.default == SUPPORTED_ROWS
     assert moe_module.ROWS5_HARDWARE_PROVEN is True and moe_module.ROWS32_HARDWARE_PROVEN is True
-    assert moe_module.ROWS6TO8_HARDWARE_PROVEN is False  # the rows-5 path at 6..8 rows, unrun on silicon
+    assert moe_module.ROWS6TO16_HARDWARE_PROVEN is False  # the rows-5 path at 6..16 rows, unrun on silicon
 
 
 def test_default_constructor_contract_preserves_the_one_row_api() -> None:
@@ -370,7 +370,7 @@ def test_routed_weights_reject_expert_replication() -> None:
         module._routed_partial(full_hidden, routing, replicated_w0_w1, sharded_w2)
 
 
-@pytest.mark.parametrize("rows", [1, TARGET_VERIFIER_ROWS, 8, PREFILL_CHUNK_ROWS])
+@pytest.mark.parametrize("rows", [1, TARGET_VERIFIER_ROWS, 8, 16, PREFILL_CHUNK_ROWS])
 def test_routed_partial_uses_the_exact_row_shapes_and_weight_ownership(rows: int) -> None:
     module = _bare_moe(rows)
     contract = module.row_contract

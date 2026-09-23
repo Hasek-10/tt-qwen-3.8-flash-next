@@ -294,16 +294,17 @@ def _qsa_constants(rows: int):
     return position_constants, chunk_constants, verify_constants
 
 
-@pytest.mark.parametrize("rows", (4, 5, 6, 7, 8))
+@pytest.mark.parametrize("rows", (4, 5, 6, 7, 8, 12, 16))
 @pytest.mark.parametrize("position", POSITIONS)
 def test_verify_inputs_match_the_torch_reference_at_every_position(fake, position: int, rows: int) -> None:
     position_constants, _, verify_constants = _qsa_constants(rows)
     derived = qsa_module.derive_qsa_verify_inputs(_u32_scalar(position), position_constants, verify_constants)
     expected = qsa_module.emulate_qsa_verify_inputs(position, rows=rows, allocated_compressed_blocks=BLOCKS)
-    # The layer's own validation admits the derived inputs (the two completed block indices of a verify pass).
+    # The layer's own validation admits the derived inputs (the block indices the row count can complete).
     _qsa_module(fake)._validate_verify_inputs(derived)
     chunk = derived.chunk
-    assert len(chunk.block_index_i32) == qsa_module.VERIFY_COMPLETED_BLOCKS == 2
+    blocks = qsa_module.verify_completed_blocks(rows)
+    assert len(chunk.block_index_i32) == derived.completed_blocks == blocks == max(2, (rows + 3) // 4)
     assert torch.equal(chunk.kv_block_start.torch_shards()[0], expected["chunk"]["kv_block_start"])
     assert [int(t.torch_shards()[0].reshape(-1)[0]) for t in chunk.block_index_i32] == [
         int(t.reshape(-1)[0]) for t in expected["chunk"]["block_index_i32"]
@@ -338,10 +339,11 @@ def test_verify_inputs_match_the_torch_reference_at_every_position(fake, positio
     assert derived.stage_keep.torch_shards()[0].reshape(-1).float().tolist() == [
         float(i < position % 32) for i in range(32)
     ]
-    # The pool select reads the four positions of block P // 4 (row 0) and P // 4 + 1 (row 1) out of the window.
+    # The pool select reads the four positions of block P // 4 + b (row b) out of the window, for every block the
+    # row count writes; the rows past them are zero.
     pool = derived.pool_select.torch_shards()[0][0, 0].float()
-    assert torch.count_nonzero(pool[2:]) == 0 and set(pool.unique().tolist()) <= {0.0, 0.25}
-    for block_row, block in ((0, position // 4), (1, position // 4 + 1)):
+    assert torch.count_nonzero(pool[blocks:]) == 0 and set(pool.unique().tolist()) <= {0.0, 0.25}
+    for block_row, block in ((b, position // 4 + b) for b in range(blocks)):
         columns = pool[block_row].nonzero().reshape(-1).tolist()
         positions = [position - 3 + w if w < 32 else position + w - 32 for w in columns]
         wanted = [p for p in range(4 * block, 4 * block + 4) if p < position + rows]
@@ -367,13 +369,27 @@ def test_verify_constants_are_exact_zero_one_selects() -> None:
     with pytest.raises(ValueError):  # allow-pytest.raises: the row bound is a contract
         qsa_module.qsa_verify_constant_rows(qsa_module.VERIFY_MAX_ROWS + 1, BLOCKS)
     assert (
-        qsa_module.VERIFY_MAX_ROWS == 8 and qsa_module.VERIFY_COMPLETED_BLOCKS == 2 and qsa_module.RAW_HISTORY_ROWS == 3
+        qsa_module.VERIFY_MAX_ROWS == 16
+        and qsa_module.VERIFY_MIN_COMPLETED_BLOCKS == 2
+        and qsa_module.VERIFY_MAX_COMPLETED_BLOCKS == 4
+        and qsa_module.RAW_HISTORY_ROWS == 3
     )
-    # R rows at P % 4 = r complete (r + R) // 4 blocks: at most 2 for every admitted R, 3 from R = 9.
-    assert (
-        max((r + qsa_module.VERIFY_MAX_ROWS) // 4 for r in range(4)) == 2
-        and max((r + qsa_module.VERIFY_MAX_ROWS + 1) // 4 for r in range(4)) == 3
-    )
+    # R rows at P % 4 = r complete (r + R) // 4 blocks, at most (R + 3) // 4: the pass writes that many, never
+    # fewer than the two every pass up to 8 rows wrote (their traces stand).
+    for rows in range(1, qsa_module.VERIFY_MAX_ROWS + 1):
+        most = max((r + rows) // 4 for r in range(4))
+        assert qsa_module.verify_completed_blocks(rows) == max(2, most) == max(2, (rows + 3) // 4), rows
+    assert [qsa_module.verify_completed_blocks(rows) for rows in (1, 4, 5, 8, 9, 12, 13, 16)] == [2, 2, 2, 2, 3, 3, 4, 4]
+    with pytest.raises(ValueError):  # allow-pytest.raises: the row bound is a contract
+        qsa_module.verify_completed_blocks(qsa_module.VERIFY_MAX_ROWS + 1)
+    # A row past the last block a row count writes: never pooled (the stack's later rows are zero for it).
+    for rows in (8, 12, 16):
+        stack = qsa_module.qsa_verify_constant_rows(rows, BLOCKS)["pool_select_stack"][0, 0]
+        blocks = qsa_module.verify_completed_blocks(rows)
+        for remainder in range(4):
+            select = stack[remainder].reshape(32, 64)
+            assert torch.count_nonzero(select[blocks:]) == 0, (rows, remainder)
+            assert set(select[:blocks].sum(dim=1).tolist()) <= {0.0, 0.25, 0.5, 0.75, 1.0}
 
 
 # --------------------------------------------------------------------------- the state rule after a partial accept
@@ -484,7 +500,7 @@ def _run_pass(
     verify.deallocate()
 
 
-@pytest.mark.parametrize("rows", (4, 5, 6, 7, 8))
+@pytest.mark.parametrize("rows", (4, 5, 6, 7, 8, 12, 16))
 @pytest.mark.parametrize("position", (5, 29, 30, 31, 32, 60, 63, 100))
 def test_kv_and_compressed_writes_commit_the_accepted_prefix_for_every_accept(fake, position: int, rows: int) -> None:
     """Pass N at P writes rows P .. P + R - 1; the host accepts a drafts; pass N + 1 at P' = P + a + 1 writes its own
@@ -644,7 +660,7 @@ def _pattern_rows(pattern: tuple[int, ...], ids: tuple[int, ...]):
     return targets, drafts, alignment
 
 
-@pytest.mark.parametrize("drafts", (3, 4, 5, 6, 7))
+@pytest.mark.parametrize("drafts", (3, 4, 5, 6, 7, 8, 12))
 def test_accept_rows_is_exact_for_every_pattern_and_large_ids(fake, drafts: int) -> None:
     constants = mtp_v2.Qwen38TTNNAcceptConstants.build("mesh", FakeContract(), drafts=drafts)
     assert constants.sentinel_tail.shape == (1, 1, 1, 31 - drafts)
@@ -882,15 +898,15 @@ def test_verify_token_rows_pad_with_the_zero_embedding_token_and_readback_parses
 
 
 def test_moe_row_admission_and_flags_are_untouched() -> None:
-    assert moe_module.SUPPORTED_ROWS == (1, 5, 6, 7, 8, 32, 128)
+    assert moe_module.SUPPORTED_ROWS == (1, *range(5, 17), 32, 128)
     assert moe_module.ROWS5_HARDWARE_PROVEN is True and moe_module.ROWS32_HARDWARE_PROVEN is True
-    assert moe_module.ROWS6TO8_HARDWARE_PROVEN is False  # flips with the first QuietBox 2 acceptance replay at k >= 5
-    assert [mtp_v2.moe_rows_for(k + 1) for k in mtp_v2.SUPPORTED_DRAFTS] == [5, 5, 6, 7, 8]
-    assert mtp_v2.SUPPORTED_DRAFTS == (3, 4, 5, 6, 7) and mtp_v2.DEFAULT_DRAFTS == 4
+    assert moe_module.ROWS6TO16_HARDWARE_PROVEN is False  # flips with the first QuietBox 2 acceptance replay at k >= 5
+    assert [mtp_v2.moe_rows_for(k + 1) for k in mtp_v2.SUPPORTED_DRAFTS] == [5, 5, *range(6, 17)]
+    assert mtp_v2.SUPPORTED_DRAFTS == tuple(range(3, 16)) and mtp_v2.DEFAULT_DRAFTS == 4
     with pytest.raises(ValueError):  # allow-pytest.raises: the row bound is a contract
         mtp_v2.moe_rows_for(33)
     # An explicit override (the runner's argument) is admitted for the instance it constructs, nothing else.
-    assert [mtp_v2.resolve_moe_rows(k + 1, None) for k in mtp_v2.SUPPORTED_DRAFTS] == [5, 5, 6, 7, 8]
+    assert [mtp_v2.resolve_moe_rows(k + 1, None) for k in mtp_v2.SUPPORTED_DRAFTS] == [5, 5, *range(6, 17)]
     assert mtp_v2.resolve_moe_rows(6, 6) == 6 and mtp_v2.resolve_moe_rows(4, 5) == 5
     source = inspect.getsource(mtp_v2._allocate_layer_verify_state)
     assert "admitted_rows=SUPPORTED_ROWS if moe_rows in SUPPORTED_ROWS else (moe_rows,)," in source
@@ -1066,9 +1082,9 @@ def test_qsa_verify_methods_are_the_chunk_ops_plus_two_block_writes_without_host
     derive = _segment(QSA_SOURCE, functions["derive_qsa_verify_inputs"])
     for forbidden in ("to_torch", ".item()", "position %", "position //", "synchronize", "for row in"):
         assert forbidden not in derive, forbidden
-    # The verify pass completes two compressed blocks at most: only their indices are derived (the chunk's eight
-    # stay the prefill path's default).
-    assert "completed_blocks=1 if single_row else VERIFY_COMPLETED_BLOCKS" in derive
+    # The verify pass completes at most verify_completed_blocks(rows) compressed blocks: only their indices are
+    # derived (the chunk's eight stay the prefill path's default).
+    assert "completed_blocks = 1 if single_row else verify.completed_blocks" in derive
     chunk_derive = _segment(QSA_SOURCE, functions["derive_qsa_chunk_inputs"])
     assert (
         "completed_blocks: int | None = None" in chunk_derive

@@ -102,6 +102,25 @@ requests, and hands the 1-row sampled loop the rest where the greedy loop would 
 bulk: R x 62,080 bf16), inside the admission's per-arm bound; the verify trace gains the rows epilogue's few ops
 and one 1 MB copy per pass, the greedy pass reads none of it.
 
+### 2.6 Verify rows to 16 (`--mtp` up to 15)
+
+The verify pass runs its R rows on the 32-row chunk operands, flat in R; the cap at 8 rows was the QSA verify
+path's two-completed-blocks invariant. A pass of R rows at P % 4 = r completes `(r + R) // 4` compressed blocks,
+at most `(R + 3) // 4`: `qsa.verify_completed_blocks(rows)` is that count (never fewer than the two every pass
+up to 8 rows wrote, so the existing arms' traces stand; three to 12 rows, four to 16), `Qwen38TTNNQSAVerifyConstants`
+carries it, the pool select stack pools block `P // 4 + b` for every `b` below it out of the raw window (the
+history tile and the 32 new rows), `derive_qsa_verify_inputs` derives that many block indices
+(`Qwen38TTNNQSAVerifyInputs.completed_blocks`, validated against the single-row form) and the compressed-index
+writer already loops over them with the chunk constants' eight row selects and block-start RoPE rows. The KV
+side spans at most two 32-row blocks for any R up to 32 and was already generic. `VERIFY_MAX_ROWS` is 16,
+`moe.TARGET_VERIFIER_ROW_COUNTS` 5..16 on the rows-5 path (`ROWS6TO16_HARDWARE_PROVEN = False`),
+`mtp_v2.SUPPORTED_DRAFTS` 3..15, the admission adds `MTP_DRAFT_ROW_BYTES_PER_BANK_UPPER_BOUND` (1 MB per bank,
+unmeasured) per draft row past k = 7 (`draft_counts`). The step-5 torch reference now covers rows 12 and 16 at
+every position (inputs, KV and compressed writes for every accept), the accept tests k = 8 and 12 (15 with
+sampled patterns), the pass-loop and draft tests k = 15. Expected: with host drafting (the matched drafts are
+free) structured output at ~0.95 acceptance per draft commits ~11.2 tokens per pass at k = 15 against 7.0 at k =
+7; on `--draft-source mtp` the device drafts k - 1 rows at ~4 ms each, so a large k is a bet on acceptance alone.
+
 ## 3. Expected effect (from the tree's pass costs; measure, do not trust)
 
 Pass time T(k) ~= 54.7 + 4k ms. Tokens per pass = 1 + accepted drafts.
@@ -141,6 +160,9 @@ measure per prompt class.
    server): the two seeded streams must agree until a near-tie of the verify pass's rounding, the pass loop's
    reply must report `qwen38.mtp.sampled_passes` > 0, and `qwen38.sampling.fallbacks` should stay at 0 on the
    twelve prompts (a fallback is a boundary tie; each costs an eager 1 MB gather).
+   Then the wide arms: `--mtp 4,11,15 --draft-source hybrid --acceptance`: the records reproduce at each arm (the
+   first silicon run of the three- and four-block verify writes and the 12- and 16-row MoE form; the gate is the
+   same as step 3), then `qwen38.mtp.tokens_per_pass` on `json` at `speculative_drafts` 15 against 7.
 8. A/Bs, one variable each: `QWEN38_FUSED=final_mixer,gdn_step,position_advance` in the launcher's environment (it
    `exec`s the server with the caller's environment; `gdn_step` replaces the 49-program GDN chain with one program per
    layer and is off by default only because its rounding follows the torch oracle rather than the chain, tolerance
@@ -153,9 +175,9 @@ measure per prompt class.
 | # | lever | evidence | expected effect | status |
 |---|---|---|---|---|
 | 1 | **sampled requests through the pass loop** | the chain drafts greedy requests only (`drafting = ... sampling is None`); the model card's defaults are temperature 0.7 / 1.0, so most chat traffic runs the 1-row loop at 27 tok/s. Every other port serves sampled requests speculatively (MTPLX: "exact at any temperature") | the MTP rates (39-68 tok/s at k = 4) for temperature > 0, times the sampled acceptance | **on this branch** (2.5); the rejection-sampling form stays open |
-| 2 | verify rows to 16 (k <= 15) | with host drafting the matched drafts are free; the QSA chunk constants carry 8 `row_selects` and `derive_qsa_chunk_inputs` admits up to 8 completed blocks; needs `VERIFY_COMPLETED_BLOCKS = (R + 3) // 4`, the pool-select stack for N rows, block-start RoPE rows, MoE rows to 16 | structured output 11.2 tokens per pass at k = 15 against 7.0 at k = 7 | no-device-testable |
-| 3 | **index sharing for the draft rows** | SGLang's IndexShare and vLLM's "index sharing": the draft rows reuse the QSA block selection of the last accepted row instead of running the indexer per row (N + 1 extra columns for the positions drafted since); +3-4% on coding and JSON on the DGX Spark | a cheaper draft row (the k - 1 rows are ~4 ms each of which the MTP layer's indexer is an unmeasured part) | device; measure the draft row's program census first |
-| 4 | **a 64k draft vocabulary and a bf4 draft LM head** | the DGX Spark recipe's `DRAFT_VOCAB=1` (the drafter's head over 65,536 ids); the draft row here re-reads the 1.27 GB bf16 LM head per row. Lossless: a draft outside the subset is a wrong draft, the verify head is the full one | 1.27 GB -> ~80 MB per draft row: ~0.6 ms of the ~4 ms, k - 1 times per pass | the sliced head and the host id remap build offline; silicon proves it |
+| 2 | verify rows to 16 (k <= 15) | with host drafting the matched drafts are free; the QSA chunk constants carry 8 `row_selects` and `derive_qsa_chunk_inputs` admits up to 8 completed blocks | structured output 11.2 tokens per pass at k = 15 against 7.0 at k = 7 | **on this branch** (2.6) |
+| 3 | **index sharing for the draft rows** | SGLang's IndexShare and vLLM's "index sharing": the draft rows reuse the QSA block selection of the last accepted row instead of running the indexer per row (N + 1 extra columns for the positions drafted since); +3-4% on coding and JSON on the DGX Spark | a cheaper draft row (the k - 1 rows are ~4 ms each). In this port the draft row's indexer is `indexer_score_dsa` + one all-reduce + the mask + `topk_large_indices` + the expansion: ~8 programs and one collective, a few percent of the row, so the gain is smaller than the GPU ports' | device; measure the draft row's program census first |
+| 4 | **a 64k draft vocabulary and a bf4 draft LM head** | the DGX Spark recipe's `DRAFT_VOCAB=1` (the drafter's head over 65,536 ids); the draft row here re-reads the 1.27 GB bf16 LM head per row. Lossless: a draft outside the subset is a wrong draft, the verify head is the full one | 1.27 GB -> ~80 MB per draft row: ~0.6 ms of the ~4 ms, k - 1 times per pass. Coverage of an id-prefix vocabulary on the twelve acceptance records' 1,040 generated ids: 64k covers 89.9% (chat / code / json / list / math / refactor / story / summary 96-99%, prose 92%, `sky` 86%, `multilingual` 14%), 96k 95.2%, 128k 98.6%: a per-request or per-language choice, never the default | the LM head is wired to the full vocabulary in ~15 places (`LOCAL_VOCAB_SIZE`); a parameterised draft head is a refactor of a pinned component for ~3-5% of a pass |
 | 5 | slab prefill re-streams the experts 16x per layer | `_routed_partial_blocks`: one 128-token `moe_compute` call per 128-row block, each touching ~92% of the 512 experts: 48 x 16 x 1.3 GB per slab = 0.26 ms per token, the measured 0.25-0.31 | 512 tokens per call: the MoE stream / 3.7, prefill -20..25% | hardware A/B (`routed_tokens_per_call` admits (rows, 32, 128) only) |
 | 6 | the verify commit reruns the GDN chunk kernel | `commit_rows` "reruns the kernel over the committed prefix": two runs x 36 layers per pass | part of the verify's 1.5x; #55548's per-token-state op makes the commit a slot copy | port the C++ op |
 | 7 | dense weights bf16 -> bfp8 | every GDN / QSA / GR / MoE-dense upload is `bfloat16`: ~5.5 GB + a 1.27 GB LM head per token. The reference deployment already runs these at 8 bits (Qwen's FP8 checkpoint; the DGX Spark ports' "FP8 heads and side layers"; MTPLX keeps the QSA projections at 8-bit under 4-bit everything else) | floor 4.1 -> 2.6 ms; ~4% today, ~30% of the ceiling once fused | a precision decision; keep the QSA projections at 8 bits |
@@ -172,13 +194,13 @@ read back and does one host-to-device copy) and GDN state precision (fp32 by con
 
 ### Lever 1, built (2.5): what stays open
 
-The match rule accepts a draft with the probability the policy gives the drafted token; the rejection sampler
-that MTPLX, vLLM and SGLang implement accepts with min(1, p(d) / q(d)) and draws the residual on a rejection, which
-needs the draft's probabilities q from the k - 1 draft rows (a second readback row per pass) and a residual
-distribution per rejected row. It is the follow-up if the match rule's sampled acceptance disappoints on the
-box; the readback and the accept live in `_sample_pass` and would gain a q-row, nothing else moves. A cheaper
-row-0 variant needs no device change: when draft 1 misses, the residual could be drawn on the host from the
-candidate row alone, exactly, because the row carries the target's top-32 per shard.
+The match rule accepts a draft with the probability the policy gives the drafted token, p(d). The rejection
+sampler that MTPLX, vLLM and SGLang implement accepts with min(1, p(d) / q(d)) and draws the residual on a
+rejection; with the greedy drafts this port makes, q is one-hot on d, so that acceptance is p(d) too: the two
+rules are the same rule here, and the match rule needs no q. A higher sampled acceptance needs drafts drawn from
+the MTP head's own distribution (sampled draft rows: the device sampler composite of the 1-row loop in the draft
+body, one draw per row), whose q the rejection sampler then exploits; that is a device change and the follow-up
+if the box shows the sampled acceptance below the greedy one by more than the policy's own temperature explains.
 
 ## 6. What the other ports do (reviewed 2026-09-23)
 
@@ -238,8 +260,10 @@ PR #27742, unsloth.ai/docs/models/qwen3.8-next, cat5edopeHA/qwen38-flash-next-ai
 | + MTP with the 128-row chunks and the slab | 1,766 | 1,626 | 38 | 16 | 86 |
 | + the polish pass | 1,766 | 1,626 | 38 | 16 | 86 |
 | + sampled requests through the pass loop | 1,783 | 1,643 | 38 | 16 | 86 |
+| + verify rows to 16 | 1,842 | 1,702 | 38 | 16 | 86 |
 
-The 17 tests added last are the sampled pass loop's (the sequential-stream equivalence for every acceptance
+The last row's 59 added tests are the rows-12/16 and k-15 parametrizations (the verify inputs and writes at every
+position and accept, the accept patterns at k 8/12/15, the pass loop and draft at k 15). The 17 before them are the sampled pass loop's (the sequential-stream equivalence for every acceptance
 pattern, the fallback, the hybrid composition, the sampler, the readback round trip and the source contracts).
 The failing and erroring set is identical on every row: the checkpoint-reading tests (`QWEN38_CHECKPOINT` unset) and
 `test_ttnn_bf4_static`, which pins the checkout's patched `ttnn.load_tensor` that the pip wheel does not carry.

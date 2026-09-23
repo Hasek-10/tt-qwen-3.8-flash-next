@@ -1464,19 +1464,31 @@ def verify_handoff_ring_select_rows(position: int) -> torch.Tensor:
 # --------------------------------------------------------------------------- MTP v2 verify (R = k + 1 rows at any P)
 # The verify body runs the R rows P .. P + R - 1 of one pass on the chunk path's 32-row operands at an
 # arbitrary P (rows R .. 31 of every tile are padding: zero hidden rows, geometry of row R - 1).  Two
-# facts bound the state it touches: R <= VERIFY_MAX_ROWS rows complete at most two compressed blocks
-# (P // 4 and P // 4 + 1: a pass of R rows at P % 4 = r completes (r + R) // 4 blocks, at most (R + 3) // 4,
-# which is 2 for every R up to 8) and span at most two 32-row KV blocks (P & ~31 and the next one, for every
-# R up to 32).  Both blocks of each kind are written every pass, so the op sequence never depends on P.
-# Rows 7 and 8 (k = 6 and 7) are admitted on the same two invariants as rows 4..6: the pool select below
-# pools only the rows that fall in those two blocks, and a third, partial block is left to the pass that
-# completes it (the garbage-hiding rule rows 6 already relies on at P % 4 = 3).
-VERIFY_MAX_ROWS = 8
-VERIFY_COMPLETED_BLOCKS = 2
-assert (VERIFY_MAX_ROWS + COMPRESS_RATIO - 1) // COMPRESS_RATIO == VERIFY_COMPLETED_BLOCKS, "R rows complete <= 2 blocks"
+# facts bound the state it touches: a pass of R rows at P % 4 = r completes (r + R) // 4 compressed blocks
+# (P // 4, P // 4 + 1, ..), at most (R + 3) // 4 of them (:func:`verify_completed_blocks`), and spans at most
+# two 32-row KV blocks (P & ~31 and the next one, for every R up to 32).  Every block the row count can complete
+# is written every pass, so the op sequence never depends on P: a block that does not complete inside the pass
+# holds finite garbage that the per-row mask hides until the pass that completes it rewrites it (the
+# garbage-hiding rule).  R up to 8 writes the two blocks it always wrote; 9..12 three; 13..16 four (the chunk
+# constants carry eight row selects and block-start RoPE rows, the raw window holds 32 new rows).
+VERIFY_MAX_ROWS = 16
+VERIFY_MIN_COMPLETED_BLOCKS = 2
+VERIFY_MAX_COMPLETED_BLOCKS = 4
 RAW_HISTORY_ROWS = COMPRESS_RATIO - 1
 RAW_WINDOW_TILE_ROWS = 2 * CACHE_WRITE_ROWS
 STAGE_LANE_BIAS = CACHE_WRITE_ROWS
+
+
+def verify_completed_blocks(rows: int) -> int:
+    """The compressed blocks a verify pass of ``rows`` rows writes: the most it can complete at any P,
+    ``(rows + 3) // 4``, and never fewer than the two every pass up to 8 rows wrote (their traces stand)."""
+
+    if isinstance(rows, bool) or type(rows) is not int or not 1 <= rows <= VERIFY_MAX_ROWS:
+        raise ValueError(f"QSA verify path admits 1..{VERIFY_MAX_ROWS} rows, got {rows!r}")
+    return max(VERIFY_MIN_COMPLETED_BLOCKS, (rows + COMPRESS_RATIO - 1) // COMPRESS_RATIO)
+
+
+assert verify_completed_blocks(VERIFY_MAX_ROWS) == VERIFY_MAX_COMPLETED_BLOCKS <= CACHE_WRITE_ROWS // COMPRESS_RATIO
 
 
 def qsa_verify_constant_rows(rows: int, allocated_compressed_blocks: int) -> dict[str, torch.Tensor]:
@@ -1489,13 +1501,13 @@ def qsa_verify_constant_rows(rows: int, allocated_compressed_blocks: int) -> dic
     new row j (i = P % 32 + j); ``stage_b_lanes[i, j] = i - j + 64`` does the same for the next block
     (i = P % 32 + j - 32).  ``pool_select_stack`` row r (r = P % 4) is the flattened ``[32, 64]`` 0.25-valued
     select over the raw window ``[history tile | new rows tile]`` (history row w holds position P - 3 + w, new
-    row j position P + j): output row 0 pools the four positions of block P // 4, row 1 those of block
-    P // 4 + 1 (only the new rows below ``rows`` can belong to it; a block that does not complete inside the
-    pass pools finite garbage that the per-row mask hides until the pass that completes it rewrites it).
+    row j position P + j): output row b (b below :func:`verify_completed_blocks`) pools the four positions of
+    block P // 4 + b (only the new rows below ``rows`` can belong to a block past the first; a block that does not
+    complete inside the pass pools finite garbage that the per-row mask hides until the pass that completes it
+    rewrites it).
     """
 
-    if isinstance(rows, bool) or type(rows) is not int or not 1 <= rows <= VERIFY_MAX_ROWS:
-        raise ValueError(f"QSA verify path admits 1..{VERIFY_MAX_ROWS} rows, got {rows!r}")
+    blocks_written = verify_completed_blocks(rows)
     blocks = validate_qsa_cache_capacity(allocated_compressed_blocks * COMPRESS_RATIO) // COMPRESS_RATIO
     clamped = torch.arange(CHUNK_ROWS, dtype=torch.int64).clamp(max=rows - 1).reshape(1, 1, CHUNK_ROWS, 1)
     lane = torch.arange(CHUNK_ROWS, dtype=torch.int64)
@@ -1509,8 +1521,10 @@ def qsa_verify_constant_rows(rows: int, allocated_compressed_blocks: int) -> dic
                 select[0, RAW_HISTORY_ROWS - remainder + lane_in_block] = 1.0 / COMPRESS_RATIO
             elif lane_in_block - remainder < rows:
                 select[0, CACHE_WRITE_ROWS + lane_in_block - remainder] = 1.0 / COMPRESS_RATIO
-            if COMPRESS_RATIO - remainder + lane_in_block < rows:
-                select[1, CACHE_WRITE_ROWS + COMPRESS_RATIO - remainder + lane_in_block] = 1.0 / COMPRESS_RATIO
+            for block in range(1, blocks_written):
+                new_index = block * COMPRESS_RATIO - remainder + lane_in_block  # the new row block b's lane takes
+                if new_index < rows:
+                    select[block, CACHE_WRITE_ROWS + new_index] = 1.0 / COMPRESS_RATIO
         stack[remainder] = select.reshape(-1)
     return {
         "row_index_blocks": clamped.expand(1, 1, CHUNK_ROWS, blocks).contiguous(),
@@ -1552,6 +1566,12 @@ class Qwen38TTNNQSAVerifyConstants:
     @property
     def allocated_compressed_blocks(self) -> int:
         return self.chunk.allocated_compressed_blocks
+
+    @property
+    def completed_blocks(self) -> int:
+        """The compressed blocks a pass of this row count writes (:func:`verify_completed_blocks`)."""
+
+        return verify_completed_blocks(self.rows)
 
     @property
     def arange_blocks_rows(self):
@@ -1626,13 +1646,13 @@ class Qwen38TTNNQSAVerifyInputs:
     """Per-pass device tensors of the verify path, derived from ``P``; shared by every QSA layer.
 
     ``chunk`` holds the per-row masks / sparse rows on the clamped templates, ``kv_block_start`` (= P & ~31)
-    and the block indices (``block_index_i32[0]`` = P // 4, ``[1]`` = P // 4 + 1 are the two blocks a pass
-    can complete).  ``kv_block_start_next`` UINT32 ``[1,1,1,1]`` is the next KV block, ``kv_read_indices``
+    and the block indices (``block_index_i32[b]`` = P // 4 + b: the ``completed_blocks`` blocks a pass of the
+    row count can complete).  ``kv_block_start_next`` UINT32 ``[1,1,1,1]`` is the next KV block, ``kv_read_indices``
     UINT32 ``[1,1,32]`` the rows of the current block (an embedding index row: a view of ``kv_read_row``, the
     rank-4 owner that ``deallocate`` releases), ``stage_keep`` BF16 TILE
     ``[1,1,32,1]`` is 1.0 for the block rows below P % 32 (already committed), ``stage_a_select`` /
     ``stage_b_select`` BF16 TILE ``[1,1,32,32]`` place new row j at staging row P % 32 + j of the current /
-    next block, ``pool_select`` BF16 TILE ``[1,1,32,64]`` pools the two blocks out of the raw window.
+    next block, ``pool_select`` BF16 TILE ``[1,1,32,64]`` pools those blocks out of the raw window.
 
     ``single_row`` (a one-row pass, the draft rows): the row never reaches the next KV block or the next compressed
     block, so ``kv_block_start_next`` and ``stage_b_select`` are None and ``chunk.block_index_i32`` holds P // 4 alone;
@@ -1648,6 +1668,7 @@ class Qwen38TTNNQSAVerifyInputs:
     stage_b_select: Any
     pool_select: Any
     single_row: bool = False
+    completed_blocks: int = VERIFY_MIN_COMPLETED_BLOCKS
 
     def deallocate(self) -> None:
         self.chunk.deallocate()
@@ -1668,7 +1689,7 @@ def derive_qsa_verify_inputs(
     *,
     single_row: bool = False,
 ) -> Qwen38TTNNQSAVerifyInputs:
-    """:func:`derive_qsa_chunk_inputs` on the clamped templates plus the two-block staging selects.
+    """:func:`derive_qsa_chunk_inputs` on the clamped templates plus the staging selects.
 
     Exact UINT32 ops on the replicated scalar ``P``; the only casts are the 0/1 selects to BF16 (the
     comparisons write 0/1 UINT32) and the pool select, one row of a 0.25-valued constant stack picked by a
@@ -1677,9 +1698,8 @@ def derive_qsa_verify_inputs(
     next-block select, one compressed block index.
     """
 
-    chunk = derive_qsa_chunk_inputs(
-        position_scalar, constants, verify, completed_blocks=1 if single_row else VERIFY_COMPLETED_BLOCKS
-    )
+    completed_blocks = 1 if single_row else verify.completed_blocks
+    chunk = derive_qsa_chunk_inputs(position_scalar, constants, verify, completed_blocks=completed_blocks)
     dram = ttnn.DRAM_MEMORY_CONFIG
     u32 = ttnn.uint32
     allocated: list[Any] = []
@@ -1744,6 +1764,7 @@ def derive_qsa_verify_inputs(
         stage_b_select=stage_b_select,
         pool_select=pool_select,
         single_row=single_row,
+        completed_blocks=completed_blocks,
     )
     for name, tensor, shape, dtype, layout in (
         ("kv_block_start_next", kv_block_start_next, (1, 1, 1, 1), u32, ttnn.ROW_MAJOR_LAYOUT),
@@ -1786,7 +1807,7 @@ def emulate_qsa_verify_inputs(position: int, *, rows: int, allocated_compressed_
             "kv_block_start": per_row[0]["kv_block_start"],
             "block_index_i32": tuple(
                 torch.tensor([position // COMPRESS_RATIO + block], dtype=torch.int32)
-                for block in range(VERIFY_COMPLETED_BLOCKS)
+                for block in range(verify_completed_blocks(rows))
             ),
             "indexer_neg_mask": torch.cat([row["indexer_neg_mask"] for row in per_row], dim=2),
             "row_keep_bits": torch.cat([row["row_keep_bits"] for row in per_row], dim=2),
@@ -4719,7 +4740,14 @@ class Qwen38TTNNQSA:
             raise RuntimeError("QSA raw history and raw rows must be distinct buffers")
 
     def _validate_verify_inputs(self, verify: Qwen38TTNNQSAVerifyInputs) -> None:
-        self._validate_chunk_inputs(verify.chunk, completed_blocks=1 if verify.single_row else VERIFY_COMPLETED_BLOCKS)
+        if (verify.completed_blocks == 1) != verify.single_row or not (
+            1 <= verify.completed_blocks <= VERIFY_MAX_COMPLETED_BLOCKS
+        ):
+            raise RuntimeError(
+                f"QSA verify inputs single_row={verify.single_row} write {verify.completed_blocks} compressed blocks; "
+                f"a one-row pass writes 1, a pass of R rows {VERIFY_MIN_COMPLETED_BLOCKS}..{VERIFY_MAX_COMPLETED_BLOCKS}"
+            )
+        self._validate_chunk_inputs(verify.chunk, completed_blocks=verify.completed_blocks)
         if verify.single_row != (verify.kv_block_start_next is None) or verify.single_row != (
             verify.stage_b_select is None
         ):
@@ -4908,9 +4936,10 @@ class Qwen38TTNNQSA:
         kept = ttnn.copy(raw_key, verify_state.raw_rows)
         if kept is not None and _tensor_key(kept) != _tensor_key(verify_state.raw_rows):
             raise RuntimeError("QSA verify raw rows were not kept in place")
-        # Block means of P // 4 (rows 0) and P // 4 + 1 (row 1) as one exact 0.25-select matmul over the raw
-        # window (four exact power-of-two products summed in fp32, one bf16 rounding: the ring's quarter-scaled
-        # sum), then the decode's norm and block-start RoPE on the whole tile and one paged write per block.
+        # Block means of P // 4 + b (row b, for the blocks the pass writes) as one exact 0.25-select matmul over
+        # the raw window (four exact power-of-two products summed in fp32, one bf16 rounding: the ring's
+        # quarter-scaled sum), then the decode's norm and block-start RoPE on the whole tile and one paged write
+        # per block.
         window = self._raw_window_verify(verify_state, raw_key)
         _deallocate(raw_key)
         pooled = ttnn.matmul(
@@ -4937,7 +4966,8 @@ class Qwen38TTNNQSA:
         _require_shape(rotated, (1, 1, CHUNK_ROWS, INDEX_HEAD_DIM), "rotated verify index keys")
         one_row = ttnn.Shape((1, 1, 1, INDEX_HEAD_DIM))
         tile = ttnn.Shape((1, 1, CHUNK_ROWS, INDEX_HEAD_DIM))
-        # The blocks the pass can complete: P // 4 and P // 4 + 1, or P // 4 alone for a one-row pass.
+        # The blocks the pass can complete: P // 4 + b for b below verify_completed_blocks(rows), or P // 4 alone
+        # for a one-row pass.
         for block, block_index in enumerate(verify.chunk.block_index_i32):
             picked = ttnn.matmul(
                 constants.row_selects[block],
@@ -5050,11 +5080,11 @@ class Qwen38TTNNQSA:
         """The R rows P .. P + R - 1 of one verify pass on the 32-row tile at any P; same op sequence for every P.
 
         ``hidden_rows`` is the ``[1,1,32,640]`` tile whose rows past R are zero.  ``state`` is mutated in
-        place (KV rows P .. P + R - 1 across the current and next 32-row block, compressed blocks P // 4 and
-        P // 4 + 1; with ``verify.single_row`` the current block and P // 4 alone); ``verify_state.raw_rows``
-        takes this pass's raw keys and ``raw_history`` is read only
-        (the caller commits it with :meth:`commit_verify` at the start of the next pass).  The RoPE rows are
-        the table lookups at P + j and at 4 * (P // 4) + 4i (rows 0 and 1 are used).  Returns the ``[1,1,32,640]``
+        place (KV rows P .. P + R - 1 across the current and next 32-row block, the compressed blocks from P // 4
+        the row count can complete, ``verify.completed_blocks`` of them; with ``verify.single_row`` the current
+        block and P // 4 alone); ``verify_state.raw_rows`` takes this pass's raw keys and ``raw_history`` is read
+        only (the caller commits it with :meth:`commit_verify` at the start of the next pass).  The RoPE rows are
+        the table lookups at P + j and at 4 * (P // 4) + 4i (row b is block P // 4 + b's).  Returns the ``[1,1,32,640]``
         BF16 TILE hidden-sharded rows; the input is left for the caller to release.
         """
 

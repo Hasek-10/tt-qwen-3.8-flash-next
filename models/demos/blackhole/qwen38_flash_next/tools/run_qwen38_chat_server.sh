@@ -14,9 +14,10 @@
 #   --cache-root DIR        the converted weights, the BF4 expert cache, the model I/O cache, the JIT cache and the run
 #                           directories (about 23 GB for 32k plus 107 GB of BF4 experts on the first start)
 #   --allocated-context N   32768 (default) | 65536 | 131072 | 262144
-#   --mtp K[,K...]          multi-token-prediction drafting depth(s), 3..7 (off by default; greedy chunked-mode requests draft;
-#                           a comma list opens one arm per K, the first the default, a request's speculative_drafts picks one;
-#                           3 and 4 measured on 4x p150, 5..7 admitted for the QuietBox 2 sweep)
+#   --mtp K[,K...]          multi-token-prediction drafting depth(s), 3..15 (off by default; greedy and sampled chunked-mode
+#                           requests draft; a comma list opens one arm per K, the first the default, a request's
+#                           speculative_drafts picks one; 3 and 4 measured on 4x p150, 5..15 admitted for the QuietBox 2
+#                           sweep; K past 7 pays with --draft-source hybrid, the device drafts K - 1 rows at ~4 ms each)
 #   --draft-source SRC      mtp (the MTP head, default) | hybrid (the host's prompt-lookup drafter when the last n tokens
 #                           recur in the request's text, the MTP head otherwise) | ngram (the host alone; the A/B arm); needs --mtp
 #   --long-chunks           prefill in 128-row chunks where the prompt allows (off by default; combines with --mtp)
@@ -51,7 +52,7 @@ readonly REPO_ROOT="$(cd -- "$MODEL_DIR/../../../.." && pwd -P)"
 readonly SERVER="$HERE/qwen38_chat_server.py"
 
 die() { printf 'run_qwen38_chat_server: %s\n' "$*" >&2; exit 2; }
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 profile= instance=0 devices= checkpoint= cache_root= allocated_context=32768 mtp= port=8000 host=0.0.0.0 long_chunks=
 prefill_slab= draft_source=
@@ -165,7 +166,7 @@ args=(
 )
 [[ -z "$devices" ]] || args+=(--device-nodes "$devices")
 if [[ -n "$mtp" ]]; then
-    [[ "$mtp" =~ ^[3-7](,[3-7])*$ ]] || die "--mtp takes K[,K...] with K in 3..7, got $mtp"
+    [[ "$mtp" =~ ^([3-9]|1[0-5])(,([3-9]|1[0-5]))*$ ]] || die "--mtp takes K[,K...] with K in 3..15, got $mtp"
     args+=(--mtp "$mtp")
 fi
 if [[ -n "$draft_source" ]]; then

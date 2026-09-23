@@ -9,7 +9,7 @@ resident BF4_B experts independently at each coordinate with
 ``local_combine=True``, applies the real normalized top-10 scores, adds the
 separately and dynamically gated shared-expert partial, and reduce-scatters the
 sum over the expert-parallel axis.  Ordinary decode uses one row.  The fixed
-target verifier uses five to eight rows (the current token plus three to seven drafts).
+target verifier uses five to sixteen rows (the current token plus the drafts, k = 3 .. 15).
 
 The TTNN FullLocal source admits non-tile token counts, but the five-row path is
 hardware-unproven on Blackhole while tt-metal issue #50038 remains relevant to
@@ -58,7 +58,7 @@ TOP_K = 10
 LOCAL_COMBINE_AXIS = 0
 EP_AXIS = 1
 TARGET_VERIFIER_ROWS = 5
-TARGET_VERIFIER_ROW_COUNTS = (TARGET_VERIFIER_ROWS, 6, 7, 8)  # k = 4 .. 7 verifiers, one row per pass position
+TARGET_VERIFIER_ROW_COUNTS = tuple(range(TARGET_VERIFIER_ROWS, 17))  # k = 4 .. 15 verifiers, one row per pass position
 PREFILL_CHUNK_ROWS = CHUNK_ROWS
 LONG_PREFILL_CHUNK_ROWS = LONG_CHUNK_ROWS
 SUPPORTED_ROWS = (1, *TARGET_VERIFIER_ROW_COUNTS, PREFILL_CHUNK_ROWS, LONG_PREFILL_CHUNK_ROWS)
@@ -88,10 +88,10 @@ def moe_compute_output_height_shard_dim(rows: int, *, matmul_ring_size: int) -> 
 ROWS5_HARDWARE_PROVEN = True
 ROWS32_HARDWARE_PROVEN = True
 ROWS128_HARDWARE_PROVEN = True
-# Rows 6, 7 and 8 (the k = 5, 6 and 7 verifiers) take the rows-5 code path unchanged: one moe_compute call of
-# ``rows`` tokens, output_height_shard_dim 1, the same routing and combine shapes with ``rows`` in place of 5.
-# They have NOT run on silicon: the first QuietBox 2 acceptance replay at --mtp 5..7 is their proof.
-ROWS6TO8_HARDWARE_PROVEN = False
+# Rows 6 .. 16 (the k = 5 .. 15 verifiers) take the rows-5 code path unchanged: one moe_compute call of ``rows``
+# tokens, output_height_shard_dim 1, the same routing and combine shapes with ``rows`` in place of 5.  They have
+# NOT run on silicon: the first QuietBox 2 acceptance replay at each --mtp past 4 is their proof.
+ROWS6TO16_HARDWARE_PROVEN = False
 # The 128-row chunk's routed stream: one moe_compute call of 128 tokens, so the union of the chunk's experts
 # streams from DRAM once instead of once per row tile.  32 selects the per-tile form (four calls of the 32-row
 # program; the micro-tests' oracle).  Until 2026-09-06 the 128-token call's rows past the first tile came back

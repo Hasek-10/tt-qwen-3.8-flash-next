@@ -1727,6 +1727,7 @@ def main() -> int:
             resident_context.allocated_context,
             arms=len(args.mtp),
             chunk_kinds=1 + int(long_chunks) + int(args.prefill_slab is not None),
+            draft_counts=args.mtp,
         )
     )
     if mtp_admission is not None and not mtp_admission["fits"]:

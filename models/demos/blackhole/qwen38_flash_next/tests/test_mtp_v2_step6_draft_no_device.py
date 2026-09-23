@@ -88,7 +88,7 @@ def _cat(tensor: FakeTensor) -> torch.Tensor:
 # --------------------------------------------------------------------------- the draft raw history
 
 
-@pytest.mark.parametrize("rows", (4, 5, 6, 7, 8))
+@pytest.mark.parametrize("rows", (4, 5, 6, 7, 8, 16))
 def test_commit_verify_into_the_draft_state_leaves_the_alignment_window_and_advances_by_one(fake, rows: int) -> None:
     module = _qsa_module(fake)
     alignment_state, draft_state = module.allocate_verify_state(), module.allocate_verify_state()
@@ -361,7 +361,7 @@ def _eager_rows(world: _World, residual: FakeTensor, tokens: list[int], steps: i
     return ids
 
 
-@pytest.mark.parametrize("drafts", (3, 4, 5, 6, 7))
+@pytest.mark.parametrize("drafts", (3, 4, 5, 6, 7, 15))
 @pytest.mark.parametrize("position,accepted", ((5, 0), (29, 2), (31, 1), (32, 3), (60, 0), (100, 2)))
 def test_forward_draft_matches_eager_rows_and_assembles_the_host_images(fake, monkeypatch, drafts, position, accepted):
     accepted = min(accepted, drafts)
@@ -628,7 +628,7 @@ def _oracles(pattern: tuple[int, ...], k: int):
 
 
 @pytest.mark.parametrize("form", ("single", "split", "enqueue"))
-@pytest.mark.parametrize("k", (3, 4, 5, 6, 7))
+@pytest.mark.parametrize("k", (3, 4, 5, 6, 7, 15))
 def test_pass_loop_commits_the_fixed_five_stream_for_every_acceptance_pattern(fake, monkeypatch, k, form) -> None:
     """The three pass forms: single trace (verify with catch-up -> the next draft), split (blocking commit -> verify
     -> draft) and the production form (commit enqueued non-blocking -> PLE lookup -> verify and the next pass's draft
@@ -1033,7 +1033,7 @@ class _OracleHostDrafter:
 
 @pytest.mark.parametrize("mode", ("host", "hybrid"))
 @pytest.mark.parametrize("enqueue", (False, True))
-@pytest.mark.parametrize("k", (3, 4, 7))
+@pytest.mark.parametrize("k", (3, 4, 7, 15))
 def test_pass_loop_with_a_host_drafter_commits_the_same_stream_and_skips_the_device_draft(
     fake, monkeypatch, k, enqueue, mode
 ) -> None:

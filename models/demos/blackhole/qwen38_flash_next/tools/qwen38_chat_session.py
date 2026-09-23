@@ -32,7 +32,7 @@ TAIL's epilogue also writes a candidate row, and a request with ``temperature > 
 runs the sampled loop (read the row after TAIL, sample on the host, write the token
 into the row before HEAD).  Greedy requests take the loop above untouched.
 
-MTP drafting is opt-in (``mtp=K``, K in 3..7; ``ttnn/mtp_v2.py``): the chain also
+MTP drafting is opt-in (``mtp=K``, K in 3..15; ``ttnn/mtp_v2.py``): the chain also
 holds the verify / draft / commit traces and, in every TAIL and in the chunk body, the
 MTP layer's rows, so the MTP layer follows the target through prefill.  A greedy
 request on such a chain runs its prefill as above, reads the first token, switches
@@ -142,11 +142,12 @@ RESIDUE_CLASSES = resident_decode.SINGLE_TRACE_RESIDUE_CLASS_TRACES
 SEED_TOKEN_ID = IM_START_ID
 THINK_END_ID = protocol.THINK_END_ID
 # MTP drafting: the draft counts a server may be opened with (3 and 4 are the chain timing tool's measured arms on
-# 4x p150; 5..7 are admitted for the QuietBox 2 sweep and unmeasured), the GDN state
+# 4x p150; 5..15 are admitted for the QuietBox 2 sweep and unmeasured: the verify pass is flat in k, the device
+# drafts k - 1 rows at ~4 ms each, so k past 7 pays with --draft-source hybrid, whose matched drafts are free), the GDN state
 # re-anchor settings (off = every GDN layer commits through the chunk kernel; layer0 = layer 0's commits run the
 # 1-row fp32 step recurrence over the committed rows), the bootstrap pass's placeholder drafts, the resident expert
 # pairs with the MTP layer's.
-MTP_DRAFTS = (3, 4, 5, 6, 7)
+MTP_DRAFTS = tuple(range(3, 16))
 # Who drafts a pass's k ids: the MTP head on the device (``mtp``), the host's prompt-lookup drafter when the last
 # n tokens recur in the request's text and the MTP head otherwise (``hybrid``), or the host alone, fill tokens when
 # nothing recurs (``ngram``: the A/B arm that measures the drafter by itself).
@@ -166,6 +167,10 @@ MTP_CHAIN_BYTES_PER_BANK_UPPER_BOUND = 24 << 20
 # row and three traces; the MTP layer's caches and the TAIL step inputs are the first arm's.  One arm's states and
 # traces measured 8.2 MB per bank at 32,768 (above); the bound leaves room for the k = 7 draft trace.
 MTP_ARM_BYTES_PER_BANK_UPPER_BOUND = 12 << 20
+# A draft count past the measured arms (k > 7): the draft trace grows by one MTP row per further draft (the row's
+# programs and its intermediate buffers baked into the trace); the bound per further row is unmeasured.
+MTP_MEASURED_MAX_DRAFTS = 7
+MTP_DRAFT_ROW_BYTES_PER_BANK_UPPER_BOUND = 1 << 20
 # A further prefill chunk kind with MTP (the 128-row chunk, a slab): the MTP layer's chunk state of that kind (its
 # QSA staging for the rows, the rows-form MoE instance over the shared combine buffer) and a rows-sized token row.
 MTP_PREFILL_EXTENSION_BYTES_PER_BANK_UPPER_BOUND = 8 << 20
@@ -180,18 +185,29 @@ RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES = {
 
 
 def mtp_capacity_admission(
-    allocated_context: int, *, ring_size: int = max(BLACKHOLE_RING_SIZES), arms: int = 1, chunk_kinds: int = 1
+    allocated_context: int,
+    *,
+    ring_size: int = max(BLACKHOLE_RING_SIZES),
+    arms: int = 1,
+    chunk_kinds: int = 1,
+    draft_counts: Sequence[int] = (),
 ) -> dict[str, Any]:
     """Whether the MTP chain fits beside the resident build at ``allocated_context``: the 49th BF4 pair (its two
     payloads interleaved over the banks, needing their contiguous room), the MTP layer's QSA state at that context and
     :data:`MTP_CHAIN_BYTES_PER_BANK_UPPER_BOUND` plus :data:`MTP_ARM_BYTES_PER_BANK_UPPER_BOUND` per further arm
-    (``arms`` draft counts), against the free bytes per bank the build leaves after its captures
-    (:data:`RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES`).  Every byte count is in the record; ``fits`` decides."""
+    (``arms`` draft counts) plus :data:`MTP_DRAFT_ROW_BYTES_PER_BANK_UPPER_BOUND` per draft row past the measured
+    arms (``draft_counts``: each k adds max(0, k - 7)), against the free bytes per bank the build leaves after its
+    captures (:data:`RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES`).  Every byte count is in the record; ``fits``
+    decides."""
 
     if isinstance(arms, bool) or type(arms) is not int or arms < 1:
         raise ValueError(f"arms must be a positive int, got {arms!r}")
     if isinstance(chunk_kinds, bool) or type(chunk_kinds) is not int or not 1 <= chunk_kinds <= 3:
         raise ValueError(f"chunk_kinds must be an int in [1, 3], got {chunk_kinds!r}")
+    draft_counts = tuple(draft_counts)
+    if any(isinstance(k, bool) or type(k) is not int or k not in MTP_DRAFTS for k in draft_counts):
+        raise ValueError(f"draft_counts must be draft counts in {MTP_DRAFTS}, got {draft_counts!r}")
+    draft_rows_past_measured = sum(max(0, k - MTP_MEASURED_MAX_DRAFTS) for k in draft_counts)
 
     free, largest = RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES[
         Qwen38ResidentContext(allocated_context).allocated_context
@@ -207,6 +223,7 @@ def mtp_capacity_admission(
         + MTP_CHAIN_BYTES_PER_BANK_UPPER_BOUND
         + (arms - 1) * MTP_ARM_BYTES_PER_BANK_UPPER_BOUND
         + (chunk_kinds - 1) * MTP_PREFILL_EXTENSION_BYTES_PER_BANK_UPPER_BOUND
+        + draft_rows_past_measured * MTP_DRAFT_ROW_BYTES_PER_BANK_UPPER_BOUND
     )
     contiguous = max(w01_per_bank, w2_per_bank, RESIDENT_MIN_CONTIGUOUS_BYTES_PER_BANK)
     return {
@@ -222,6 +239,9 @@ def mtp_capacity_admission(
         "mtp_arm_bytes_per_bank_upper_bound": MTP_ARM_BYTES_PER_BANK_UPPER_BOUND,
         "chunk_kinds": chunk_kinds,
         "mtp_prefill_extension_bytes_per_bank_upper_bound": MTP_PREFILL_EXTENSION_BYTES_PER_BANK_UPPER_BOUND,
+        "draft_counts": list(draft_counts),
+        "draft_rows_past_measured": draft_rows_past_measured,
+        "mtp_draft_row_bytes_per_bank_upper_bound": MTP_DRAFT_ROW_BYTES_PER_BANK_UPPER_BOUND,
         "required_free_bytes_per_bank": required,
         "required_largest_contiguous_bytes_per_bank": contiguous,
         "headroom_bytes_per_bank": free - required,
@@ -1985,6 +2005,7 @@ class Qwen38TracedChain:
                 ring_size=builder.identity.ring_size,
                 arms=len(mtp_arms),
                 chunk_kinds=1 + int(long_chunks) + int(slab_rows is not None),
+                draft_counts=mtp_arms,
             )
             if not mtp_admission["fits"]:
                 raise Qwen38ChatChainError(

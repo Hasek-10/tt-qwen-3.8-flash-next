@@ -11,6 +11,7 @@ reduce only below 2048).
 from __future__ import annotations
 
 import itertools
+import random
 
 import pytest
 import torch
@@ -47,9 +48,19 @@ def _leading_matches(pattern: tuple[int, ...]) -> int:
     return next((j for j, match in enumerate(pattern) if not match), len(pattern))
 
 
-@pytest.mark.parametrize("k", (3, 4, 5, 6, 7))
+def _patterns(k: int):
+    """Every match pattern up to k = 8; past that 1,024 seeded ones plus the two extremes (2^15 is too many)."""
+
+    if k <= 8:
+        return list(itertools.product((0, 1), repeat=k))
+    rng = random.Random(k)
+    sampled = {tuple(rng.randrange(2) for _ in range(k)) for _ in range(1024)}
+    return sorted(sampled | {(0,) * k, (1,) * k})
+
+
+@pytest.mark.parametrize("k", (3, 4, 5, 6, 7, 8, 15))
 def test_accept_count_and_gather_select_are_exact_for_every_pattern(k: int) -> None:
-    for pattern in itertools.product((0, 1), repeat=k):
+    for pattern in _patterns(k):
         for ids in (SMALL_IDS, LARGE_IDS, SMALL_IDS + LARGE_IDS):
             targets, drafts, alignment = _rows(pattern, ids)
             result = accept_select(targets, drafts, alignment)
@@ -59,12 +70,12 @@ def test_accept_count_and_gather_select_are_exact_for_every_pattern(k: int) -> N
             assert result["first_draft_gather"] == int(alignment[accepted]), (pattern, ids, result)
 
 
-@pytest.mark.parametrize("k", (3, 4, 5, 6, 7))
+@pytest.mark.parametrize("k", (3, 4, 5, 6, 7, 8, 15))
 def test_sum_select_is_exact_only_below_the_tf32_integer_limit(k: int) -> None:
     """Design 2.6 writes t' = sum(one_hot * argmax rows); through an FPU reduce that is wrong from id 2048."""
 
     wrong_large = 0
-    for pattern in itertools.product((0, 1), repeat=k):
+    for pattern in _patterns(k):
         small = accept_select(*_rows(pattern, SMALL_IDS))
         assert small["next_token_sum"] == small["next_token_gather"], pattern
         assert small["first_draft_sum"] == small["first_draft_gather"], pattern

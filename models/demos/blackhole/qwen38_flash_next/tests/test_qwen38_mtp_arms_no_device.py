@@ -51,7 +51,7 @@ def test_parse_mtp_drafts_accepts_one_or_more_admitted_counts_in_order() -> None
     assert server_module.parse_mtp_drafts(",".join(map(str, MTP_DRAFTS))) == MTP_DRAFTS
 
 
-@pytest.mark.parametrize("text", ("", "4,", "2", "8", "4,4", "4;7", "four", "4,7,4"))
+@pytest.mark.parametrize("text", ("", "4,", "2", "16", "4,4", "4;7", "four", "4,7,4"))
 def test_parse_mtp_drafts_rejects_what_the_arms_cannot_take(text: str) -> None:
     with pytest.raises(argparse.ArgumentTypeError):  # allow-pytest.raises: argparse contract
         server_module.parse_mtp_drafts(text)
@@ -84,7 +84,7 @@ def test_parse_chat_request_reads_speculative_drafts_and_rejects_bad_values() ->
     assert server_module.parse_chat_request({**document, "speculative_drafts": 7}, seed=1)["speculative_drafts"] == 7
     assert "speculative_drafts" in server_module.KNOWN_REQUEST_FIELDS
     assert server_module.parse_chat_request({**document, "speculative_drafts": 4}, seed=1)["ignored"] == []
-    for bad in (2, 8, "4", 4.0, True, [4]):
+    for bad in (2, 16, "4", 4.0, True, [4]):
         with pytest.raises(server_module.Qwen38ChatRequestRejected) as info:  # allow-pytest.raises: exact param
             server_module.parse_chat_request({**document, "speculative_drafts": bad}, seed=1)
         assert info.value.param == "speculative_drafts", bad
