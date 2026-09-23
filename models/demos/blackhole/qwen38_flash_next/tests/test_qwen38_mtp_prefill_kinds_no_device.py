@@ -161,7 +161,7 @@ def test_the_lifted_contracts_and_the_extension_lifecycle_are_pinned() -> None:
     assert "rows" in inspect.signature(mtp_input_module.Qwen38TTNNMTPInput.rows).parameters
     assert inspect.signature(mtp_input_module.Qwen38TTNNMTPInput.rows).parameters["rows"].default == 32
     forward = inspect.getsource(model_module.Qwen38TTNNTextModel.forward_prefill_chunk_generic)
-    assert "is the 32-row chunk's option" not in forward and 'getattr(mtp, "rows", CHUNK_ROWS) != chunk_state.rows' in forward
+    assert "is the 32-row chunk's option" not in forward and "mtp.rows != chunk_state.rows" in forward
     driver_init = inspect.getsource(driver_module.Qwen38ChunkPrefill.__init__)
     assert "no long chunks with MTP drafting" not in driver_init and "long_mtp" in driver_init and "slab_mtp" in driver_init
     session_open = inspect.getsource(session_module.Qwen38TracedChain.open)
@@ -172,10 +172,7 @@ def test_the_lifted_contracts_and_the_extension_lifecycle_are_pinned() -> None:
     assert "mtp=None if chain_mtp is None else chain_mtp.slab_extension" in session_open
     close = inspect.getsource(session_module.Qwen38TracedChain.close)
     assert "reversed(self.mtp.chunk_extensions())" in close and "for arm in sorted(self.mtp.arms.values()" in close
-    main = inspect.getsource(server_module.main) if hasattr(server_module, "main") else inspect.getsource(server_module)
-    assert "--prefill-slab and --mtp are alternatives" not in main
-    extension = session_module.Qwen38ChainMTP.chunk_extensions
-    assert callable(extension)
+    assert "--prefill-slab and --mtp are alternatives" not in inspect.getsource(server_module.main)
     admission = session_module.mtp_capacity_admission(32768, chunk_kinds=3)
     assert admission["chunk_kinds"] == 3 and (
         admission["required_free_bytes_per_bank"] - session_module.mtp_capacity_admission(32768)["required_free_bytes_per_bank"]

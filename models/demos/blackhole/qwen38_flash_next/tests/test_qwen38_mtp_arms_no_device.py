@@ -120,11 +120,10 @@ def test_extension_refuses_an_unopened_arm_and_a_switch_under_a_live_loop() -> N
 
 def test_extension_counts_passes_per_arm_and_reports_the_active_one() -> None:
     extension = _extension(4, 7)
-    record = SimpleNamespace(accepted=3)
-    extension.record(record)
+    extension.record(SimpleNamespace(accepted=3, source="device"))
     extension.select(7)
-    extension.record(SimpleNamespace(accepted=6))
-    extension.record(SimpleNamespace(accepted=0))
+    extension.record(SimpleNamespace(accepted=6, source="device"))
+    extension.record(SimpleNamespace(accepted=0, source="device"))
     assert (extension.arms[4].passes, extension.arms[4].accepted_drafts) == (1, 3)
     assert (extension.arms[7].passes, extension.arms[7].accepted_drafts) == (2, 6)
     assert (extension.passes, extension.accepted_drafts) == (3, 9)
@@ -133,7 +132,7 @@ def test_extension_counts_passes_per_arm_and_reports_the_active_one() -> None:
     assert summary["passes"] == 3 and summary["accepted_drafts"] == 9 and summary["tokens_per_pass"] == 4.0
     assert extension.summary(passes=2, accepted_drafts=6)["tokens_per_pass"] == 4.0
     assert extension.summary(passes=0, accepted_drafts=0)["tokens_per_pass"] is None
-    # Host-drafted passes are counted per arm from the record's source; records without one are the device's.
+    # Host-drafted passes are counted per arm from the record's source.
     extension.record(SimpleNamespace(accepted=2, source="host"))
     assert extension.arms[7].host_passes == 1 and extension.host_drafted_passes == 1
     assert summary["draft_source"] == "mtp" and extension.summary()["host_drafted_passes"] == 1

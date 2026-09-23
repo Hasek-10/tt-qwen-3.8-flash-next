@@ -24,8 +24,9 @@ Inside a slab every layer runs its ROWS rows in one pass:
   and runs `sparse_sdpa` over all ROWS query rows in one call.
 
 The remainder of a prompt after the slabs runs through the 128-row chunks, then the 32-row chunks and the padded tail,
-then the ordinary hand-off from the 32-row state.  `--prefill-slab` implies `--long-chunks`; like `--long-chunks` it is
-not combined with `--mtp` (the MTP chain prefills in 32-row chunks).  The 32-row and 128-row bodies are unchanged.
+then the ordinary hand-off from the 32-row state.  `--prefill-slab` implies `--long-chunks`; both combine with `--mtp`
+(the MTP layer runs its rows of every chunk kind through an MTP chunk extension of that kind; `docs/PERF-QB2.md`).  The
+32-row and 128-row bodies are unchanged.
 
 ## Numerics class
 

@@ -1469,7 +1469,7 @@ class Qwen38ChainMTP:
         arm = self.active
         arm.passes += 1
         arm.accepted_drafts += pass_record.accepted
-        if getattr(pass_record, "source", "device") == "host":
+        if pass_record.source == "host":
             arm.host_passes += 1
         return pass_record
 
@@ -1815,7 +1815,10 @@ class Qwen38TracedChain:
         # ``mtp``: one draft count or a sequence of them (one arm each, the first the default).
         mtp_arms: tuple[int, ...] = ()
         if mtp is not None:
-            mtp_arms = (mtp,) if type(mtp) is int else tuple(mtp)
+            try:
+                mtp_arms = (mtp,) if type(mtp) is int else tuple(mtp)
+            except TypeError:
+                mtp_arms = (mtp,)
             if not mtp_arms or any(isinstance(k, bool) or type(k) is not int or k not in MTP_DRAFTS for k in mtp_arms):
                 raise ValueError(f"mtp drafts must be draft counts in {MTP_DRAFTS} or None, got {mtp!r}")
             if len(set(mtp_arms)) != len(mtp_arms):

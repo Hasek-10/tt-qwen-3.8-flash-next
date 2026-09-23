@@ -16,9 +16,9 @@
 #   --allocated-context N   32768 (default) | 65536 | 131072 | 262144
 #   --mtp K[,K...]          multi-token-prediction drafting depth(s), 3..7 (off by default; greedy chunked-mode requests draft;
 #                           a comma list opens one arm per K, the first the default, a request's speculative_drafts picks one;
+#                           3 and 4 measured on 4x p150, 5..7 admitted for the QuietBox 2 sweep)
 #   --draft-source SRC      mtp (the MTP head, default) | hybrid (the host's prompt-lookup drafter when the last n tokens
 #                           recur in the request's text, the MTP head otherwise) | ngram (the host alone; the A/B arm); needs --mtp
-#                           3 and 4 measured on 4x p150, 5..7 admitted for the QuietBox 2 sweep)
 #   --long-chunks           prefill in 128-row chunks where the prompt allows (off by default; combines with --mtp)
 #   --prefill-slab ROWS     prefill in slabs of ROWS rows (a multiple of 128, 256..4096; 2048 is the measured form)
 #                           ahead of the 128-row chunks (off by default; implies --long-chunks; combines with --mtp)

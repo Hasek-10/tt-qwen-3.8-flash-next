@@ -1064,7 +1064,6 @@ def test_pass_loop_with_a_host_drafter_commits_the_same_stream_and_skips_the_dev
         assert [record.accepted for record in chain.records] == list(pattern), (k, mode, pattern)
         sources = ["host" if propose_on(index) else "device" for index in range(passes)]
         assert [record.source for record in chain.records] == sources
-        assert chain.host_passes == sources.count("host") == host.proposals if hasattr(host, "proposals") else True
         assert chain.host_passes == sources.count("host")
         # The device draft replays only on the passes the host declined; the verify and (from pass 1) the commit
         # replay on every pass.

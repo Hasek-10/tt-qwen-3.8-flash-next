@@ -1717,6 +1717,8 @@ def main() -> int:
     template = Qwen38OfficialChatTemplate(prepared.checkpoint.root)
     records = load_acceptance_records(args.acceptance_prompts) if args.acceptance_prompts is not None else []
     resident_context = Qwen38ResidentContext(args.allocated_context)
+    # --prefill-slab implies the 128-row chunks; with --mtp, every chunk kind the prefill runs gets an MTP chunk extension.
+    long_chunks = bool(args.long_chunks) or args.prefill_slab is not None
     # MTP is refused where the resident build's admission table says its pair, state and chain do not fit.
     mtp_admission = (
         None
@@ -1724,7 +1726,7 @@ def main() -> int:
         else mtp_capacity_admission(
             resident_context.allocated_context,
             arms=len(args.mtp),
-            chunk_kinds=1 + int(bool(args.long_chunks) or args.prefill_slab is not None) + int(args.prefill_slab is not None),
+            chunk_kinds=1 + int(long_chunks) + int(args.prefill_slab is not None),
         )
     )
     if mtp_admission is not None and not mtp_admission["fits"]:
@@ -1788,7 +1790,8 @@ def main() -> int:
             }
         ),
         "mtp": {
-            "k": args.mtp,
+            "k": None if args.mtp is None else args.mtp[0],
+            "arms": None if args.mtp is None else list(args.mtp),
             "anchor": args.mtp_gdn_anchor if args.mtp is not None else None,
             "draft_source": args.draft_source if args.mtp is not None else None,
             "admission": mtp_admission,
@@ -1876,7 +1879,7 @@ def main() -> int:
             chunked_prefill=args.prefill_mode == "chunked",
             sampling=bool(args.sampling),
             bf4_stage_limit=args.bf4_stage_limit,
-            long_chunks=bool(args.long_chunks) or args.prefill_slab is not None,
+            long_chunks=long_chunks,
             slab_rows=args.prefill_slab,
             mtp=args.mtp,
             mtp_gdn_anchor=args.mtp_gdn_anchor,

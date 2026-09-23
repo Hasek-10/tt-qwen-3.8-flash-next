@@ -87,7 +87,7 @@ class Qwen38NgramDrafter:
         next_token = _token(next_token, "next_token")
         history = self._history
         for n in range(self.max_n, self.min_n - 1, -1):
-            if len(history) + 1 < n + 1:  # the n-gram and at least one earlier token for it to recur in
+            if len(history) < n:  # no n-gram of this order is indexed yet
                 continue
             gram = (*history[len(history) - (n - 1) :], next_token) if n > 1 else (next_token,)
             ends = self._index[n].get(gram)

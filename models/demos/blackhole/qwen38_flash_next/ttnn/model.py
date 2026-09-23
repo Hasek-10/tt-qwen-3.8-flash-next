@@ -2640,11 +2640,8 @@ class Qwen38TTNNTextModel:
         (the MTP-drafting server's chunk extension) runs the MTP layer's rows on the layer-47 residual rows before
         they are released.  Any failure poisons this owner."""
 
-        if mtp is not None and getattr(mtp, "rows", CHUNK_ROWS) != chunk_state.rows:
-            raise ValueError(
-                f"the MTP chunk extension is the {getattr(mtp, 'rows', CHUNK_ROWS)}-row kind, got a "
-                f"{chunk_state.rows}-row chunk"
-            )
+        if mtp is not None and mtp.rows != chunk_state.rows:
+            raise ValueError(f"the MTP chunk extension is the {mtp.rows}-row kind, got a {chunk_state.rows}-row chunk")
 
         self._validate_generic_state(state)
         self._validate_chunk_state(chunk_state)
