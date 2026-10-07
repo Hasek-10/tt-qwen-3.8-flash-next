@@ -107,14 +107,9 @@ void kernel_main() {
 
     // Process each chunk
     for (uint32_t chunk = 0; chunk < total_chunks; chunk++) {
-        // Study zones (MOE_ZONES): this chunk's phases, recorded inside the profiler window only
-        const bool zone_on = moe_ring::zones::in_window(chunk);
-        {
-            // Wait for reader to push tokens_per_chunk pages (row-major data)
-            // Reader always reserves/pushes tokens_per_chunk for consistent synchronization
-            MOE_ZONE_IF(zone_on, "mz_c_wait_in");
-            cb_tilize_input.wait_front(tokens_per_chunk);
-        }
+        // Wait for reader to push tokens_per_chunk pages (row-major data)
+        // Reader always reserves/pushes tokens_per_chunk for consistent synchronization
+        cb_tilize_input.wait_front(tokens_per_chunk);
 
         // DEBUG: Print subsets of input (row-major bfloat16)
         // Get CB address directly within UNPACK context (avoids mailbox sync issues with get_tile_address)
@@ -128,15 +123,9 @@ void kernel_main() {
 
         // one chunk slot: this core's tiles at its start, the other tilize cores' sub-chunks gathered into the rest of
         // it on the drain, the whole slot multicast from there; the next chunk goes to the next slot
-        {
-            MOE_ZONE_IF(zone_on, "mz_c_reserve_out");
-            cb_tilize_output.reserve_back(chunk_slot_pages);
-        }
+        cb_tilize_output.reserve_back(chunk_slot_pages);
 
-        {
-            MOE_ZONE_IF(zone_on, "mz_c_tilize");
-            fast_tilize_block(tilize_input_cb_id, tiles_per_local_chunk, tilize_output_cb_id);
-        }
+        fast_tilize_block(tilize_input_cb_id, tiles_per_local_chunk, tilize_output_cb_id);
 
         // DEBUG: Print first and last tiles of output (tilized format)
         // PACK(({

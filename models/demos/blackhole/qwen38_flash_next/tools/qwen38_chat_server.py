@@ -118,9 +118,9 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gdn_rows_scan as gdn_rows_scan_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.moe import (
     MOE_CHUNK_ROWS_FORM,
+    MOE_ROWS_FORM,
+    MOE_SLAB_ROWS_FORM,
     admit_slab_moe_switches,
-    moe_local_output_enabled,
-    moe_rows_form,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.vision_residency import (
     PEAK_ACTIVATION_BYTES_PER_ROW_PER_DIE,
@@ -2448,8 +2448,8 @@ def main() -> int:
     if args.prefill_slab is not None and not is_slab_rows(args.prefill_slab):
         raise SystemExit(f"--prefill-slab takes a multiple of 128 in 256..4096, got {args.prefill_slab}")
     if args.prefill_slab is not None:
-        # the slab MoE switches (QWEN38_MOE_SLAB_ONE_CALL / QWEN38_MOE_SLAB_RINGS) are admitted here, before any
-        # device is opened: a refused ring count is a start-up error, not a poisoned model 79 s into the warm pass
+        # the slab MoE switch (QWEN38_MOE_SLAB_ONE_CALL) is admitted here, before any device is opened: a refused
+        # value is a start-up error, not a poisoned model 79 s into the warm pass
         try:
             admit_slab_moe_switches()
         except ValueError as error:
@@ -3053,9 +3053,11 @@ def main() -> int:
                 "mtp_drafts_admitted": list(mtp_drafts_admitted),
                 "fused_kernels": sorted(fused.enabled_names()),
                 "dram_workers_per_bank": report["chain"]["dram_workers_per_bank"],
-                "moe_local_output": moe_local_output_enabled(),
-                "moe_rows_form": moe_rows_form(),
-                "moe_chunk_rows_form": MOE_CHUNK_ROWS_FORM,  # the 128-row chunk's form (a constant, no switch)
+                # the routed experts' launch forms per launch site (constants, no switch): the one-tile rows, the
+                # 128-row chunk, the one-call slab
+                "moe_rows_form": MOE_ROWS_FORM,
+                "moe_chunk_rows_form": MOE_CHUNK_ROWS_FORM,
+                "moe_slab_rows_form": MOE_SLAB_ROWS_FORM,
                 "dram_workers_fallback": report["chain"]["dram_workers_fallback"],
                 "dram_workers_placement": report["chain"].get("dram_workers_placement"),
                 "dense_weight_dtype": report["chain"]["dense_weight_dtype"],

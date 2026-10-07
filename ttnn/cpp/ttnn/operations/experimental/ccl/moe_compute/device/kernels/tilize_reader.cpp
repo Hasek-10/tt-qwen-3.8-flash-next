@@ -1171,34 +1171,25 @@ void kernel_main() {
         // Process tokens in chunks of tokens_per_chunk
         for (uint32_t chunk_start = 0; chunk_start < num_tokens; chunk_start += tokens_per_chunk) {
             uint32_t tokens_in_chunk = std::min(tokens_per_chunk, num_tokens - chunk_start);
-            // Study zones (MOE_ZONES): this chunk's phases, recorded inside the profiler window only
-            const bool zone_on = moe_ring::zones::in_window(num_chunks_sent);
-            {
-                MOE_ZONE_IF(zone_on, "mz_r_reserve");
-                cb_tilize_input.reserve_back(tokens_per_chunk);
-            }
-            {
-                MOE_ZONE_IF(zone_on, "mz_r_reads");
-                MOE_STUDY_DELAY(R_BEFORE_READS);
-                // Read each activated token from the sparse input buffer
-                for (uint32_t i = 0; i < tokens_in_chunk; i++) {
-                    // Get sparse token ID from e_t buffer (16B aligned entries) or the packed segment
-                    uint32_t token_id;
-                    if constexpr (local_output) {
-                        token_id = moe_ring::token_list::entry_token(packed_segment[chunk_start + i]);
-                    } else {
-                        token_id = *reinterpret_cast<uint32_t*>(e_t_expert_addr + (chunk_start + i) * e_t_entry_size);
-                    }
-                    // read the token from the input tensor at the tilize subtoken offset and size
-                    noc_rows_obj.async_read(
-                        input_tensor_addr_gen,
-                        cb_tilize_input,
-                        subtoken_size,
-                        {.page_id = token_id, .offset_bytes = global_subtoken_offset},
-                        {.offset_bytes = i * subtoken_size});
+            cb_tilize_input.reserve_back(tokens_per_chunk);
+            // Read each activated token from the sparse input buffer
+            for (uint32_t i = 0; i < tokens_in_chunk; i++) {
+                // Get sparse token ID from e_t buffer (16B aligned entries) or the packed segment
+                uint32_t token_id;
+                if constexpr (local_output) {
+                    token_id = moe_ring::token_list::entry_token(packed_segment[chunk_start + i]);
+                } else {
+                    token_id = *reinterpret_cast<uint32_t*>(e_t_expert_addr + (chunk_start + i) * e_t_entry_size);
                 }
-                noc_rows_obj.async_read_barrier();
+                // read the token from the input tensor at the tilize subtoken offset and size
+                noc_rows_obj.async_read(
+                    input_tensor_addr_gen,
+                    cb_tilize_input,
+                    subtoken_size,
+                    {.page_id = token_id, .offset_bytes = global_subtoken_offset},
+                    {.offset_bytes = i * subtoken_size});
             }
+            noc_rows_obj.async_read_barrier();
             cb_tilize_input.push_back(tokens_per_chunk);  // Push full chunk (padding is garbage, that's OK)
             num_chunks_sent++;
 

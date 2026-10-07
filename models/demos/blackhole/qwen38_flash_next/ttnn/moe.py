@@ -5,15 +5,17 @@
 
 The fused all-to-all dispatch path cannot represent one interactive token on
 EP4.  This module instead replicates exactly one logical row set, runs the 128
-resident BF4_B experts independently at each coordinate with
-``local_combine=True``, applies the real normalized top-10 scores, adds the
-separately and dynamically gated shared-expert partial, and reduce-scatters the
-sum over the expert-parallel axis.  Ordinary decode uses one row.  The fixed
-target verifier uses five rows (the current token plus four drafts).
+resident BF4_B experts independently at each coordinate on ``moe_compute``'s
+local output path (the op writes each expert's rows into a shared buffer; the
+rows of the experts a coordinate does not hold are never written), applies the
+real normalized top-10 scores in the weighted reduce, adds the separately and
+dynamically gated shared-expert partial, and reduce-scatters the sum over the
+expert-parallel axis.  Ordinary decode uses one row.  The fixed target verifier
+uses five rows (the current token plus four drafts).
 
-The TTNN FullLocal source admits non-tile token counts, but the five-row path is
-hardware-unproven on Blackhole while tt-metal issue #50038 remains relevant to
-MoE numerics.  Static/source-contract validation is not a numerical claim.
+The op admits non-tile token counts, but the five-row path is hardware-unproven
+on Blackhole while tt-metal issue #50038 remains relevant to MoE numerics.
+Static/source-contract validation is not a numerical claim.
 """
 
 from __future__ import annotations
@@ -36,14 +38,14 @@ from models.demos.blackhole.qwen38_flash_next.tt.moe import Qwen38MoEWeights
 from models.demos.blackhole.qwen38_flash_next.ttnn import fused
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROWS,
-    is_slab_rows,
     LONG_CHUNK_ROWS,
     MAX_LANES,
     MESH_SHAPE,
     Qwen38MeshContract,
+    TensorPlacement,
+    is_slab_rows,
     replicate_tensor_2d_mesh_mapper,
     same_buffer,
-    TensorPlacement,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dense_dtype_tag,
@@ -63,42 +65,36 @@ ROUTED_EXPERTS = 512
 EXPERTS_PER_DEVICE = 128
 TOP_K = 10
 LOCAL_COMBINE_AXIS = 0
-MOE_LOCAL_OUTPUT_ENV = "QWEN38_MOE_LOCAL_OUTPUT"
 MOE_SLAB_ONE_CALL_ENV = "QWEN38_MOE_SLAB_ONE_CALL"
-MOE_SLAB_RINGS_ENV = "QWEN38_MOE_SLAB_RINGS"
-# The one-call slab's weight stream: 3 = three rings of cores splitting the chunks, each reading the slices of the
-# experts it owns (the default since 2026-09-26: bitwise on the 4-chip line with the ring exchange's backpressure
-# credit in place, twice, and about 42,500 device-checked calls bitwise on one die; 2.2 percent less TTFT than two
-# rings at 32k); 2 = two rings (the default of 2026-09-25); 0 = the op's one-ring three-slot stream; 1 = the replay
-# ring (one ring, each expert's slice read once per slab). Nothing is refused: the three-ring nondeterminism of
-# 2026-09-25 was the ring exchange's missing backpressure, fixed the same day.
-MOE_SLAB_RINGS_DEFAULT = 3
-MOE_SLAB_RINGS_ADMITTED = (0, 1, 2, 3)
-MOE_SLAB_RINGS_REFUSED: dict[int, str] = {}
-# The one-tile rows forms' (rows <= 32: decode, the MTP verify rows, the lanes, the 32-row chunk) moe_compute launch
-# form.  rings2 (the default since 2026-09-27; measured on the 1x4 p150 line: per-launch 42.0 + 10.87 n -> 36.1 + 7.39 n us
-# over n distinct local experts, the combine pages bitwise): the local output path with two rings.  fulllocal (the
-# form the pins were first taken with, the documented fallback): the streaming ring with the 4-core fused local combine.  localoutput:
-# the op's local output path on the same streaming ring (dm1 writes each expert's rows straight into the
-# [10, rows, 2560] buffer, no combine kernels: 12 cores).  replay / rings2 / rings3: the local output path with
-# prefill_rings 1 / 2 / 3 -- the replay ring reads each expert's slice once; R rings are R x 8 ring cores, each ring
-# reading the slices of the experts it owns (a 1-chunk expert goes whole to the least-loaded ring), so the DRAM
-# banks have R readers and the compute R rings.  The 128-row chunk takes MOE_CHUNK_ROWS_FORM (the local output path on
-# three rings, the one-call slab's ring form; its owned pages are bitwise the fused local combine's); the slab keeps
-# its own form.
-MOE_ROWS_FORM_ENV = "QWEN38_MOE_ROWS_FORM"
-MOE_ROWS_FORM_DEFAULT = "rings2"
-# form -> (local output path, prefill_rings passed to the op; None = the op's streaming ring)
-MOE_ROWS_FORMS: dict[str, tuple[bool, int | None]] = {
-    "fulllocal": (False, None),
-    "localoutput": (True, None),
-    "replay": (True, 1),
-    "rings2": (True, 2),
-    "rings3": (True, 3),
-}
-# The 128-row chunk's launch form (a MOE_ROWS_FORMS name, no switch): the local output path on three rings, the ring
-# form the one-call slab runs; measured against the fused local combine in the development note under the MoE rings study (2026-09-30).
+# The routed experts' moe_compute launch form, a constant per launch site (no switch).  Every instance runs the op's
+# local output path: dm1 writes each expert's rows straight into the [10, rows, 2560] buffer (no combine kernels) and
+# the rows of the experts this device does not hold are never written -- the buffer is zero at allocation and only
+# ever holds finite expert outputs, which the weighted reduce multiplies by an exact 0 where unowned (the ownership
+# contract, docs/NUMERICS.md).  The ring count is the row count's: R replica rings are R x 8 ring cores, each ring
+# reading the slices of the experts it owns chunks of (a 1-chunk expert goes whole to the least-loaded ring), so the
+# DRAM banks have R readers and the compute R rings.  Two rings for the one-tile rows (rows 1..32: decode, the MTP
+# verify rows and drafts, the lanes, the 32-row chunk; 2026-09-27 on the 1x4 p150 line: per launch 36.1 + 7.39 n us
+# over n distinct local experts against 30.2 + 10.86 n on the streaming ring and 42.0 + 10.87 n with the fused local
+# combine, the pages bitwise; two and three rings within noise at the served counts), three for the 128-row chunk
+# (2026-09-30: served TTFT -6..-7 percent against the fused local combine, 0.7 percent ahead of two rings) and for the
+# one-call slab (2026-09-26: -2.1 percent TTFT against two rings at 32k).  docs/PREFILL.md has the table.
+MOE_ROWS_FORM = "rings2"
 MOE_CHUNK_ROWS_FORM = "rings3"
+MOE_SLAB_ROWS_FORM = "rings3"
+# form -> prefill_rings passed to the op
+MOE_ROWS_FORMS: dict[str, int] = {"rings2": 2, "rings3": 3}
+
+
+def moe_rows_form_for(rows: int) -> str:
+    """The launch form of a ``rows``-row instance: the one-tile rows (1..32), the 128-row chunk, else the slab."""
+
+    if rows <= CHUNK_ROWS:
+        return MOE_ROWS_FORM
+    if rows == LONG_PREFILL_CHUNK_ROWS:
+        return MOE_CHUNK_ROWS_FORM
+    return MOE_SLAB_ROWS_FORM
+
+
 # The one-call slab's weighted reduce runs in blocks of this many rows: the fused reduce keeps one score table per
 # row tile in L1 (512 rows admitted bitwise the 128-row form, 1024 refused) and the whole [10, rows, 2560] page set
 # tilized at once would not fit L1.
@@ -118,18 +114,6 @@ MOE_COMPUTE_TOKEN_SIZE = 32
 MOE_COMPUTE_HIDDEN_TILES = HIDDEN_SIZE // 32
 
 
-def moe_local_output_enabled() -> bool:
-    """``QWEN38_MOE_LOCAL_OUTPUT=1``: ``moe_compute`` writes each expert's token rows straight into the ``[10, rows,
-    2560]`` buffer (its LocalOutput path on the degenerate axis: 12 worker cores, no combine kernels, the rows of the
-    experts this device does not hold zero-filled by the op); unset or 0, the fused local combine
-    (``local_combine=True``) the pins were taken with."""
-
-    value = os.environ.get(MOE_LOCAL_OUTPUT_ENV, "0")
-    if value not in ("0", "1"):
-        raise ValueError(f"{MOE_LOCAL_OUTPUT_ENV} must be 0 or 1, got {value!r}")
-    return value == "1"
-
-
 def moe_slab_one_call_enabled() -> bool:
     """``QWEN38_MOE_SLAB_ONE_CALL`` (unset = 1): a slab instance routes all of its rows through ONE ``moe_compute``
     call on the op's local output path (each expert's tokens packed into 32-row chunks once per slab instead of once
@@ -146,41 +130,12 @@ def moe_slab_one_call_enabled() -> bool:
     return value == "1"
 
 
-def moe_slab_prefill_rings() -> int:
-    """``QWEN38_MOE_SLAB_RINGS``: the one-call slab's ``prefill_rings`` (3 = three rings of cores splitting the
-    chunks, each ring reading the slices of the experts it owns -- the default when unset; 2 = two rings; 0 = the
-    op's one-ring 3-slot weight stream; 1 = the replay ring, one ring with each expert's weight slice read from DRAM
-    once per slab; ``MOE_SLAB_RINGS_ADMITTED``). A count in ``MOE_SLAB_RINGS_REFUSED`` (none today) is refused with
-    its reason. Only the one-call slab reads the switch; the chunk forms and decode never do."""
+def admit_slab_moe_switches() -> bool:
+    """Read the slab MoE switch once, before any device is touched: the server calls this when ``--prefill-slab``
+    is given (a refused value ends the process at its start instead of at the first slab forward 79 s into the warm
+    pass), and every slab MoE instance calls it at construction. Returns ``one_call``."""
 
-    value = os.environ.get(MOE_SLAB_RINGS_ENV, str(MOE_SLAB_RINGS_DEFAULT))
-    for refused, reason in MOE_SLAB_RINGS_REFUSED.items():
-        if value == str(refused):
-            raise ValueError(f"{MOE_SLAB_RINGS_ENV}={value} is refused: {reason}")
-    if value not in tuple(str(v) for v in MOE_SLAB_RINGS_ADMITTED):
-        raise ValueError(f"{MOE_SLAB_RINGS_ENV} must be one of {MOE_SLAB_RINGS_ADMITTED}, got {value!r}")
-    return int(value)
-
-
-def moe_rows_form() -> str:
-    """``QWEN38_MOE_ROWS_FORM`` (unset = rings2): the one-tile rows forms' moe_compute launch form
-    (``MOE_ROWS_FORMS``).  Read once per instance at construction; a value outside the table ends the process there."""
-
-    value = os.environ.get(MOE_ROWS_FORM_ENV, MOE_ROWS_FORM_DEFAULT)
-    if value not in MOE_ROWS_FORMS:
-        raise ValueError(f"{MOE_ROWS_FORM_ENV} must be one of {tuple(MOE_ROWS_FORMS)}, got {value!r}")
-    return value
-
-
-def admit_slab_moe_switches() -> tuple[bool, int]:
-    """Read both slab MoE switches once, before any device is touched: the server calls this when ``--prefill-slab``
-    is given (a refused ``QWEN38_MOE_SLAB_RINGS``, three rings today, ends the process at its start instead of at the
-    first slab forward 79 s into the warm pass), and every slab MoE instance calls it at construction. Returns
-    ``(one_call, rings)``."""
-
-    one_call = moe_slab_one_call_enabled()
-    rings = moe_slab_prefill_rings() if one_call else 0
-    return one_call, rings
+    return moe_slab_one_call_enabled()
 
 
 def moe_compute_output_height_shard_dim(rows: int, *, matmul_ring_size: int) -> int:
@@ -716,15 +671,9 @@ class Qwen38TTNNMoE:
         )
         ring_size = effective_matmul_ring_size(mesh_device)
         output_width_shard_dim = auto_output_width_shard_dim(HIDDEN_SIZE, matmul_ring_size=ring_size)
-        # The one-tile rows forms take QWEN38_MOE_ROWS_FORM, the 128-row chunk MOE_CHUNK_ROWS_FORM; every other instance
-        # is fulllocal here (the slab's own local output path is slab_one_call below).
-        if self.row_contract.row_tiles == 1:
-            self.rows_form = moe_rows_form()
-        elif self.rows == LONG_PREFILL_CHUNK_ROWS:
-            self.rows_form = MOE_CHUNK_ROWS_FORM
-        else:
-            self.rows_form = "fulllocal"
-        self.local_output = moe_local_output_enabled() or self.slab_one_call or MOE_ROWS_FORMS[self.rows_form][0]
+        # The launch form of this instance's row count (a constant per launch site): the one-tile rows, the 128-row
+        # chunk, the slab (its one call; a slab in blocks launches through its 128-row worker).
+        self.rows_form = moe_rows_form_for(self.rows)
         self.output_height_shard_dim = moe_compute_output_height_shard_dim(
             self.routed_tokens, matmul_ring_size=ring_size
         )
@@ -1134,11 +1083,11 @@ class Qwen38TTNNMoE:
         self.mesh_contract.validate_tensor(scores_l1, placement=TensorPlacement.REPLICATED)
         phase_observer("after-routed-dispatch")
 
-        # Local combine writes only owned k slots.  Clear every invocation so a
-        # masked 0*uninitialized-NaN cannot poison fast-reduce.  The long chunk's shared buffer is zero at
-        # allocation and every slot it ever holds is a finite expert output (the weighted reduce multiplies
-        # the slots this device does not own by an exact 0), so its 48 layers skip the 6.5 MB fill; the one-call slab's
-        # 105 MB buffer likewise (and the op does not zero the unowned rows either: zero_fill_non_owned_rows below).
+        # The op writes only the owned k slots (the ownership contract).  This plain path clears the buffer every
+        # invocation so a masked 0*uninitialized-NaN cannot poison fast-reduce.  The long chunk's shared buffer is
+        # zero at allocation and every slot it ever holds is a finite expert output (the weighted reduce multiplies
+        # the slots this device does not own by an exact 0), so its 48 layers skip the 6.5 MB fill; the one-call
+        # slab's 105 MB buffer likewise.
         if self.rows != LONG_PREFILL_CHUNK_ROWS and not self.slab_one_call:
             zeroed = ttnn.fill(self.local_combine_output, 0.0, output_tensor=self.local_combine_output)
             if zeroed.tensor_id != self.local_combine_output.tensor_id:
@@ -1165,9 +1114,7 @@ class Qwen38TTNNMoE:
             optional_cross_device_semaphore=None,
             activation_type=MoEActivationFunction.SILU,
             compute_only=False,
-            local_combine=not self.local_output,
             num_shared_experts_per_device=0,
-            zero_fill_non_owned_rows=self.zero_fill_non_owned_rows,
             prefill_rings=self.prefill_rings,
         )
         phase_observer("after-moe-compute-launch")
@@ -1402,9 +1349,7 @@ class Qwen38TTNNMoE:
             optional_cross_device_semaphore=None,
             activation_type=MoEActivationFunction.SILU,
             compute_only=False,
-            local_combine=not self.local_output,
             num_shared_experts_per_device=0,
-            zero_fill_non_owned_rows=self.zero_fill_non_owned_rows,
             prefill_rings=self.prefill_rings,
         )
         phase_observer("after-moe-compute-launch")
@@ -1583,23 +1528,11 @@ class Qwen38TTNNMoE:
         return self.slab and self.routed_calls == 1
 
     @property
-    def zero_fill_non_owned_rows(self) -> bool:
-        # The one-call slab skips the fill (its buffer is zero at allocation); a rows form with several rings must
-        # (the op refuses the fill with R >= 2: one ring's zero writes would race the others' rows) -- its buffer is
-        # cleared by the fill before every call above, so the unowned rows are zero either way.
-        if self.slab_one_call:
-            return False
-        return (MOE_ROWS_FORMS[getattr(self, "rows_form", "fulllocal")][1] or 0) < 2
+    def prefill_rings(self) -> int:
+        """The ring count of this instance's launch form (``moe_rows_form_for(self.rows)``: two replica rings for the
+        one-tile rows, three for the 128-row chunk and the one-call slab)."""
 
-    @property
-    def prefill_rings(self) -> int | None:
-        """The one-call slab's ring mode (``QWEN38_MOE_SLAB_RINGS``); ``None`` = the op's default for every other
-        instance (the kwarg is not passed as a value, so the chunk forms' program hashes are untouched)."""
-
-        if self.slab_one_call:
-            rings = moe_slab_prefill_rings()
-            return rings if rings else None
-        return MOE_ROWS_FORMS[getattr(self, "rows_form", "fulllocal")][1]
+        return MOE_ROWS_FORMS[moe_rows_form_for(self.rows)]
 
     @property
     def slab(self) -> bool:
@@ -1730,9 +1663,7 @@ class Qwen38TTNNMoE:
                 optional_cross_device_semaphore=None,
                 activation_type=MoEActivationFunction.SILU,
                 compute_only=False,
-                local_combine=not self.local_output,
                 num_shared_experts_per_device=0,
-                zero_fill_non_owned_rows=self.zero_fill_non_owned_rows,
                 prefill_rings=self.prefill_rings,
             )
             phase_observer("after-moe-compute-launch")
@@ -2066,7 +1997,7 @@ class Qwen38TTNNMoE:
                     packed_w2,
                     temporaries["shared_partial"],
                     phase_observer=observe,
-                    sparse_rows=temporaries["sparse_rows"],  # the composite's rows: owned here until moe_compute has them
+                    sparse_rows=temporaries["sparse_rows"],  # owned here until moe_compute has them
                 )
                 release("sparse_rows")
             else:

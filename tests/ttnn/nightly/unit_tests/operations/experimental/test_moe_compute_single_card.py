@@ -174,7 +174,7 @@ def _run_moe_compute_single_card_test(
     expect_error=None,
     ccl_knobs=False,
     local_output_memory_config=None,
-    check_non_owned_rows_zero=False,
+    check_non_owned_rows_untouched=False,
 ):
     """
     Single-card MoE compute test body. The op is called with cluster_axis=op_cluster_axis:
@@ -199,11 +199,13 @@ def _run_moe_compute_single_card_test(
     bitwise equal to the interleaved output of the same inputs: the writer addresses the
     output through a TensorAccessor built from the given buffer, one token row per page.
 
-    check_non_owned_rows_zero (1xN local output only): the output contract is that every row of
-    [k, T, H] is what the op wrote, the rows of the experts a device holds carrying its results
-    and every other row being exactly zero, so the per-device partials sum directly. Checked on
-    an op-allocated output, on a caller tensor pre-filled with a sentinel, and on that same
-    tensor reused after a routing change (its rows then hold the previous routing's results).
+    check_non_owned_rows_untouched (1xN local output only): the ownership contract of the
+    local output -- the op writes the rows of the experts a device holds and no other row, so a
+    caller's buffer keeps whatever it held in the rows nobody owns (the caller owns the buffer;
+    its reduce reads the owned slots only, or multiplies the others by an exact 0). Checked on
+    an op-allocated output (zero at allocation), on a caller tensor pre-filled with a sentinel,
+    and on that same tensor reused after a routing change (its rows then hold the previous
+    routing's results where the new routing owns nothing).
 
     The matmul ring size is auto-detected from the live DRAM-bank count (12 on WH, 7/8 on
     BH) — the same ``effective_matmul_ring_size(mesh_device)`` the public op uses — and is used
@@ -829,17 +831,17 @@ def _run_moe_compute_single_card_test(
                 ttnn.deallocate(placed_output)
                 ttnn.synchronize_device(mesh_device)
 
-        if check_non_owned_rows_zero:
-            # The output contract on a 1xN mesh: every row of [k, T, H] is what the op wrote. The
-            # rows of the experts a device holds carry its results; every other row is zero (the
-            # writer zero-fills them before its first row write), so the partials sum directly.
-            # Checked bitwise (an int16 view: -0.0 or NaN cannot pass as zero) on an op-allocated
-            # output, on a caller tensor pre-filled with a sentinel, and on that same tensor
-            # reused after a routing change, when its rows hold the previous routing's results
-            # exactly where the new routing may own nothing.
-            assert multi_device_local and local_output_path, "check_non_owned_rows_zero needs the 1xN local output path"
+        if check_non_owned_rows_untouched:
+            # The ownership contract on a 1xN mesh: the op writes the rows of the experts a device
+            # holds and no other row of [k, T, H]. Checked bitwise (an int16 view) against what the
+            # buffer held before the call: zero on an op-allocated output, the sentinel on a caller
+            # tensor pre-filled with 1.0, and the previous routing's results on that same tensor
+            # reused after a routing change (exactly where the new routing owns nothing).
+            assert (
+                multi_device_local and local_output_path
+            ), "check_non_owned_rows_untouched needs the 1xN local output path"
 
-            def assert_partial_output(tt_output, slot_owner, goldens, what):
+            def assert_partial_output(tt_output, slot_owner, goldens, before_bits, what):
                 output_ref, output_data_map = goldens
                 for device_idx, device_tensor in enumerate(ttnn.get_device_tensors(tt_output)):
                     rows = ttnn.to_torch(device_tensor, mesh_composer=None)
@@ -856,9 +858,10 @@ def _run_moe_compute_single_card_test(
                         "both owned and non-owned rows"
                     )
                     non_owned_bits = rows.contiguous().view(torch.int16)[~owned]
-                    nonzero = int((non_owned_bits != 0).sum())
-                    assert nonzero == 0, (
-                        f"{what}: device {device_idx} has {nonzero} non-zero bf16 values in the {num_non_owned} rows "
+                    expected_bits = before_bits[device_idx].contiguous().view(torch.int16)[~owned]
+                    changed = int((non_owned_bits != expected_bits).sum())
+                    assert changed == 0, (
+                        f"{what}: device {device_idx} changed {changed} bf16 values in the {num_non_owned} rows "
                         "its experts do not own"
                     )
                     passed = validate_combine_torch(
@@ -867,15 +870,20 @@ def _run_moe_compute_single_card_test(
                     assert passed, f"{what}: device {device_idx} owned rows do not match the golden"
                     logger.info(
                         f"{what}: device {device_idx} owned rows ({num_owned}) match the golden, "
-                        f"{num_non_owned} non-owned rows exactly zero"
+                        f"{num_non_owned} non-owned rows untouched"
                     )
 
+            def device_rows(tt_output):
+                return [ttnn.to_torch(t, mesh_composer=None) for t in ttnn.get_device_tensors(tt_output)]
+
             slot_owner = owner_of_slots(expert_indices_flat)
+            zeros = [torch.zeros([selected_experts_k, total_tokens, hidden_size], dtype=torch.bfloat16)] * num_devices
+            ones = [torch.ones([selected_experts_k, total_tokens, hidden_size], dtype=torch.bfloat16)] * num_devices
 
             logger.info("\n========== Running op, op-allocated output ==========")
             allocated_outputs = run_moe_compute_once(None)
             assert len(allocated_outputs) == expected_n, f"expected {expected_n} tensors, got {len(allocated_outputs)}"
-            assert_partial_output(allocated_outputs[5], slot_owner, combine_goldens, "Op-allocated output")
+            assert_partial_output(allocated_outputs[5], slot_owner, combine_goldens, zeros, "Op-allocated output")
             deallocate_l1_moe_compute_outputs(allocated_outputs)
             ttnn.deallocate(allocated_outputs[5])
 
@@ -891,7 +899,10 @@ def _run_moe_compute_single_card_test(
             assert (
                 sentinel_outputs[5].buffer_address() == sentinel_tensor.buffer_address()
             ), "slot 5 must be the caller's optional_output_tensor"
-            assert_partial_output(sentinel_outputs[5], slot_owner, combine_goldens, "Sentinel-filled caller tensor")
+            assert_partial_output(
+                sentinel_outputs[5], slot_owner, combine_goldens, ones, "Sentinel-filled caller tensor"
+            )
+            after_first_routing = device_rows(sentinel_outputs[5])
             deallocate_l1_moe_compute_outputs(sentinel_outputs)
 
             # A routing change: new tokens, indices and scores over the same weights, run through the
@@ -972,7 +983,11 @@ def _run_moe_compute_single_card_test(
                 reused_outputs[5].buffer_address() == sentinel_tensor.buffer_address()
             ), "slot 5 must be the caller's optional_output_tensor"
             assert_partial_output(
-                reused_outputs[5], slot_owner_b, combine_goldens_b, "Caller tensor reused after a routing change"
+                reused_outputs[5],
+                slot_owner_b,
+                combine_goldens_b,
+                after_first_routing,
+                "Caller tensor reused after a routing change",
             )
             deallocate_l1_moe_compute_outputs(reused_outputs)
             for tensor in (sentinel_tensor, tt_input_b, tt_indices_b, tt_scores_b):
@@ -1383,13 +1398,14 @@ def test_moe_compute_multi_device_local_axis(mesh_device, mesh_shape, expect_err
     indirect=True,
 )
 @pytest.mark.parametrize("mesh_shape, mesh_device", [((1, 4), (1, 4))], indirect=["mesh_device"])
-def test_moe_compute_multi_device_local_axis_zero_fills_non_owned_rows(mesh_device, mesh_shape, expect_error):
-    """The local output on a 1x4 mesh is one partial per device whose every row is what the op
-    wrote: the rows of the experts a device holds carry its results and every other row is exactly
-    zero, so the caller sums the partials without a zero-filled sink. Checked on an op-allocated
-    output, on a caller tensor pre-filled with 1.0, and on that tensor reused after a routing
-    change (its rows then hold the previous routing's results). The mesh_device fixture skips this
-    on machines with fewer than four devices."""
+def test_moe_compute_multi_device_local_axis_leaves_non_owned_rows_untouched(mesh_device, mesh_shape, expect_error):
+    """The ownership contract of the local output on a 1x4 mesh: each device writes the rows of the
+    experts it holds and no other row, so the caller's buffer keeps what it held in the rows nobody
+    owns (zero at allocation, finite expert outputs of earlier calls afterwards) and the caller's
+    reduce reads the owned slots only. Checked on an op-allocated output, on a caller tensor
+    pre-filled with 1.0, and on that tensor reused after a routing change (its rows then hold the
+    previous routing's results). The mesh_device fixture skips this on machines with fewer than
+    four devices."""
     if mesh_device.get_num_devices() < 2:
         pytest.skip("the non-owned-row check needs at least two devices")
     hidden_size = 2048
@@ -1410,7 +1426,7 @@ def test_moe_compute_multi_device_local_axis_zero_fills_non_owned_rows(mesh_devi
         compute_only=False,
         op_cluster_axis=0,
         expect_error=expect_error,
-        check_non_owned_rows_zero=True,
+        check_non_owned_rows_untouched=True,
     )
 
 
@@ -1514,19 +1530,12 @@ def test_moe_compute_local_axis_rejects_shared_experts(mesh_device, mesh_shape, 
 
 
 @pytest.mark.parametrize("mesh_shape, mesh_device", [((1, 1), (1, 1))], indirect=["mesh_device"])
-def test_moe_compute_local_output_rejects_four_rings(mesh_device, mesh_shape, expect_error):
-    """prefill_rings admits the replay ring (1) and two or three rings (2, 3); more rings are not implemented and the
-    op says so before any kernel launch."""
-    with expect_error(RuntimeError, r"prefill_rings=4: one replay ring \(1\), two or three rings \(2, 3\)"):
-        _call_moe_compute_for_rejection(mesh_device, cluster_axis=0, zero_fill_non_owned_rows=False, prefill_rings=4)
-
-
-@pytest.mark.parametrize("mesh_shape, mesh_device", [((1, 1), (1, 1))], indirect=["mesh_device"])
-def test_moe_compute_local_output_rejects_zero_fill_with_two_rings(mesh_device, mesh_shape, expect_error):
-    """With two rings the zero fill of the unowned rows would be written by both rings' cores and could land after
-    the other ring's row writes; the op requires zero_fill_non_owned_rows=False (the slab's setting)."""
-    with expect_error(RuntimeError, r"prefill_rings=2: the zero fill of the unowned rows"):
-        _call_moe_compute_for_rejection(mesh_device, cluster_axis=0, zero_fill_non_owned_rows=True, prefill_rings=2)
+def test_moe_compute_local_output_rejects_other_ring_counts(mesh_device, mesh_shape, expect_error):
+    """prefill_rings admits the streaming ring (0) and two or three replica rings (2, 3); one ring with a resident
+    slice and four rings are not forms of the op, and it says so before any kernel launch."""
+    for rings in (1, 4):
+        with expect_error(RuntimeError, rf"prefill_rings={rings}: the streaming ring \(0\) and two or three replica"):
+            _call_moe_compute_for_rejection(mesh_device, cluster_axis=0, prefill_rings=rings)
 
 
 @pytest.mark.parametrize("mesh_shape, mesh_device", [((1, 1), (1, 1))], indirect=["mesh_device"])
@@ -1683,7 +1692,6 @@ def _run_moe_compute_local_output_prefill_test(
     mesh_device,
     tokens,
     routing_case,
-    zero_fill=True,
     sentinel_output=False,
     second_routing_case=None,
     prefill_rings=0,
@@ -1789,9 +1797,8 @@ def _run_moe_compute_local_output_prefill_test(
         return tt_rows, tt_indices, tt_scores, tt_output
 
     def run(tt_rows, tt_indices, tt_scores, tt_output, cluster_axis, rings=prefill_rings):
-        # zero_fill_non_owned_rows and prefill_rings apply to the local output path only; the fused reference
-        # keeps the defaults.
-        fill_kwargs = {} if cluster_axis is None else {"zero_fill_non_owned_rows": zero_fill, "prefill_rings": rings}
+        # prefill_rings applies to the local output path only; the fused reference keeps the default.
+        fill_kwargs = {} if cluster_axis is None else {"prefill_rings": rings}
         return ttnn.experimental.moe_compute(
             tt_rows,
             tt_indices,
@@ -1828,12 +1835,12 @@ def _run_moe_compute_local_output_prefill_test(
 
     reference_bits = fused_reference_bits(indices, scores)
     if sentinel_output:
-        # The caller's buffer holds a sentinel: with the fill the unowned rows come back zero, without it they keep
-        # the sentinel; the owned rows are the reference either way.
+        # The caller's buffer holds a sentinel: the unowned rows keep it (the op writes the owned rows and no other,
+        # the ownership contract); the owned rows are the reference.
         sentinel_bits = torch.tensor(1.0, dtype=torch.bfloat16).view(torch.int16)
         unowned = (indices >= experts_per_device).t().unsqueeze(-1)  # [K, T, 1]
         assert bool(unowned.any()), "the sentinel check needs unowned rows"
-        expected_bits = reference_bits if zero_fill else torch.where(unowned, sentinel_bits, reference_bits)
+        expected_bits = torch.where(unowned, sentinel_bits, reference_bits)
     else:
         expected_bits = reference_bits
 
@@ -1882,7 +1889,7 @@ def _run_moe_compute_local_output_prefill_test(
         ttnn.deallocate(tensor)
 
     if prefill_rings > 0:
-        # The same inputs through the un-replayed op (prefill_rings=0): "the same bits" asserted directly, not only
+        # The same inputs through the streaming ring (prefill_rings=0): "the same bits" asserted directly, not only
         # through the shared 128-token reference.
         call_inputs = upload_call_inputs(hidden, indices, scores, output_fill=1.0 if sentinel_output else 0.0)
         outputs = run(*call_inputs, cluster_axis=0, rings=0)
@@ -1911,86 +1918,71 @@ def _run_moe_compute_local_output_prefill_test(
 )
 @pytest.mark.parametrize("mesh_shape, mesh_device", [((1, 1), (1, 1))], indirect=["mesh_device"])
 @pytest.mark.parametrize(
-    "tokens, routing_case, zero_fill, sentinel_output, second_routing_case, prefill_rings",
+    "tokens, routing_case, sentinel_output, second_routing_case, prefill_rings",
     [
-        (128, "zipf", True, False, None, 0),
-        (512, "zipf", True, False, None, 0),
-        (2048, "zipf", True, False, "random_local", 0),
-        (2048, "zipf", True, True, None, 0),
-        (2048, "zipf", False, True, None, 0),
-        (99, "zipf", True, False, None, 0),
-        (2050, "zipf", True, False, None, 0),
-        (2048, "one_expert", True, False, None, 0),
-        (2048, "uniform_local", True, False, None, 0),
-        (2048, "random_local", True, False, None, 0),
-        (2048, "no_local", True, False, None, 0),
-        (2048, "no_local", False, True, None, 0),
-        # the replay ring: the weight slice read once per expert and replayed per chunk
-        (128, "zipf", True, False, None, 1),
-        (2048, "zipf", False, True, "random_local", 1),
-        (2048, "one_expert", True, False, None, 1),
-        (2048, "random_local", True, False, None, 1),
-        (2048, "no_local", True, False, None, 1),
+        (128, "zipf", False, None, 0),
+        (512, "zipf", False, None, 0),
+        (2048, "zipf", False, "random_local", 0),
+        (2048, "zipf", True, None, 0),
+        (99, "zipf", False, None, 0),
+        (2050, "zipf", False, None, 0),
+        (2048, "one_expert", False, None, 0),
+        (2048, "uniform_local", False, None, 0),
+        (2048, "random_local", False, None, 0),
+        (2048, "no_local", False, None, 0),
+        (2048, "no_local", True, None, 0),
         # two rings: the owner table splits the chunks over a second ring of cores, each ring reading the slices of
-        # the experts it owns chunks of (fill off: one ring's fill would race the other's rows)
-        (128, "zipf", False, False, None, 2),
-        (2048, "zipf", False, True, "random_local", 2),
-        (2048, "one_expert", False, False, None, 2),
-        (2048, "random_local", False, False, None, 2),
-        (2048, "no_local", False, False, None, 2),
+        # the experts it owns chunks of
+        (128, "zipf", False, None, 2),
+        (2048, "zipf", True, "random_local", 2),
+        (2048, "one_expert", False, None, 2),
+        (2048, "random_local", False, None, 2),
+        (2048, "no_local", False, None, 2),
         # three rings: the third ring's cores two cells inside the ring box; chunks split three ways
-        (2048, "zipf", False, True, "random_local", 3),
-        (2048, "one_expert", False, False, None, 3),
-        (2048, "random_local", False, False, None, 3),
+        (2048, "zipf", True, "random_local", 3),
+        (2048, "one_expert", False, None, 3),
+        (2048, "random_local", False, None, 3),
     ],
     ids=[
         "128-zipf",
         "512-zipf",
         "2048-zipf-then-random_local",
-        "2048-zipf-fill-sentinel",
-        "2048-zipf-no_fill-sentinel",
+        "2048-zipf-sentinel",
         "99-zipf",
         "2050-zipf",
         "2048-one_expert",
         "2048-uniform_local",
         "2048-random_local",
         "2048-no_local",
-        "2048-no_local-no_fill-sentinel",
-        "128-zipf-replay",
-        "2048-zipf-no_fill-then-random_local-replay",
-        "2048-one_expert-replay",
-        "2048-random_local-replay",
-        "2048-no_local-replay",
+        "2048-no_local-sentinel",
         "128-zipf-rings2",
-        "2048-zipf-no_fill-then-random_local-rings2",
+        "2048-zipf-sentinel-then-random_local-rings2",
         "2048-one_expert-rings2",
         "2048-random_local-rings2",
         "2048-no_local-rings2",
-        "2048-zipf-no_fill-then-random_local-rings3",
+        "2048-zipf-sentinel-then-random_local-rings3",
         "2048-one_expert-rings3",
         "2048-random_local-rings3",
     ],
 )
 def test_moe_compute_single_card_local_output_prefill(
-    mesh_device, mesh_shape, tokens, routing_case, zero_fill, sentinel_output, second_routing_case, prefill_rings
+    mesh_device, mesh_shape, tokens, routing_case, sentinel_output, second_routing_case, prefill_rings
 ):
     """One local output call over a prefill slab's tokens (Qwen3.8-Flash-Next shape: hidden 2560, N 640, 128 of 512
     experts local, K 10) writes the same pages as the fused local combine over the same rows in 128-token calls,
     bitwise; the per-expert counts are the routing histogram and the packed token lists decode to the golden lists.
     Cases: the natural-text shape at 128 / 512 / 2048 tokens and at counts the four tilize cores split unevenly (99,
     2050); one expert taking every token (a 64-chunk segment); every slot local, uniform (the lists at capacity) and
-    random; and no local pair (an empty call). With a sentinel-filled caller buffer the rows nobody owns come back
-    zero with the fill and keep the sentinel without it (zero_fill_non_owned_rows=False), the owned rows being the
-    reference either way; one row re-runs the cached program on a second routing. The replay rows (prefill_rings=1)
-    keep each expert's weight slice resident for all of its chunks (one expert with 64 chunks, the capacity routing,
-    an empty call) and must give the same bits. The two- and three-ring rows (prefill_rings=2, 3) split the chunks
-    over further rings of cores, each reading the slices of the experts it owns chunks of (Blackhole only), and must
-    give the same bits as one ring, also compared directly against prefill_rings=0 on the same inputs."""
+    random; and no local pair (an empty call). With a sentinel-filled caller buffer the rows nobody owns keep the
+    sentinel (the ownership contract: the op writes the owned rows and no other), the owned rows being the
+    reference; one row re-runs the cached program on a second routing. The two- and three-ring rows (prefill_rings=2,
+    3) split the chunks over further rings of cores, each reading the slices of the experts it owns chunks of
+    (Blackhole only), and must give the same bits as the streaming ring, also compared directly against
+    prefill_rings=0 on the same inputs."""
     _run_moe_compute_local_output_prefill_test(
         mesh_device,
         tokens,
         routing_case,
-        zero_fill=zero_fill,
         sentinel_output=sentinel_output,
         second_routing_case=second_routing_case,
         prefill_rings=prefill_rings,

@@ -45,9 +45,9 @@ candidate row (27.4 ms per token on both model cards; the host sampler's law, ga
   those of the previous base `d04395ed86` of 2026-08-29) plus the runtime fixes the model needs, not on main, without an upstream
   equivalent:
   - moe_compute: `Fix empty-rank moe compute metadata ownership` (the tilize writer; routed experts at batch 1),
-    `skip idle-expert combine sync in moe_compute B=1` (-1.2 ms per token), `Fix fused MoE source buffer double
-    counting`, `Add exact TP4 TTNN component path` (`moe_compute(..., local_combine=True)`, the DRAM-bank-to-worker
-    query; the DRAM-sharded matmul's second reader per bank placed on a 1x4 mesh, 2026-09-16)
+    `Fix fused MoE source buffer double counting`, the local output path's replica rings and packed routing lists
+    (`docs/PREFILL.md`; the DRAM-bank-to-worker query; the DRAM-sharded matmul's second reader per bank placed on a
+    1x4 mesh, 2026-09-16)
   - the all-gather and fabric guards: `Guard all-gather scatter state initialization`, `Preserve ring connections in
     all-gather endpoint guard`, `Fix all-gather endpoint no-target connection access`, `Clear fabric router packet
     tags on teardown`

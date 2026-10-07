@@ -15,12 +15,16 @@ The routed experts' `moe_compute` launch form per instance (every served instanc
 
 | instance | rows per call | form | since |
 |---|---|---|---|
-| decode, the MTP verify rows and drafts, the lanes, the 32-row chunk | 1-32 (one row tile) | local output path, two rings (`QWEN38_MOE_ROWS_FORM`, default `rings2`; `docs/SERVER.md`) | 2026-09-27 |
-| the 128-row chunk (and the MTP layer's 128-row twin) | 128 | local output path, three rings (`MOE_CHUNK_ROWS_FORM` in `ttnn/moe.py`, a constant; the fused local combine before it) | 2026-09-30 |
-| the slab, one call | 256-4096 | local output path, three rings (`QWEN38_MOE_SLAB_RINGS`, default 3; *The routed experts in one call* below) | 2026-09-26 |
+| decode, the MTP verify rows and drafts, the lanes, the 32-row chunk | 1-32 (one row tile) | local output path, two replica rings (`MOE_ROWS_FORM` in `ttnn/moe.py`; `docs/SERVER.md`) | 2026-09-27 |
+| the 128-row chunk (and the MTP layer's 128-row twin) | 128 | local output path, three replica rings (`MOE_CHUNK_ROWS_FORM`; the fused local combine before it) | 2026-09-30 |
+| the slab, one call | 256-4096 | local output path, three replica rings (`MOE_SLAB_ROWS_FORM`; *The routed experts in one call* below) | 2026-09-26 |
 | the slab's blocks (`QWEN38_MOE_SLAB_ONE_CALL=0`) | 128 per block | the 128-row worker's form | -- |
 
-The owned combine pages are bitwise across the forms (the same matmuls in the same order); the 128-row chunk's move to
+Every form is a constant of its launch site (no switch since 2026-10-01; the earlier `QWEN38_MOE_ROWS_FORM` and
+`QWEN38_MOE_SLAB_RINGS` switches and the op's one-ring replay form had no served user).  The op writes the rows of the
+experts a device holds and no other row: the buffer is zero at allocation and only ever holds finite expert outputs,
+which the weighted reduce multiplies by an exact 0 where unowned (the ownership contract, `docs/NUMERICS.md`).  The
+owned combine pages are bitwise across the forms (the same matmuls in the same order); the 128-row chunk's move to
 three rings takes 6-7 percent off the served time to the first token (*Served rates* below).
 
 ## The slab (`--prefill-slab 2048`)
@@ -149,7 +153,7 @@ Memory: the slab state adds about 200 MB per device at 32k (one set of GDN pass 
 the PLE rows, the QSA slab constants and kept rows, the slab trace); the transients inside a layer peak around
 150 MB (about 350 MB at 256k, where the score all-reduce per 512-row block is the largest).
 
-## The routed experts in one call (`QWEN38_MOE_SLAB_ONE_CALL`, `QWEN38_MOE_SLAB_RINGS`)
+## The routed experts in one call (`QWEN38_MOE_SLAB_ONE_CALL`)
 
 Since 2026-09-25 the slab routes all of its rows through one `moe_compute` call per layer (`QWEN38_MOE_SLAB_ONE_CALL`
 unset or `1`) on the op's local output path: each expert's tokens are packed into 32-row chunks once per slab (223
@@ -186,7 +190,7 @@ reduce's fewer, larger k-strided slices of the one-call page); the page costs 12
 (4x p150, 2026-09-25, 32k context, natural-text prompts, `max_tokens` 64, TTFT the request's time to its first token
 and the rate the server's prefill ms per prompt token):
 
-| prompt tokens | 16 x 128-row blocks | one call, one ring (`QWEN38_MOE_SLAB_RINGS=0`) | one call, two rings (the default) |
+| prompt tokens | 16 x 128-row blocks | one call, one ring (the streaming ring) | one call, two rings (the default of 2026-09-25) |
 |---|---|---|---|
 | 2,118 | | 1.59 s / 0.736 | 1.54 s / 0.712 |
 | 2,764 | | 2.40 s / 0.855 | 2.31 s / 0.826 |
@@ -201,11 +205,11 @@ the profiler, 1041.7 ms of kernel time on one ring (1,951 prompt tokens per seco
 1.58 and 1.53 s; the acceptance records, the agreement rows and the completions were identical across the blocks, the
 one ring and the two rings, and the decode after the prefill identical to the lineage's own run.
 
-`QWEN38_MOE_SLAB_RINGS` selects how the one call streams the expert weights; only the one-call slab reads it, the
-32- and 128-row chunks and decode never do.  Three rings are the default since 2026-09-26; `QWEN38_MOE_SLAB_RINGS=2`
-restores two rings (the default of 2026-09-25) and `=0` one ring:
+The one call streams the expert weights over three replica rings (`MOE_SLAB_ROWS_FORM` in `ttnn/moe.py`, a
+constant since 2026-10-01; the `QWEN38_MOE_SLAB_RINGS` switch that selected the count until then is gone).  The ring
+counts measured on the way there, all bitwise with each other:
 
-- `3` (unset): the chunks are split over three rings of cores, each reading the slices of the experts it owns.
+- `3` (the form): the chunks are split over three rings of cores, each reading the slices of the experts it owns.
   Bitwise on the 4-chip line at 32k (the acceptance records, the 3232 agreement columns and the four completions
   identical to the two-ring form's, two runs) and on one die over about 42,500 device-checked calls (captured and
   adversarial routings, every replay compared); TTFT 12.18 s at 31,716 tokens against 12.45 with two rings
@@ -217,8 +221,8 @@ restores two rings (the default of 2026-09-25) and `=0` one ring:
 - `2`: two rings; bitwise on the 4-chip line in three runs; 73.5 ms less kernel time per slab under the profiler than
   one ring (971.4 against 1044.9 ms);
 - `0`: the op's one-ring, three-slot weight stream (the form the one call was first gated with);
-- `1`: one ring with each expert's weight slice read from DRAM once per slab (a replay ring); bitwise the one-ring
-  stream on one die, not measured on the 4-chip line.
+- the one-ring replay form (each expert's weight slice read from DRAM once per slab) was bitwise the one-ring stream
+  on one die and never faster; it left the op on 2026-10-01.
 
 ## Served rates
 
@@ -380,8 +384,8 @@ models/demos/blackhole/qwen38_flash_next/tools/run_qwen38_chat_server.sh --profi
 
 The first start compiles the slab body's programs in the warm pass (an eager slab from the reset state) and captures
 its trace after the 128-row chunk trace; `/health` reports `prefill_slab_rows`.  `QWEN38_MOE_SLAB_ONE_CALL=0` in the
-server's environment restores the 16 x 128-row expert calls, `QWEN38_MOE_SLAB_RINGS=2` (or `0`) restores two (one)
-rings for the one call; both are read when the slab's layer instances are built, so they take effect at the next start.
+server's environment restores the 16 x 128-row expert calls; it is read when the slab's layer instances are built, so
+it takes effect at the next start.  The one call's ring count is a constant (three replica rings), not a switch.
 
 ### The dense-linear switches
 

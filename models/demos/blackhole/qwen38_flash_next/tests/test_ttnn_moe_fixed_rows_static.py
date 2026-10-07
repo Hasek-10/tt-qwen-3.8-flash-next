@@ -17,16 +17,15 @@ import torch
 
 import models.demos.blackhole.qwen38_flash_next.ttnn.builder as builder_module
 import models.demos.blackhole.qwen38_flash_next.ttnn.moe as moe_module
-from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import TensorPlacement
-import ttnn
 from models.demos.blackhole.qwen38_flash_next.ttnn import decode_matmul as decode_matmul_module
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import TensorPlacement
 from models.demos.blackhole.qwen38_flash_next.ttnn.moe import (
     BLACKHOLE_MOE_NUMERIC_ISSUE,
     EXPERTS_PER_DEVICE,
     HIDDEN_SIZE,
     MOE_STAGE_FENCES,
-    ROUTED_EXPERTS,
     PREFILL_CHUNK_ROWS,
+    ROUTED_EXPERTS,
     ROWS5_HARDWARE_PROVEN,
     ROWS32_HARDWARE_PROVEN,
     SUPPORTED_ROWS,
@@ -80,7 +79,6 @@ def _bare_moe(rows: int) -> Qwen38TTNNMoE:
         layout=moe_module.ttnn.ROW_MAJOR_LAYOUT,
         memory=moe_module.ttnn.DRAM_MEMORY_CONFIG,
     )
-    instance.local_output = False  # the production path: FullLocal (QWEN38_MOE_LOCAL_OUTPUT unset)
     instance._owned_buffers_released = False
     instance._owns_local_combine_output = True
     instance.output_height_shard_dim = 1
@@ -99,70 +97,47 @@ def _attribute_call(tree: ast.AST, name: str) -> list[ast.Call]:
     ]
 
 
-def test_rows_form_switch(monkeypatch) -> None:
-    """QWEN38_MOE_ROWS_FORM (unset = rings2): the one-tile rows forms' moe_compute launch form.  rings2 = the local output
-    path with two rings (the default since 2026-09-27: per launch 42.0 + 10.87 n -> 36.1 + 7.39 n us over n distinct
-    local experts on the 1x4 p150 line, the combine pages bitwise the FullLocal form); fulllocal = the fused local
-    combine (the fallback); localoutput / replay / rings3 diagnostics.  Only one-tile rows instances read it; a ring
-    count of two or more turns the op's zero fill off (the model's fill before every call keeps the unowned rows zero).
+def test_rows_form_constants() -> None:
+    """The routed experts' moe_compute launch form is a constant per launch site, no switch: every instance runs the
+    op's local output path, two replica rings for the one-tile rows (rows 1..32: decode, the MTP verify rows and
+    drafts, the lanes, the 32-row chunk; the law 36.1 + 7.39 n us per launch on the 1x4 p150 line, 2026-09-27),
+    three for the 128-row chunk (2026-09-30) and the one-call slab (2026-09-26).  The op never writes the rows of the
+    experts a device does not hold (the ownership contract); the plain path's fill before every call stays for the
+    one-tile rows.
     """
 
-    assert moe_module.MOE_ROWS_FORM_ENV == "QWEN38_MOE_ROWS_FORM"
-    assert moe_module.MOE_ROWS_FORM_DEFAULT == "rings2"
-    assert moe_module.MOE_ROWS_FORMS == {
-        "fulllocal": (False, None),
-        "localoutput": (True, None),
-        "replay": (True, 1),
-        "rings2": (True, 2),
-        "rings3": (True, 3),
-    }
-    monkeypatch.delenv(moe_module.MOE_ROWS_FORM_ENV, raising=False)
-    assert moe_module.moe_rows_form() == "rings2"
-    for form in moe_module.MOE_ROWS_FORMS:
-        monkeypatch.setenv(moe_module.MOE_ROWS_FORM_ENV, form)
-        assert moe_module.moe_rows_form() == form
-    monkeypatch.setenv(moe_module.MOE_ROWS_FORM_ENV, "rings4")
-    with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
-        moe_module.moe_rows_form()
-    monkeypatch.delenv(moe_module.MOE_ROWS_FORM_ENV)
-    # the instance: one-tile rows read the switch, the 128-row chunk takes MOE_CHUNK_ROWS_FORM (three rings, no
-    # switch), every other instance is fulllocal there; the local output path and the kwargs follow the table
-    assert moe_module.MOE_CHUNK_ROWS_FORM == "rings3" and moe_module.MOE_CHUNK_ROWS_FORM in moe_module.MOE_ROWS_FORMS
+    assert moe_module.MOE_ROWS_FORM == "rings2"
+    assert moe_module.MOE_CHUNK_ROWS_FORM == "rings3"
+    assert moe_module.MOE_SLAB_ROWS_FORM == "rings3"
+    assert moe_module.MOE_ROWS_FORMS == {"rings2": 2, "rings3": 3}
+    assert not hasattr(moe_module, "MOE_ROWS_FORM_ENV") and not hasattr(moe_module, "moe_rows_form")
+    assert not hasattr(moe_module, "MOE_SLAB_RINGS_ENV") and not hasattr(moe_module, "moe_slab_prefill_rings")
+    assert not hasattr(moe_module, "MOE_LOCAL_OUTPUT_ENV") and not hasattr(moe_module, "moe_local_output_enabled")
+    # the instance: the one-tile rows, the 128-row chunk and the slab take their site's constant
     init = inspect.getsource(Qwen38TTNNMoE.__init__)
-    assert "if self.row_contract.row_tiles == 1:\n            self.rows_form = moe_rows_form()" in init
-    assert "elif self.rows == LONG_PREFILL_CHUNK_ROWS:\n            self.rows_form = MOE_CHUNK_ROWS_FORM" in init
-    assert 'else:\n            self.rows_form = "fulllocal"' in init
-    assert (
-        "self.local_output = moe_local_output_enabled() or self.slab_one_call or MOE_ROWS_FORMS[self.rows_form][0]"
-        in init
-    )
-    # every moe_compute launch of the class passes the form's kwargs: the plain path (_routed_partial), the served
-    # routing-in-L1 path (_routed_local_sum, the decode and MTP verify rows) and the 128-row form's tiles
+    assert "self.rows_form = moe_rows_form_for(self.rows)" in init
+    assert "return MOE_ROWS_FORMS[moe_rows_form_for(self.rows)]" in inspect.getsource(Qwen38TTNNMoE.prefill_rings.fget)
+    # every moe_compute launch of the class passes the form's ring count and nothing else of the retired knobs: the
+    # plain path (_routed_partial), the served routing-in-L1 path (_routed_local_sum, the decode and MTP verify rows)
+    # and the 128-row form's tiles
     for launch in (Qwen38TTNNMoE._routed_partial, Qwen38TTNNMoE._routed_local_sum, Qwen38TTNNMoE._routed_partial_tiles):
         source = inspect.getsource(launch)
         assert source.count("ttnn.experimental.moe_compute(") == 1, launch.__name__
-        assert "local_combine=not self.local_output," in source, launch.__name__
-        assert "zero_fill_non_owned_rows=self.zero_fill_non_owned_rows," in source, launch.__name__
+        assert "cluster_axis=LOCAL_COMBINE_AXIS," in source, launch.__name__
         assert "prefill_rings=self.prefill_rings," in source, launch.__name__
+        assert "local_combine=" not in source and "zero_fill" not in source, launch.__name__
     partial = inspect.getsource(Qwen38TTNNMoE._routed_partial)
-    zero_fill = inspect.getsource(Qwen38TTNNMoE.zero_fill_non_owned_rows.fget)
-    assert 'return (MOE_ROWS_FORMS[getattr(self, "rows_form", "fulllocal")][1] or 0) < 2' in zero_fill
-    for rows, form, rings, local_output, zero_fill_expected in (
-        (1, "rings2", 2, True, False),
-        (5, "rings2", 2, True, False),
-        (5, "fulllocal", None, False, True),
-        (5, "localoutput", None, True, True),
-        (5, "replay", 1, True, True),
-        (32, "rings3", 3, True, False),
-        (128, moe_module.MOE_CHUNK_ROWS_FORM, 3, True, False),
+    for rows, form, rings in (
+        (1, "rings2", 2),
+        (5, "rings2", 2),
+        (32, "rings2", 2),
+        (128, "rings3", 3),
+        (2048, "rings3", 3),
     ):
-        instance = _bare_moe(rows)
-        instance.rows_form = form
-        instance.local_output = moe_module.MOE_ROWS_FORMS[form][0]
-        assert instance.prefill_rings == rings
-        assert instance.local_output is local_output
-        assert instance.zero_fill_non_owned_rows is zero_fill_expected
-    # the fill before every call stays for every one-tile rows form (the unowned rows of a rings form are zero by it)
+        assert moe_module.moe_rows_form_for(rows) == form and moe_module.MOE_ROWS_FORMS[form] == rings
+    for rows in (1, 5, 32, 128):
+        assert _bare_moe(rows).prefill_rings == moe_module.MOE_ROWS_FORMS[moe_module.moe_rows_form_for(rows)]
+    # the fill before every call stays on the plain path for the one-tile rows forms
     assert "if self.rows != LONG_PREFILL_CHUNK_ROWS and not self.slab_one_call:" in partial
     assert "ttnn.fill(self.local_combine_output, 0.0, output_tensor=self.local_combine_output)" in partial
 
@@ -564,7 +539,11 @@ def test_routed_partial_uses_the_exact_row_shapes_and_weight_ownership(rows: int
     assert moe_compute_call["kwargs"]["output_height_shard_dim"] == 1
     assert moe_compute_call["kwargs"]["cluster_axis"] == 0
     assert moe_compute_call["kwargs"]["compute_only"] is False
-    assert moe_compute_call["kwargs"]["local_combine"] is True
+    assert moe_compute_call["kwargs"]["prefill_rings"] == 2  # the one-tile rows form: two replica rings
+    assert (
+        "local_combine" not in moe_compute_call["kwargs"]
+        and "zero_fill_non_owned_rows" not in moe_compute_call["kwargs"]
+    )
     assert moe_compute_call["kwargs"]["num_shared_experts_per_device"] == 0
 
     fast_input, fast_indices = fast_reduce_call["args"][:2]
@@ -799,9 +778,16 @@ def test_pinned_ttnn_source_contracts_match_the_five_row_choreography() -> None:
     assert "const uint32_t total_tokens = input_shape[0] * input_shape[1];" in moe_source
     assert ".seq_size = total_tokens" in moe_source
     assert "path=FullLocal requires combine_params->local_combine to be true" in moe_source
-    # the replicated-input contract holds on a multi-device mesh; a 1x1 mesh has nothing to replicate
+    # the fused local combine is the 1x1 form only (as upstream has it); the served form is the local output path on a
+    # mesh axis of extent 1, whose replicated-input contract holds on a multi-device mesh (a 1x1 mesh has nothing to
+    # replicate)
+    assert "path=FullLocal is only supported on a 1x1 mesh" in moe_source
     assert "if (mesh_device->num_devices() > 1) {" in moe_source
-    assert "path=FullLocal on a multi-device mesh requires a fully replicated logical-token input " in moe_source
+    assert "moe_compute over a mesh axis of extent 1 on a multi-device mesh requires a fully " in moe_source
+    assert (
+        "local_combine ="
+        not in moe_source.split("combine_params->local_combine")[0].split("std::vector<ttnn::Tensor> moe_compute(")[-1]
+    )
 
     reduce_source = (
         REPO_ROOT / "ttnn/cpp/ttnn/operations/experimental/reduction/deepseek_moe_fast_reduce_nc_fused/device/"

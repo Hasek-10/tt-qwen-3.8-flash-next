@@ -21,6 +21,68 @@ Every number here was measured on 4x p150 unless a date and host say otherwise.
   packer), and every start re-packs one routed expert of the first cached layer from the checkpoint and compares the
   bytes with the cache; a cache converted by different code is refused (`SERVER.md`).
 
+## The moe_compute consolidation, package 1: the study instrumentation and the dead options leave the op (2026-10-01)
+
+The op's delta against upstream shrinks to what every served form uses (the packed routing lists, the replica rings
+with their chunk ownership, the handshake-once exchange with its backpressure credit, the pipelined tilize feed, the
+compact expert layout).  Two commits, one kit, the served programs unchanged in what they compute and in which order:
+
+- the study instrumentation (the per-chunk profiler zones, the feed-protocol delays and fault points, the two
+  environment knobs of the program factory that built them) leaves the served kernel sources; it is a study patch
+  beside the development tools, applied to a study tree before the runtime is built.  The defines compiled to nothing
+  in every served kernel: the compiled tilize kernels (reader, writer, compute) of every served program are
+  instruction-for-instruction identical to the kit of record's (16 of 16 paired programs over the three ring kernels'
+  companions; the ring kernels themselves are compared below after the second commit folded their lambdas back);
+- the dead options leave: the one-ring replay form (`prefill_rings=1`, never faster than the streaming ring), the zero
+  fill of the unowned rows with its argument, dm1's fill loop and the pre-zeroed CB, the explicit `local_combine`
+  (the fused local combine is the implicit 1x1 form again, as upstream has it), the idle-expert combine handshake skip
+  in dm1 and the combine writer (the FullCcl path keeps the stock handshake), and the a2a pipeline overlap of the
+  streaming ring (its parity slots, third feed half and fourth weight block).  The model's launch form is one constant
+  per launch site (`MOE_ROWS_FORM` rings2 for the one-tile rows, `MOE_CHUNK_ROWS_FORM` and `MOE_SLAB_ROWS_FORM`
+  rings3), the `QWEN38_MOE_ROWS_FORM`, `QWEN38_MOE_SLAB_RINGS` and `QWEN38_MOE_LOCAL_OUTPUT` switches are gone and
+  the READY record names the three forms.
+
+**The ownership contract** (what the zero fill's removal rests on).  The op writes the rows of the experts the device
+holds and no other row of the `[10, rows, 2560]` buffer.  Every served instance already lived by it: the buffer is zero
+at allocation and only ever holds finite expert outputs, and the weighted reduce (`deepseek_moe_fast_reduce_nc_fused`
+with the expert indices and mapping) reads the owned slots and multiplies the unowned ones by an exact 0.  A NaN or
+Inf left in a slot would poison the sum, which is why the sentinel rows of the op test stay (the unowned rows keep
+whatever the buffer held, bit for bit) and the finite-output check runs at every bench point.
+
+**One die (the A/B bench of the upstream review, one p150, 8-bank ring; before = the kit of record 33b23a205b97 through
+the tree at 4fe7997e1cb4, after = the package kit):** at every one of the 42 points (rows 5 / 20 / 32 with n = 3 / 5 /
+8 / 13 distinct local experts on the streaming ring, two and three rings; the 2048-row layer at Zipf routings over 128
+and over 512 experts) the output bytes are identical before and after (sha256, eager and traced replay), identical
+across the three forms, finite, non-zero in the owned rows and zero in the unowned rows.  Device-bound per-launch time
+(50 traced replays, one synchronize; the host-wall medians moved with the host's 1-minute load, 5 in the before arm and
+16-28 in the after arm, so the batched figure is the one to read):
+
+| form | rows 5, n = 8 | rows 20, n = 8 | rows 32, n = 8 | 2048-row layer, E 128 (705 chunks) | E 512 (231 chunks) |
+|---|---|---|---|---|---|
+| two rings (the one-tile rows) | 110.5 -> 109.5 us | 119.1 -> 118.8 | 123.1 -> 124.3 | 5.745 -> 5.739 ms | 2.019 -> 2.018 |
+| three rings (the chunk and the slab) | 110.7 -> 111.2 | 118.6 -> 118.7 | 123.8 -> 123.2 | 4.977 -> 4.987 | 1.855 -> 1.854 |
+| streaming ring (no served user; the pipeline left) | 134.3 -> 139.1 | 141.7 -> 148.2 | 147.2 -> 152.8 | 8.828 -> 9.327 | 3.208 -> 3.052 |
+
+The served forms are unchanged within 1 percent (the noise of the bench); the streaming ring lost the pipeline's 3-4
+percent, as the review's A/B had measured it, and nothing served runs it.  The before arm re-run at a 1-minute host load of 1.9 (the rows of record for that arm) repeats the table within 1 us per point: two rings 110.4 / 120.0 / 123.1 us, three rings 110.5 / 118.4 / 123.5, the layer 5.744 and 4.990 ms; the after arm's quiet re-run (a 1-minute load of 1.96) gives two rings 109.7 / 117.8 / 122.9 us, three rings 110.3 / 118.4 / 123.4, and the 2048-row layer 5.743 and 2.016 ms with two rings, 4.988 and 1.854 with three, every point's sha256 identical to the before arm's (42 of 42) -- so the rows of record are a quiet pair on both arms, and the table above (the matched-load first pass) is the same picture at a louder host.
+
+**The line (1x4 p150, 32k, the package kit):** the acceptance replays are identical to their pins by divergence index
+and token-id digest: `A3-mtp4-32k` 12/12, `A3-chunked-32k` 12/12 with the `json` record 96/96, `A3-slab2048-mtp4-32k`
+13/13, the lanes (`--lanes 4 --mtp 4`) 12/12, the vision gate's four fixtures and its controls at their pinned
+divergences (7/7 verdicts).  The READY record names the three forms (`rings2`, `rings3`, `rings3`) and no retired
+field.  Chunked TTFT (2120 / 6877 / 31735 prompt tokens, medians of three): before 2.620 / 8.009 / 36.804 s at a 1-minute
+host load of 9-18, after 2.802 / 8.225 / 36.695 s at a load of 26-42 (+7.0 / +2.7 / -0.3 percent; the short prompts'
+TTFT follows the host load, so the after arm was re-run in the before arm's load class: both arms at a launch load of 6-9, medians of three: before 2.620 / 8.009 / 36.80 s, after 2.603 / 7.978 / 36.54 s, -0.6 / -0.4 / -0.7 percent, within the 1 percent bar).
+
+**The pass pair (chat560 greedy `--mtp 4`, 60 pipelined passes, the pass wall over 107 steady passes):** an
+informational pair first (both arms launched under a loaded host, 1-minute loads 5.5 and 19.3, the masked test set
+running): before p50 43.305 / p90 44.725 ms with the device-bound readback at 40.266 ms, after 42.201 / 43.122 with the
+readback at 40.100 ms, 2.8426 tokens per pass on both (307 tokens in 108 passes), so the device term is unchanged within
+noise and the walls' difference is the host's.  The rows of record (both arms launched at a 1-minute load under 2, no
+test set running, minutes apart): not run; the host did not quiet while the test set and other sessions ran, and the landing does not rest on it (the package removes code with no served user and claims no performance change: the proofs are the bitwise ones above and the identity of what is computed).  A quiet pass pair is owed as a post-landing check; a regression over 0.15 ms at p50 at matched quiet loads reverts the package.
+
+The masked no-device set at the package head: 79 failed, 5135 passed, 784 skipped (the failed list identical to the baseline's 79: 0 new, 0 gone, all development tests) (the host had 113 GB free at the verdict).
+
 ## The served tokenizer is `tokenizer.json` (2026-09-30)
 
 The chat template loader built its tokenizer through `AutoTokenizer`, which hands the checkpoint to the class

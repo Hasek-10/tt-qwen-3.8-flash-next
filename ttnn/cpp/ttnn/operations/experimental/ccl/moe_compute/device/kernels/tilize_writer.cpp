@@ -548,13 +548,8 @@ void kernel_main() {
         uint32_t num_expert_chunks = (num_expert_tokens + tokens_per_chunk - 1) / tokens_per_chunk;
 
         for (uint32_t chunk = 0; chunk < num_expert_chunks; chunk++) {
-            // Study zones (MOE_ZONES): this chunk's phases, recorded inside the profiler window only
-            const bool zone_on = moe_ring::zones::in_window(num_chunks_sent);
-            {
-                // Wait for compute to push this chunk's slot (its tiles_per_local_chunk tiles at the slot's start)
-                MOE_ZONE_IF(zone_on, "mz_w_tilized");
-                cb_tilize_output.wait_front(chunk_slot_pages);
-            }
+            // Wait for compute to push this chunk's slot (its tiles_per_local_chunk tiles at the slot's start)
+            cb_tilize_output.wait_front(chunk_slot_pages);
             uint32_t l1_read_addr = cb_tilize_output.get_read_ptr();
 
             /*
@@ -585,13 +580,8 @@ void kernel_main() {
             // gather into the drain's staging slot is gated by the slot rule (== 3b ==) and their own staging CB.
             if (num_chunks_sent >= chunk_halves && is_drain_tilize_core) {
                 // every ring core has consumed the chunk that last used this half (credits are cumulative per half)
-                {
-                    MOE_ZONE_IF(zone_on, "mz_w_half");
-                    if constexpr (!MOE_STUDY_FAULT(X_DRAIN_NO_HALF_WAIT)) {
-                        noc_semaphore_wait_min(
-                            half_free_sem_ptr[chunk_half], num_matmul_cores * half_chunks_landed[chunk_half]);
-                    }
-                }
+                noc_semaphore_wait_min(
+                    half_free_sem_ptr[chunk_half], num_matmul_cores * half_chunks_landed[chunk_half]);
                 if constexpr (two_mcasters) {
                     // the secondary multicaster writes into this half too: pass the credit on (one count per chunk)
                     noc_semaphore_inc(secondary_half_ok_noc_addr, 1, noc_index);
@@ -602,42 +592,32 @@ void kernel_main() {
             if (is_drain_tilize_core || secondary_role) {
                 // == 5 ==
                 // wait until the group's other cores' sub-chunks landed in this chunk's slot (per-slot counts)
-                {
-                    MOE_ZONE_IF(zone_on, "mz_w_gather");
-                    slot_gathers[chunk_half] += 1;
-                    noc_semaphore_wait_min(gather_sem_ptr[chunk_half], own_group_others * slot_gathers[chunk_half]);
-                }
+                slot_gathers[chunk_half] += 1;
+                noc_semaphore_wait_min(gather_sem_ptr[chunk_half], own_group_others * slot_gathers[chunk_half]);
                 if (secondary_role && num_chunks_sent >= chunk_halves) {
                     // the drain has seen this chunk's input half credited (== 1 ==)
-                    MOE_ZONE_IF(zone_on, "mz_w_half_ok");
                     half_ok_sem.wait_min(num_chunks_sent + 1 - chunk_halves);
                 }
 
-                MOE_STUDY_DELAY(W_BEFORE_MCAST);
                 // == 6 ==
                 // mcast this group's tiles of the chunk into the ring cores' half (linked, this multicaster's NoC)
-                {
-                    MOE_ZONE_IF(zone_on, "mz_w_mcast");
-                    noc_async_write_linked_multicast(
-                        mcast_noc_obj,
-                        l1_read_addr,
-                        mcast_dest_addr[chunk_half],
-                        bytes_to_mcast,
-                        matmul_bounding_box_num_cores);
-                }
+                noc_async_write_linked_multicast(
+                    mcast_noc_obj,
+                    l1_read_addr,
+                    mcast_dest_addr[chunk_half],
+                    bytes_to_mcast,
+                    matmul_bounding_box_num_cores);
                 if constexpr (two_mcasters) {
                     if (secondary_role) {
                         // == 7 ==
                         // the drain signals the MM cores on NoC1: this multicast (NoC0) must have landed first
                         noc_alt_obj.async_write_barrier();
-                        MOE_STUDY_DELAY(W_SECONDARY_BEFORE_INC);
                         // Device 2.0 migration: legacy primitive retained: the drain's count is a precomposed
                         // uint64_t NoC address (tilize_chunk_ready_drain_semaphore_noc_addr)
                         noc_semaphore_inc(tilize_chunk_ready_drain_semaphore_noc_addr, 1, noc_index);
                     } else {
                         // == 8 ==
                         // wait for the secondary's half of this chunk (cumulative count)
-                        MOE_ZONE_IF(zone_on, "mz_w_second_half");
                         tilize_chunk_ready_sem.wait_min(num_chunks_sent + 1);
                     }
                 }
@@ -650,12 +630,8 @@ void kernel_main() {
                 // the multicaster's slot for this chunk was last used by chunk num_chunks_sent - chunk_halves, popped
                 // before the drain multicast the chunk after it (the drain's count follows the secondary's, == 8 ==)
                 if (num_chunks_sent + 2 > chunk_halves) {
-                    MOE_ZONE_IF(zone_on, "mz_w_go_wait");
-                    if constexpr (!MOE_STUDY_FAULT(X_GATHER_NO_GO_WAIT)) {
-                        feed_go_sem.wait_min(num_chunks_sent + 2 - chunk_halves);
-                    }
+                    feed_go_sem.wait_min(num_chunks_sent + 2 - chunk_halves);
                 }
-                MOE_STUDY_DELAY(W_GATHER_BEFORE_WRITE);
                 noc_alt_obj.async_write(
                     CoreLocalMem<uint32_t>(l1_read_addr),
                     UnicastEndpoint{},
@@ -666,7 +642,6 @@ void kernel_main() {
                      .addr = gather_addr});
                 noc_alt_obj.async_write_barrier();
 
-                MOE_STUDY_DELAY(W_GATHER_BEFORE_INC);
                 // == 4 ==
                 // increment the multicaster's gather count of this slot (same NoC as the data)
                 // Device 2.0 migration: legacy primitive retained: the per-slot gather count is a precomposed
@@ -674,54 +649,43 @@ void kernel_main() {
                 noc_semaphore_inc(gather_sem_alt_noc_addr[chunk_half], 1, 1 - noc_index);
             }
 
-            {
-                MOE_ZONE_IF(zone_on, "mz_w_signal");
-                if (is_drain_tilize_core) {
-                    MOE_STUDY_DELAY(W_BEFORE_SIGNAL);
-                    // == 9 ==
-                    // signal to MM cores that entire chunk has arrived
+            if (is_drain_tilize_core) {
+                // == 9 ==
+                // signal to MM cores that entire chunk has arrived
 
-                    // set local value
-                    matmul_chunk_ready_sem.set(matmul_chunk_ready_semaphore_set_value);
-                    matmul_chunk_ready_semaphore_set_value++;
+                // set local value
+                matmul_chunk_ready_sem.set(matmul_chunk_ready_semaphore_set_value);
+                matmul_chunk_ready_semaphore_set_value++;
 
-                    // mcast sem set
+                // mcast sem set
+                set_multicast_safe(
+                    matmul_chunk_ready_sem,
+                    noc_obj,
+                    matmul_mcast_start_x,
+                    matmul_mcast_start_y,
+                    matmul_mcast_end_x,
+                    matmul_mcast_end_y,
+                    matmul_bounding_box_num_cores);
+
+                // == 10 ==
+                if constexpr (two_mcasters) {
+                    // the count of chunks multicast (this one included): the gathering cores send chunk m into
+                    // their multicaster once it reaches m + 2 - chunk_halves (the slot m % chunk_halves is free)
+                    feed_go_sem.set(num_chunks_sent + 1);
                     set_multicast_safe(
-                        matmul_chunk_ready_sem,
+                        feed_go_sem,
                         noc_obj,
-                        matmul_mcast_start_x,
-                        matmul_mcast_start_y,
-                        matmul_mcast_end_x,
-                        matmul_mcast_end_y,
-                        matmul_bounding_box_num_cores);
-
-                    // == 10 ==
-                    if constexpr (two_mcasters) {
-                        MOE_STUDY_DELAY(W_BEFORE_GO);
-                        // the count of chunks multicast (this one included): the gathering cores send chunk m into
-                        // their multicaster once it reaches m + 2 - chunk_halves (the slot m % chunk_halves is free)
-                        feed_go_sem.set(num_chunks_sent + 1);
-                        set_multicast_safe(
-                            feed_go_sem,
-                            noc_obj,
-                            tilize_mcast_start_x,
-                            tilize_mcast_start_y,
-                            tilize_mcast_end_x,
-                            tilize_mcast_end_y,
-                            tilize_bounding_box_num_cores - 1);
-                    }
+                        tilize_mcast_start_x,
+                        tilize_mcast_start_y,
+                        tilize_mcast_end_x,
+                        tilize_mcast_end_y,
+                        tilize_bounding_box_num_cores - 1);
                 }
             }
 
-            {
-                // we already barrier when using (1 - noc_index), so just need to flush on noc_index here
-                MOE_ZONE_IF(zone_on, "mz_w_flush");
-                if constexpr (!MOE_STUDY_FAULT(X_DRAIN_NO_FLUSH)) {
-                    noc_obj.async_writes_flushed();
-                }
-            }
+            // we already barrier when using (1 - noc_index), so just need to flush on noc_index here
+            noc_obj.async_writes_flushed();
 
-            MOE_STUDY_DELAY(W_BEFORE_POP);
             // pop this chunk's slot (the next chunk may already be tilized into the next slot)
             cb_tilize_output.pop_front(chunk_slot_pages);
             half_chunks_landed[chunk_half] += 1;
