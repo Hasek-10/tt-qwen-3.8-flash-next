@@ -21,21 +21,22 @@ namespace ttnn::experimental::prim {
 // Mode selector for the moe_compute op.
 // - `FullCcl` runs the production multi-device pipeline (matmul + fused
 //   selective_reduce_combine over fabric). Requires a cluster_axis of extent > 1; CCL options apply.
-// - `FullLocal` runs a single-device fused pipeline (matmul + local combine) with no
+// - `SingleDevice` runs a single-device fused pipeline (matmul + local combine) with no
 //   CCL/fabric. Used on a 1x1 mesh with cluster_axis=None. Returns 6 tensors like FullCcl.
-// - `LocalOutput` runs on a cluster_axis of extent 1 (a 1x1 mesh with an explicit axis, or axis
+// - `SingleCluster` runs on a cluster_axis of extent 1 (a 1x1 mesh with an explicit axis, or axis
 //   0 of a 1xN expert-parallel mesh): there is nothing to combine, so no combine kernels are
 //   built and moe_compute's own writer (dm1) writes each expert's token rows straight into the
 //   final [k, T, H] row-major output (one token row per page: INTERLEAVED or HEIGHT_SHARDED,
 //   DRAM or L1). No fabric; the CCL options are accepted and unused. On a
 //   multi-device mesh the token set and its routing metadata must be replicated and every
-//   coordinate returns the partial of its own experts (their rows hold the results, every other
-//   row is written as zero), which the caller sums across the other axis. Returns 6 tensors like
-//   FullCcl, but slot 4 (the staged matmul output) is not written: nothing is staged.
+//   coordinate writes only the rows of its own experts, like the combine; a caller that sums the
+//   partials across the other axis passes a zeroed output tensor. Returns 6 tensors like
+//   FullCcl, but slot 4 (the staged matmul output) is not written: nothing is staged; slots 1 and 2
+//   are a placeholder and the packed (token, k) lists (moe_ring::token_list).
 //   `combine_params` only describes the output (k, tokens, hidden, memory config, axis).
 // - `ComputeOnly` bypasses the combine path: no combine cores allocated, no fabric setup,
 //   no global semaphores; op emits 5 tensors instead of 6 (matmul_output is the final output).
-enum class MoEComputePath : uint8_t { FullCcl = 0, FullLocal = 2, ComputeOnly = 1, LocalOutput = 3 };
+enum class MoEComputePath : uint8_t { FullCcl = 0, SingleDevice = 2, ComputeOnly = 1, SingleCluster = 3 };
 
 struct MoEComputeParams {
     // MoE compute attributes
@@ -55,9 +56,6 @@ struct MoEComputeParams {
     // Ring size in matmul cores. On WH this is always 12 (DRAM banks), so keep the
     // field initializer at the WH-neutral default. On BH, invoke() resolves this to
     // the live DRAM-bank count (7 or 8) from the bh_ring_size op kwarg.
-    // num_data_parallel_cores is auto-derived ring-aware (largest d | hidden_tiles
-    // with d<=4 and ring_n % d == 0). Stored in attributes() so the program cache
-    // distinguishes different ring sizes within the same session.
     uint32_t bh_ring_size = 12;
 
     // nullopt if path == MoEComputePath::ComputeOnly
@@ -66,12 +64,12 @@ struct MoEComputeParams {
     ttnn::experimental::prim::detail::MoEActivationFunction activation_type =
         ttnn::experimental::prim::detail::MoEActivationFunction::SILU;  // Default to SILU
 
-    // LocalOutput only. 0: the streaming ring (the weight CB holds 3 blocks, dm0 re-streams an expert's slice from
-    // DRAM for every 32-token chunk). 2, 3: that many replica rings of cores, the chunks split over them by one
-    // owner table (moe_ring::rings::ChunkOwners); each ring core keeps one whole expert slice resident and reads it
-    // once per owned expert. The compute kernel and its arithmetic are the same on every form, so the pages are the
-    // same. The rows of the experts a coordinate does not own are never written (the caller owns the buffer).
-    uint32_t prefill_rings = 0;
+    // CLAMPED_SILU only: silu(min(gate, limit)) * clamp(up, -limit, limit). Zero for other activations.
+    float activation_limit = 0.0f;
+
+    // Expert matmuls and activation. math_approx_mode and dst_full_sync_en stay fixed by the kernel.
+    tt::tt_metal::MathFidelity math_fidelity = tt::tt_metal::MathFidelity::LoFi;
+    bool fp32_dest_acc_en = false;
 
     // Same value as combine_params->axis (single source of truth when combine_params is set).
     // ComputeOnly path returns nullopt; Full-path call-sites must unwrap with .value().
@@ -82,7 +80,7 @@ struct MoEComputeParams {
     auto attributes() const {
         using ttsl::reflection::Attribute;
         std::vector<std::tuple<std::string, Attribute>> attrs;
-        attrs.reserve(12);
+        attrs.reserve(14);
         attrs.emplace_back("layer_id", layer_id);
         attrs.emplace_back("output_height_shard_dim", output_height_shard_dim);
         attrs.emplace_back("intermediate_size", intermediate_size);
@@ -94,7 +92,9 @@ struct MoEComputeParams {
         attrs.emplace_back("bh_ring_size", bh_ring_size);
         attrs.emplace_back("combine_params", combine_params);
         attrs.emplace_back("activation_type", static_cast<uint32_t>(activation_type));
-        attrs.emplace_back("prefill_rings", prefill_rings);
+        attrs.emplace_back("activation_limit", activation_limit);
+        attrs.emplace_back("math_fidelity", static_cast<uint32_t>(math_fidelity));
+        attrs.emplace_back("fp32_dest_acc_en", fp32_dest_acc_en);
         return attrs;
     }
 };
@@ -107,6 +107,10 @@ struct MoEComputeInputs {
     const ttnn::Tensor& matmul_w0_w1_tensor;
     const ttnn::Tensor& matmul_w2_tensor;
     const std::optional<ttnn::Tensor>& optional_output_tensor;
+    // expert rows: the expert-row program's row buffer and routing table (MoEComputePlaceFactory), on the local output
+    // its packed (token, k) lists (output 2) and per-expert counts; empty for the ring
+    const std::optional<ttnn::Tensor>& expert_rows_tensor;
+    const std::optional<ttnn::Tensor>& expert_rows_table_tensor;
 };
 
 }  // namespace ttnn::experimental::prim

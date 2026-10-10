@@ -15,16 +15,7 @@
 #include "api/compute/eltwise_unary/eltwise_unary.h"
 #include "api/dataflow/circular_buffer.h"
 
-// Need these headers for running SFPU on PACK thread
-#ifdef TRISC_PACK
-#include "ckernel_sfpu_exp.h"
-#include "../../../moe_gpt/device/kernels/swiglu_sfpu.h"
-#include "ckernel_sfpu_silu.h"
-#include "ckernel_sfpu_binary.h"
-#include "llk_math_eltwise_unary_sfpu_macros.h"
-#include "llk_math_eltwise_binary_sfpu_macros.h"
-#include "ckernel_sfpu_gelu.h"
-#endif
+#include "moe_activation.h"
 
 namespace detail {
 
@@ -37,133 +28,93 @@ void noc_semaphore_wait_min(volatile tt_l1_ptr uint32_t* sem_addr, uint32_t val)
     WAYPOINT("NSMD");
 }
 
-// Note GELU gets init'd at each iteration in the pack_compute_activation specialization
-template <ttnn::experimental::prim::detail::MoEActivationFunction activation>
-inline void pack_init_activation() {};
+// in @ {W0, W1} for one gate/up block-column, then the activation, packed to the in2 tiles
+// [out_tile, out_tile + kPairs). kPairs = 2: a full block-column, 4 tiles wide (W0 c, W1 c, W0 c+1, W1 c+1);
+// kPairs = 1: the half block-column of a ring core with an odd column count, 2 tiles wide. The caller sets
+// matmul_block_init to ct_dim = 2 * kPairs.
+template <
+    ttnn::experimental::prim::detail::MoEActivationFunction activation,
+    uint32_t kPairs,
+    uint32_t num_blocks,
+    uint32_t tiles_per_block,
+    uint32_t Kt,
+    bool has_bias>
+FORCE_INLINE void compute_w0_w1_block_column(
+    uint32_t in_cb_id,
+    uint32_t w0_w1_cb_id,
+    uint32_t ones_tile_cb_id,
+    uint32_t in2_cb_id,
+    uint32_t in0_index,
+    uint32_t out_tile) {
+    constexpr uint32_t ct_dim = 2 * kPairs;
+    CircularBuffer cb_w0_w1(w0_w1_cb_id);
 
-template <>
-inline void pack_init_activation<ttnn::experimental::prim::detail::MoEActivationFunction::SWIGLU>() {
-    PACK((llk_math_eltwise_binary_sfpu_swiglu_init()));
-};
+    tile_regs_acquire();
+    [[maybe_unused]] uint32_t k_tracker = 0;
+    for (uint32_t block_id = 0; block_id < num_blocks; ++block_id) {
+        cb_w0_w1.wait_front(tiles_per_block);
 
-template <>
-inline void pack_init_activation<ttnn::experimental::prim::detail::MoEActivationFunction::SILU>() {
-    PACK(SFPU_UNARY_INIT_FN(silu, sfpu::silu_init, (true /*APPROXIMATE*/)));
-};
-
-// Activation on the packer's SFPU over DEST: dst 0 = act(W0 x) * (W1 x) for the first (W0, W1) pair, dst 2 for the
-// second (dst 1 and 3 hold W1 x). kPairs = 1: only the first pair holds data -- the half block-column of a ring core
-// with an odd gate/up column count.
-template <ttnn::experimental::prim::detail::MoEActivationFunction activation, uint32_t kPairs>
-struct PackActivation {
-    static inline void compute() {}
-};
-
-template <uint32_t kPairs>
-struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::SILU, kPairs> {
-    static inline void compute() {
-        PACK(SFPU_UNARY_CALL(
-            DST_SYNC_MODE,
-            DST_ACCUM_MODE,
-            calculate_silu,
-            (false /*is_fp32_dest_acc_en*/, 8 /*ITERATIONS*/),
-            0 /*DST_IDX*/,
-            ::ckernel::VectorMode::RC));
-        if constexpr (kPairs == 2) {
-            PACK(SFPU_UNARY_CALL(
-                DST_SYNC_MODE,
-                DST_ACCUM_MODE,
-                calculate_silu,
-                (false /*is_fp32_dest_acc_en*/, 8 /*ITERATIONS*/),
-                2 /*DST_IDX*/,
-                ::ckernel::VectorMode::RC));
+        for (uint32_t k = 0; k < tiles_per_block; k += ct_dim) {
+            if constexpr (has_bias) {
+                if (k_tracker == Kt) {
+                    // Bias addition: matmul(ones_tile, bias_row)
+                    matmul_block(
+                        ones_tile_cb_id,
+                        w0_w1_cb_id,
+                        0,
+                        /*in1_index=*/k,
+                        /*idst=*/0,
+                        /*transpose=*/false,
+                        /*ct_dim=*/ct_dim,
+                        /*rt_dim=*/1,
+                        /*kt_dim=*/1);
+                    k_tracker++;
+                    continue;
+                } else if (k_tracker > Kt) {
+                    k_tracker++;
+                    continue;  // skip padding K slots after bias
+                }
+            }
+            if constexpr (!has_bias) {
+                if (k_tracker >= Kt) {
+                    k_tracker++;
+                    continue;  // skip padding K slots
+                }
+            }
+            matmul_block(
+                in_cb_id,
+                w0_w1_cb_id,
+                in0_index++,
+                /*in1_index=*/k,
+                /*idst=*/0,
+                /*transpose=*/false,
+                /*ct_dim=*/ct_dim,
+                /*rt_dim=*/1,
+                /*kt_dim=*/1);
+            k_tracker++;
         }
-
-        PACK((SFPU_BINARY_CALL(
-            DST_SYNC_MODE,
-            DST_ACCUM_MODE,
-            calculate_sfpu_binary,
-            (true /*APPROXIMATE*/, ckernel::BinaryOp::MUL, 8 /*ITERATIONS*/, DST_ACCUM_MODE),
-            0 /*DST_IN0*/,
-            1 /*DST_IN1*/,
-            0 /*DST_OUT*/,
-            ::ckernel::VectorMode::RC)));
-        if constexpr (kPairs == 2) {
-            PACK((SFPU_BINARY_CALL(
-                DST_SYNC_MODE,
-                DST_ACCUM_MODE,
-                calculate_sfpu_binary,
-                (true /*APPROXIMATE*/, ckernel::BinaryOp::MUL, 8 /*ITERATIONS*/, DST_ACCUM_MODE),
-                2 /*DST_IN0*/,
-                3 /*DST_IN1*/,
-                2 /*DST_OUT*/,
-                ::ckernel::VectorMode::RC)));
-        }
+        cb_w0_w1.pop_front(tiles_per_block);
     }
-};
 
-template <uint32_t kPairs>
-struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::SWIGLU, kPairs> {
-    static inline void compute() {
-        PACK((llk_math_eltwise_binary_sfpu_swiglu<false>(0, 1, 0)));
-        if constexpr (kPairs == 2) {
-            PACK((llk_math_eltwise_binary_sfpu_swiglu<false>(2, 3, 2)));
-        }
+    tile_regs_commit();
+
+    // The below is equivalent to tile_regs_wait(), but we stall CFG as well, so that the succeeding
+    // TT_SETC16 instruction is also stalled until math thread is done with these dest registers.
+    PACK(TTI_SEMWAIT(
+        p_stall::STALL_TDMA | p_stall::STALL_CFG, semaphore::t6_sem(semaphore::MATH_PACK), p_stall::STALL_ON_ZERO));
+
+    // Make SFPU access the appropriate half of the destination registers
+    PACK(TT_SETC16(DEST_TARGET_REG_CFG_MATH_Offset_ADDR32, ckernel::packer::get_packer_dest_offset()));
+
+    ::moe_activation::PackActivation<activation, kPairs>::compute();
+
+    PACK(TTI_STALLWAIT(p_stall::STALL_PACK, p_stall::WAIT_SFPU));
+
+    pack_tile</*out_of_order_output=*/true>(0, in2_cb_id, /*output_tile_index=*/out_tile);
+    if constexpr (kPairs == 2) {
+        pack_tile</*out_of_order_output=*/true>(2, in2_cb_id, /*output_tile_index=*/out_tile + 1);
     }
-};
-
-template <uint32_t kPairs>
-struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::GELU, kPairs> {
-    static inline void compute() {
-        // GELU programs an SFPU LUT (gelu_init). The trailing binary MUL below clobbers that LUT,
-        // so when the activation loop runs >1 iteration per chunk (tiles_per_step > 2, which happens
-        // for ring sizes where ceil(Nt/ring) is odd — e.g. gemma at ring=8) the next iteration's
-        // gelu reads a stale LUT and produces garbage. Re-init the LUT here so every gelu is valid.
-        // SILU/SWIGLU don't use this LUT, so they keep their cheaper once-per-chunk init.
-        PACK((llk_math_eltwise_unary_sfpu_init<SfpuType::gelu>(ckernel::sfpu::gelu_init<true, false>)));
-        PACK(SFPU_UNARY_CALL(
-            DST_SYNC_MODE,
-            DST_ACCUM_MODE,
-            calculate_gelu,
-            (true /*APPROXIMATE*/, false /*is_fp32_dest_acc_en*/, 8 /*ITERATIONS*/),
-            0 /*DST_IDX*/,
-            ::ckernel::VectorMode::RC));
-        if constexpr (kPairs == 2) {
-            PACK(SFPU_UNARY_CALL(
-                DST_SYNC_MODE,
-                DST_ACCUM_MODE,
-                calculate_gelu,
-                (true /*APPROXIMATE*/, false /*is_fp32_dest_acc_en*/, 8 /*ITERATIONS*/),
-                2 /*DST_IDX*/,
-                ::ckernel::VectorMode::RC));
-        }
-
-        PACK((SFPU_BINARY_CALL(
-            DST_SYNC_MODE,
-            DST_ACCUM_MODE,
-            calculate_sfpu_binary,
-            (true /*APPROXIMATE*/, ckernel::BinaryOp::MUL, 8 /*ITERATIONS*/, DST_ACCUM_MODE),
-            0 /*DST_IN0*/,
-            1 /*DST_IN1*/,
-            0 /*DST_OUT*/,
-            ::ckernel::VectorMode::RC)));
-        if constexpr (kPairs == 2) {
-            PACK((SFPU_BINARY_CALL(
-                DST_SYNC_MODE,
-                DST_ACCUM_MODE,
-                calculate_sfpu_binary,
-                (true /*APPROXIMATE*/, ckernel::BinaryOp::MUL, 8 /*ITERATIONS*/, DST_ACCUM_MODE),
-                2 /*DST_IN0*/,
-                3 /*DST_IN1*/,
-                2 /*DST_OUT*/,
-                ::ckernel::VectorMode::RC)));
-        }
-    }
-};
-
-template <ttnn::experimental::prim::detail::MoEActivationFunction activation, uint32_t kPairs = 2>
-inline void pack_compute_activation() {
-    PackActivation<activation, kPairs>::compute();
+    tile_regs_release();
 }
 
 }  // namespace detail
@@ -183,12 +134,6 @@ void kernel_main() {
 
     // For synchronization with tilize cores
     constexpr uint32_t tokens_per_chunk = get_named_compile_time_arg_val("tokens_per_chunk");
-    // Chunk g arrives in half g % chunk_halves of cb_s2c_in (2 halves today, R + 1 with R prefill rings)
-    constexpr uint32_t chunk_halves = get_named_compile_time_arg_val("chunk_halves");
-    // Chunk ownership over the prefill rings: every role derives the same table from the per-expert counts
-    // (moe_ring::rings::ChunkOwners); one ring today, so every chunk is this core's.
-    constexpr uint32_t prefill_rings = get_named_compile_time_arg_val("prefill_rings");
-    constexpr uint32_t num_rings = prefill_rings < 2 ? 1u : prefill_rings;
 
     // Run-time arguments
     uint32_t argidx = 0;
@@ -201,9 +146,6 @@ void kernel_main() {
     const auto ring_core_id = get_arg_val<uint32_t>(argidx++);
     [[maybe_unused]] const auto ring_neighbor_physical_x = get_arg_val<uint32_t>(argidx++);
     [[maybe_unused]] const auto ring_neighbor_physical_y = get_arg_val<uint32_t>(argidx++);
-    const auto ring_index = get_arg_val<uint32_t>(argidx++);
-    [[maybe_unused]] const auto ring_predecessor_physical_x = get_arg_val<uint32_t>(argidx++);
-    [[maybe_unused]] const auto ring_predecessor_physical_y = get_arg_val<uint32_t>(argidx++);
 
     // CB ids
     constexpr auto cb_s2c_in_id = tt::CBIndex::c_0;     // tilize_output_cb_id
@@ -223,7 +165,6 @@ void kernel_main() {
 
     // CircularBuffer typed wrappers
     CircularBuffer cb_s2c_in(cb_s2c_in_id);
-    CircularBuffer cb_r2c_w0_w1(cb_r2c_w0_w1_id);
     CircularBuffer cb_c2w_rdy(cb_c2w_rdy_id);
     CircularBuffer cb_w2c_rdy(cb_w2c_rdy_id);
     CircularBuffer cb_s2c_in2(cb_s2c_in2_id);
@@ -250,17 +191,16 @@ void kernel_main() {
     //-------------------------------------------------------------------------
     // W0 and W1 reading constants
     //-------------------------------------------------------------------------
-    // Per-shape DRAM transaction size of both weight streams (moe_ring::tiles_per_txn_for_shape: 14, or 10)
+    // Per-shape DRAM transaction size of both weight streams (moe_ring::tiles_per_txn_for_shape: 14, or 20)
     constexpr uint32_t txn_tiles = get_named_compile_time_arg_val("tiles_per_txn");
     using Cfg = moe_ring::MoeRingConfig<Ht, Nt, num_cores, has_bias, shared_expert_tp_factor, txn_tiles>;
 
-    constexpr uint32_t w0_w1_txns_per_block = Cfg::txns_per_block;
-    constexpr uint32_t w0_w1_tiles_per_txn = Cfg::tiles_per_txn;
-    constexpr uint32_t w0_w1_tiles_per_block = w0_w1_tiles_per_txn * w0_w1_txns_per_block;  // 14 * 2 = 28 (10 * 2)
+    // A block is 2 transactions: 28 tiles with 14-tile transactions, 40 with 20-tile ones
+    constexpr uint32_t w0_w1_tiles_per_block = Cfg::tiles_per_block;
 
     // W2 reading constants (base-constant aliases only; derived values come from Cfg)
     constexpr auto w2_tiles_per_iter_w = moe_ring::W2_TILES_PER_A2A_ITER_W;
-    constexpr uint32_t w2_tiles_per_block = Cfg::tiles_per_block;  // 14 * 2 = 28 (10 * 2)
+    constexpr uint32_t w2_tiles_per_block = Cfg::tiles_per_block;
     [[maybe_unused]] constexpr uint32_t w2_tiles_per_iter_h = Cfg::block_tiles_h;
 
     //-------------------------------------------------------------------------
@@ -327,7 +267,8 @@ void kernel_main() {
     volatile tt_l1_ptr uint32_t* num_tokens_per_expert_ptr =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cb_w2c_md_read_ptr[0]);
 
-    // The tilize cores' chunk-ready count is the number of chunks delivered: chunk g has arrived at g + 1
+    // Value we wait on that indicates the next chunk of tiles have arrived from the tilize cores
+    uint32_t matmul_chunk_ready_semaphore_wait_value = 1;
     uint32_t matmul_chunk_ready_semaphore_addr = cb_w2c_md_read_ptr[1];
 
     // Zero out dest registers
@@ -337,30 +278,17 @@ void kernel_main() {
     // Expert loop
     //-------------------------------------------------------------------------
 
-    // Chunks are numbered in feed order over all experts; chunk g sits in half g % chunk_halves of the buffer.
-    uint32_t chunk_index = 0;
-    moe_ring::rings::ChunkOwners<num_rings> owners;
+    // This decides which half of the buffer will have the valid data sent by tilize cores
+    bool use_second_half_buffer = false;
     for (uint32_t expert_id = 0; expert_id < num_experts; ++expert_id) {
         const uint32_t num_tokens = num_tokens_per_expert_ptr[expert_id];
         const uint32_t num_expert_chunks = (num_tokens + tokens_per_chunk - 1) / tokens_per_chunk;
-        owners.begin_expert(num_expert_chunks);
         for (uint32_t chunk = 0; chunk < num_expert_chunks; ++chunk) {
-            const uint32_t chunk_g = chunk_index++;
-            if (owners.owner(chunk) != ring_index) {
-                // Another ring's chunk: it lands in this core's buffer too, but nothing here reads it. The W2 output
-                // staging (cb_c2s_out) is the same L1 as the input halves, so its pointer must stay in step with the
-                // input half g % chunk_halves: an empty push here, matched by dm1's empty pop, keeps every chunk's
-                // output over its own (consumed) input and never over a later chunk's pending input.
-                cb_c2s_out.reserve_back(num_w0_w1_tiles_h);
-                cb_c2s_out.push_back(num_w0_w1_tiles_h);
-                continue;
-            }
-            const uint32_t chunk_half = chunk_g % chunk_halves;
-            // GELU re-inits its SFPU LUT inside pack_compute_activation on every iteration (the
+            // GELU re-inits its SFPU LUT inside PackActivation on every iteration (the
             // trailing MUL there clobbers it), so it's its own initializer — skip the per-chunk
             // init for GELU to avoid a redundant gelu_init. SILU/SWIGLU init once here.
             if constexpr (activation_type != ttnn::experimental::prim::detail::MoEActivationFunction::GELU) {
-                ::detail::pack_init_activation<activation_type>();
+                ::moe_activation::pack_init_activation<activation_type>();
             }
 
             // Initialize matmul for W0
@@ -371,96 +299,29 @@ void kernel_main() {
             // Min to allow tilize cores to send increment for second expert
             // while first expert still being processed
             ::detail::noc_semaphore_wait_min(
-                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(matmul_chunk_ready_semaphore_addr), chunk_g + 1);
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(matmul_chunk_ready_semaphore_addr),
+                matmul_chunk_ready_semaphore_wait_value++);
 
             //---------------------------------------------------------------------
             // Compute in @ {W0,W1}
             //---------------------------------------------------------------------
-            // Compact layout: produce only this core's logical columns (dm0 reads exactly those):
-            // the full pairs here, then the odd column from its half block-column below. The in2
-            // slice keeps the full tiles_per_step stride, so dm1 / the a2a ring / W2 are unchanged.
-            // Shared experts are TP-split + front-packed: produce only the real TpNt prefix
-            // (dm0 reads the matching shortened W0/W1). The unchanged full W2 walk then contracts
-            // real×real in the prefix and (zero in2)×(front-packed zero W2) past it.
+            // Produce this core's gate/up columns (dm0 reads exactly those): the full pairs, then an odd
+            // column from its half block-column, in the same K order. Shared experts take the same path:
+            // w0_w1_prod_cols gives them only the real TpNt prefix of their front-packed columns, and the
+            // zero-fill below covers the rest of the slice.
             const bool is_shared_expert = expert_id >= num_experts - num_shared_experts;
             const uint32_t prod_tiles_per_step = Cfg::w0_w1_prod_cols(ring_core_id, is_shared_expert);
             const uint32_t prod_pair_tiles = prod_tiles_per_step & ~1u;
+            const uint32_t in0_index = use_second_half_buffer ? num_w0_w1_tiles_h : 0;
             for (uint32_t tile_id = 0; tile_id < prod_pair_tiles; tile_id += 2) {
-                uint32_t in0_index = chunk_half * num_w0_w1_tiles_h;
-
-                tile_regs_acquire();
-                [[maybe_unused]] uint32_t k_tracker = 0;
-                for (uint32_t block_id = 0; block_id < Cfg::w0_w1_blocks_per_col; ++block_id) {
-                    cb_r2c_w0_w1.wait_front(w0_w1_tiles_per_block);
-
-                    for (uint32_t k = 0; k < w0_w1_tiles_per_block; k += 4) {
-                        if constexpr (has_bias) {
-                            if (k_tracker == num_w0_w1_tiles_h) {
-                                // Bias addition: matmul(ones_tile, bias_row)
-                                matmul_block(
-                                    cb_c2c_ones_tile_id,
-                                    cb_r2c_w0_w1_id,
-                                    0,
-                                    /*in1_index=*/k,
-                                    /*idst=*/0,
-                                    /*transpose=*/false,
-                                    /*ct_dim=*/4,
-                                    /*rt_dim=*/1,
-                                    /*kt_dim=*/1);
-                                k_tracker++;
-                                continue;
-                            } else if (k_tracker > num_w0_w1_tiles_h) {
-                                k_tracker++;
-                                continue;  // skip padding K slots after bias
-                            }
-                        }
-                        if constexpr (!has_bias) {
-                            if (k_tracker >= num_w0_w1_tiles_h) {
-                                k_tracker++;
-                                continue;  // skip padding K slots
-                            }
-                        }
-                        matmul_block(
-                            cb_s2c_in_id,
-                            cb_r2c_w0_w1_id,
-                            in0_index++,
-                            /*in1_index=*/k,
-                            /*idst=*/0,
-                            /*transpose=*/false,
-                            /*ct_dim=*/4,
-                            /*rt_dim=*/1,
-                            /*kt_dim=*/1);
-                        k_tracker++;
-                    }
-                    cb_r2c_w0_w1.pop_front(w0_w1_tiles_per_block);
-                }
-
-                tile_regs_commit();
-
-                // The below is equivalent to tile_regs_wait(), but we stall CFG as well, so that the succeeding
-                // TT_SETC16 instruction is also stalled until math thread is done with these dest registers.
-                PACK(TTI_SEMWAIT(
-                    p_stall::STALL_TDMA | p_stall::STALL_CFG,
-                    semaphore::t6_sem(semaphore::MATH_PACK),
-                    p_stall::STALL_ON_ZERO));
-
-                // Make SFPU access the appropriate half of the destination registers
-                PACK(TT_SETC16(DEST_TARGET_REG_CFG_MATH_Offset_ADDR32, ckernel::packer::get_packer_dest_offset()));
-
-                //---------------------------------------------------------------------
-                // Apply activation
-                //---------------------------------------------------------------------
-                ::detail::pack_compute_activation<activation_type>();
-
-                PACK(TTI_STALLWAIT(p_stall::STALL_PACK, p_stall::WAIT_SFPU));
-
-                pack_tile</*out_of_order_output=*/true>(0, cb_s2c_in2_id, /*output_tile_index=*/tile_id);
-                pack_tile</*out_of_order_output=*/true>(2, cb_s2c_in2_id, /*output_tile_index=*/tile_id + 1);
-                tile_regs_release();
+                ::detail::compute_w0_w1_block_column<
+                    activation_type,
+                    /*kPairs=*/2,
+                    Cfg::w0_w1_blocks_per_col,
+                    w0_w1_tiles_per_block,
+                    num_w0_w1_tiles_h,
+                    has_bias>(cb_s2c_in_id, cb_r2c_w0_w1_id, cb_c2c_ones_tile_id, cb_s2c_in2_id, in0_index, tile_id);
             }
-
-            // Odd column: (W0 c, W1 c) from the half block-column, 2 tiles wide x 14 K rows per block.
-            // Same K order as the pairs, so the per-column accumulation is unchanged.
             if (prod_pair_tiles != prod_tiles_per_step) {
                 matmul_block_init(
                     cb_s2c_in_id,
@@ -469,71 +330,14 @@ void kernel_main() {
                     /*ct_dim=*/moe_ring::W0_W1_HALF_BLOCK_TILES_W,
                     /*rt_dim=*/1,
                     /*kt_dim=*/1);
-                uint32_t in0_index = chunk_half * num_w0_w1_tiles_h;
-
-                tile_regs_acquire();
-                [[maybe_unused]] uint32_t k_tracker = 0;
-                for (uint32_t block_id = 0; block_id < Cfg::w0_w1_blocks_per_half_col; ++block_id) {
-                    cb_r2c_w0_w1.wait_front(w0_w1_tiles_per_block);
-
-                    for (uint32_t k = 0; k < w0_w1_tiles_per_block; k += moe_ring::W0_W1_HALF_BLOCK_TILES_W) {
-                        if constexpr (has_bias) {
-                            if (k_tracker == num_w0_w1_tiles_h) {
-                                // Bias addition: matmul(ones_tile, bias_row)
-                                matmul_block(
-                                    cb_c2c_ones_tile_id,
-                                    cb_r2c_w0_w1_id,
-                                    0,
-                                    /*in1_index=*/k,
-                                    /*idst=*/0,
-                                    /*transpose=*/false,
-                                    /*ct_dim=*/moe_ring::W0_W1_HALF_BLOCK_TILES_W,
-                                    /*rt_dim=*/1,
-                                    /*kt_dim=*/1);
-                                k_tracker++;
-                                continue;
-                            } else if (k_tracker > num_w0_w1_tiles_h) {
-                                k_tracker++;
-                                continue;  // skip padding K slots after bias
-                            }
-                        }
-                        if constexpr (!has_bias) {
-                            if (k_tracker >= num_w0_w1_tiles_h) {
-                                k_tracker++;
-                                continue;  // skip padding K slots
-                            }
-                        }
-                        matmul_block(
-                            cb_s2c_in_id,
-                            cb_r2c_w0_w1_id,
-                            in0_index++,
-                            /*in1_index=*/k,
-                            /*idst=*/0,
-                            /*transpose=*/false,
-                            /*ct_dim=*/moe_ring::W0_W1_HALF_BLOCK_TILES_W,
-                            /*rt_dim=*/1,
-                            /*kt_dim=*/1);
-                        k_tracker++;
-                    }
-                    cb_r2c_w0_w1.pop_front(w0_w1_tiles_per_block);
-                }
-
-                tile_regs_commit();
-
-                // tile_regs_wait() with the CFG stall, as in the pair loop above.
-                PACK(TTI_SEMWAIT(
-                    p_stall::STALL_TDMA | p_stall::STALL_CFG,
-                    semaphore::t6_sem(semaphore::MATH_PACK),
-                    p_stall::STALL_ON_ZERO));
-                PACK(TT_SETC16(DEST_TARGET_REG_CFG_MATH_Offset_ADDR32, ckernel::packer::get_packer_dest_offset()));
-
-                ::detail::pack_compute_activation<activation_type, /*kPairs=*/1>();
-
-                PACK(TTI_STALLWAIT(p_stall::STALL_PACK, p_stall::WAIT_SFPU));
-
-                pack_tile</*out_of_order_output=*/true>(0, cb_s2c_in2_id, /*output_tile_index=*/prod_pair_tiles);
-                tile_regs_release();
-
+                ::detail::compute_w0_w1_block_column<
+                    activation_type,
+                    /*kPairs=*/1,
+                    Cfg::w0_w1_blocks_per_half_col,
+                    w0_w1_tiles_per_block,
+                    num_w0_w1_tiles_h,
+                    has_bias>(
+                    cb_s2c_in_id, cb_r2c_w0_w1_id, cb_c2c_ones_tile_id, cb_s2c_in2_id, in0_index, prod_pair_tiles);
                 // Restore the 4-wide matmul for the W2 phase.
                 matmul_block_init(
                     cb_s2c_in_id, cb_r2c_w0_w1_id, /*transpose=*/false, /*ct_dim=*/4, /*rt_dim=*/1, /*kt_dim=*/1);
@@ -593,14 +397,7 @@ void kernel_main() {
                 }
                 uint32_t src_core = ring_core_id;
                 uint32_t dm1_tiles_remaining = shard_tiles_lut[ring_core_id];
-                // The shards arrive during the ring's handshake iterations and stay resident for the chunk (the
-                // a2a_free credit follows this chunk's W2 output): the per-shard rendezvous over cb_w2c_rdy runs in
-                // those iterations only and the later ones read the buffers as they are (dm1.cpp runs the ring for
-                // the same count).
-                const bool a2a_handshake = iter < moe_ring::a2a_handshake_iters;
-                if (a2a_handshake) {
-                    cb_w2c_rdy.wait_front(1);
-                }
+                cb_w2c_rdy.wait_front(1);
 
                 uint32_t in2_offset = 0, in2_index = 0;
 
@@ -631,10 +428,8 @@ void kernel_main() {
                             continue;  // skip padding K slots (bias: after bias tile; no_bias: at/past logical K)
                         }
                         if (dm1_tiles_remaining == 0) {
-                            if (a2a_handshake) {
-                                cb_w2c_rdy.pop_front(1);
-                                cb_w2c_rdy.wait_front(1);
-                            }
+                            cb_w2c_rdy.pop_front(1);
+                            cb_w2c_rdy.wait_front(1);
                             src_core = (src_core == 0) ? num_cores - 1 : src_core - 1;
                             dm1_tiles_remaining = shard_tiles_lut[src_core];
                             in2_offset += tiles_per_step;
@@ -656,9 +451,7 @@ void kernel_main() {
                     }
                     cb_r2c_w2.pop_front(w2_tiles_per_block);
                 }
-                if (a2a_handshake) {
-                    cb_w2c_rdy.pop_front(1);
-                }
+                cb_w2c_rdy.pop_front(1);
 
                 tile_regs_commit();
 
@@ -674,8 +467,11 @@ void kernel_main() {
 
             cb_c2s_out.push_back(num_w0_w1_tiles_h);
 
+            // Toggle the buffer to use
+            use_second_half_buffer = !use_second_half_buffer;
             // Restore packer data format for next chunk's activation pipeline (mirrors moe_gpt:342).
             pack_reconfig_data_format(cb_s2c_in2_id);
+
         }  // end for (chunk)
     }  // end for (expert_id)
 

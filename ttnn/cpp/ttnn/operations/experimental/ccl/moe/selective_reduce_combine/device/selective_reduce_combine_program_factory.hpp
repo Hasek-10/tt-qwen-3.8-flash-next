@@ -107,6 +107,30 @@ private:
 // addresses (0 when nullopt) for writer kernel runtime args, and stores them in the returned
 // artifacts for ownership. nullopt is used by the fused moe_compute FullLocal path, whose
 // writer compiles out all init/final barrier handling.
+// [tree B adapter] Our moe_compute (main + expert rows) lists the compute cores feeding each combine column (a W2
+// slice that straddles two columns feeds both); this fork's fused combine takes one feeder count per column plus the
+// feeders in column order. Exact when every column has the same count and no core feeds two columns, else TT_FATAL.
+inline std::pair<uint32_t, std::vector<CoreCoord>> treeb_uniform_combine_feeders(
+    const std::vector<std::vector<CoreCoord>>& by_column) {
+    TT_FATAL(!by_column.empty(), "tree B combine adapter: no combine columns");
+    const uint32_t per_column = by_column.front().size();
+    std::vector<CoreCoord> flat;
+    for (const auto& column : by_column) {
+        TT_FATAL(
+            column.size() == per_column && per_column > 0,
+            "tree B combine adapter: the fork's fused combine needs the same feeder count per column ({} vs {})",
+            column.size(),
+            per_column);
+        for (const auto& core : column) {
+            for (const auto& seen : flat) {
+                TT_FATAL(seen != core, "tree B combine adapter: a W2 slice straddles combine columns (core {})", core);
+            }
+            flat.push_back(core);
+        }
+    }
+    return {per_column, flat};
+}
+
 SelectiveReduceCombineProgramArtifacts build_selective_reduce_combine_program_artifacts(
     tt::tt_metal::Program& program,
     const experimental::prim::SelectiveReduceCombineParams& operation_attributes,

@@ -46,6 +46,13 @@ bool is_axis_straight(const tt::tt_metal::distributed::MeshDevice& mesh_device, 
 // fewer devices, which closes on the link it already uses.
 bool is_axis_wrap_wired(const tt::tt_metal::distributed::MeshDevice& mesh_device, uint32_t axis);
 
+// [tree B, from tenstorrent/tt-metal main 14565689d1e] Where to allocate a GlobalSemaphore whose value is CARRIED
+// across invocations: L1_SMALL when configured (above a fabric mux's raw-L1 ceiling), else general L1.
+tt::tt_metal::BufferType prefer_l1_small_buffer_type(const tt::tt_metal::distributed::MeshDevice& mesh_device);
+
+// [tree B, from main 14565689d1e] Floor of the L1_SMALL region = the highest address a fabric mux's raw-L1 map may reach.
+size_t l1_small_floor_address(const tt::tt_metal::distributed::MeshDevice& mesh_device);
+
 // Resolve the topology (Ring vs Linear) for a single mesh axis
 tt::tt_fabric::Topology get_axis_topology(
     const Tensor& tensor, tt::tt_fabric::FabricConfig fabric_config, uint32_t axis);

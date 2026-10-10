@@ -23,15 +23,12 @@ constexpr uint32_t div_up() {
 constexpr uint32_t W0_W1_TXNS_PER_BLOCK = 2;
 // Tokens per expert chunk: one tile row of activations (the kernels' "tokens_per_chunk" compile arg).
 constexpr uint32_t TOKENS_PER_CHUNK = 32;
-// The DRAM transaction size in tiles is a per-shape compile-time parameter (tiles_per_txn_for_shape below; the host
-// passes it to the kernels as the "tiles_per_txn" named compile arg and they build MoeRingConfig with it). Every block
-// height derives from it (MoeRingConfig::block_tiles_h / half_block_tiles_h): there are deliberately no fixed
-// 14-tile *_TILES_H / *_TILES_PER_TXN constants, so code written for the fixed geometry fails to compile rather than
-// read 28-tile blocks from a 20-tile stream.
-constexpr uint32_t DEFAULT_TILES_PER_TXN = 14;  // 8,064 B BF4; 28-tile blocks, 4 wide x 7 K rows
-constexpr uint32_t ALT_TILES_PER_TXN = 20;      // 11,520 B BF4 (one NoC packet); 40-tile blocks, 4 wide x 10 K rows
+// DRAM transaction sizes in tiles. The host picks one per shape (tiles_per_txn_for_shape) and passes it to the kernels
+// as the "tiles_per_txn" compile arg; every block height derives from it (block_tiles_h, half_block_tiles_h).
+constexpr uint32_t DEFAULT_TILES_PER_TXN = 14;  // 8,064 B BF4 (one Wormhole NoC packet); blocks 4 wide x 7 K rows
+constexpr uint32_t ALT_TILES_PER_TXN = 20;      // 11,520 B BF4 (one Blackhole NoC packet); blocks 4 wide x 10 K rows
 
-// probably don't need this for W0_W1 and W2 because it's the same
+// Block width in tiles, both weight streams
 constexpr uint32_t W0_W1_BLOCK_TILES_W = 4;
 
 // Half block-column: the odd gate/up column of a ring core that owns an odd column count is stored as
@@ -39,9 +36,9 @@ constexpr uint32_t W0_W1_BLOCK_TILES_W = 4;
 // stored 4-tile row holds two consecutive K rows (W0 k, W1 k, W0 k+1, W1 k+1).
 constexpr uint32_t W0_W1_HALF_BLOCK_TILES_W = W0_W1_BLOCK_TILES_W / 2;
 
-// Let's call this a constant
+// W2 output tiles per a2a iteration
 constexpr uint32_t W2_TILES_PER_A2A_ITER_W = 4;
-// Half-width last a2a iteration (ALT_TILES_PER_TXN only, when every core has 1 or 2 output tiles left for it):
+// Half-width last a2a iteration (20-tile transactions only, when every core has 1 or 2 output tiles left for it):
 // 2 output tiles wide, twice the K rows per block, two consecutive K rows per stored 4-tile row.
 constexpr uint32_t W2_HALF_A2A_ITER_TILES_W = W2_TILES_PER_A2A_ITER_W / 2;
 
@@ -91,10 +88,8 @@ constexpr uint32_t even_stride_at_least_a2a_width(uint32_t tiles) {
 }
 
 // Per-shape choice of the W0/W1 column layout. Compact (each ring core stores only its own shard_tiles(Nt, c)
-// columns) when that shortens the critical path: the busiest core owns fewer columns than the uniform even stride
-// (1-3 columns, or an odd count). Otherwise (e.g. 6/5 or 8/7 columns) the busiest core does the same work either way
-// and every core keeps the uniform stride, byte-identical to the per-core stride layout: compacting such shapes only
-// added cross-bank reads and half-width passes (GLM-4.5-Air 4096/1408, Nemotron-3-Nano 2688/1856 measured ~1 % slower).
+// columns) only when that shortens the critical path: the busiest core owns fewer columns than the uniform even
+// stride. Otherwise every core keeps the uniform stride, byte-identical to the per-core stride layout.
 constexpr bool w0_w1_compact_for_shape(uint32_t Nt, uint32_t n_cores) {
     const uint32_t max_cols = (Nt + n_cores - 1) / n_cores;
     return max_cols < even_stride_at_least_a2a_width(max_cols);
@@ -106,16 +101,6 @@ constexpr uint32_t w0_w1_stored_cols(uint32_t Nt, uint32_t core_id, uint32_t n_c
     return w0_w1_compact_for_shape(Nt, n_cores) ? shard_tiles(Nt, core_id, n_cores)
                                                 : even_stride_at_least_a2a_width((Nt + n_cores - 1) / n_cores);
 }
-
-// The W2 exchange's handshake iterations: dm1 runs the ring (one rendezvous over cb_w2c_rdy and one ring-semaphore
-// step per shard) for this many of Cfg::num_a2a_iters. The partials travel in iteration 0 only: it fills a2a buffers
-// 1..num_cores-1 once per chunk, every later W2 iteration of the compute reads the same resident buffers, and the
-// credit that frees them follows the chunk's W2 output. One iteration is therefore the whole exchange: the later
-// iterations' wait / increment pairs are dropped on every core alike (the ring semaphore accounting stays
-// consistent) and the compute reads the resident buffers without a rendezvous. Bitwise on every form (decode rows,
-// the 128-token chunk, the 2048-row slab); -10 % per moe_compute launch on the 1x4 p150 line (2026-09-26). Part of
-// every moe_compute kernel's compile through this header, so the form is in the kernel hash.
-constexpr uint32_t a2a_handshake_iters = 1;
 
 // Width in tiles of the in2 slice every ring core hands to the a2a ring: with the compact layout the largest per-core
 // column count (at least 2), else the uniform stride.
@@ -182,22 +167,16 @@ constexpr uint32_t half_block_tiles_h(uint32_t tiles_per_txn) {
     return W0_W1_TXNS_PER_BLOCK * tiles_per_txn / W0_W1_HALF_BLOCK_TILES_W;
 }
 
-// The per-shape DRAM transaction size (tiles) of both weight streams. 20-tile transactions store the
-// Qwen3.8-Flash-Next expert (hidden 2560 = 80 tiles, intermediate 640 = 20 tiles, no bias) on the 8-bank ring, where
-// the layout has no padding at all (gate/up K 80 = 8 x 10 and 4 x 20, W2 K 20 = 2 x 10 and 1 x 20; 80 blocks =
-// 10 per bank; W2 a2a iterations 4 + 4 + a half). Other rings and every other shape keep the 14-tile layout: 14
-// tiles is one 8 KB Wormhole NoC packet, and the 20-tile blocks with padded bank pieces and no half-width W2
-// iteration (12 cores: 7 blocks per bank + 4 pad, W2 4 + 3) produced wrong outputs on a Wormhole chip. Mirrored by
-// moe_compute_utils.py::_tiles_per_txn.
+// The per-shape DRAM transaction size (tiles) of both weight streams. 20 tiles only for the 2560/640 expert
+// (80/20 tiles, no bias) on the 8-core ring, where that layout has no padding (gate/up K 80 = 8 x 10, W2 K 20 =
+// 2 x 10, 10 blocks per bank, W2 a2a iterations 4 + 4 + a half); 14 tiles everywhere else. Other rings are not
+// supported at 20 tiles (wrong outputs on a 12-core ring). Mirrored by moe_compute_utils.py::_tiles_per_txn.
 constexpr uint32_t tiles_per_txn_for_shape(uint32_t Ht, uint32_t Nt, bool has_bias, uint32_t num_cores) {
     return (Ht == 80 && Nt == 20 && !has_bias && num_cores == 8) ? ALT_TILES_PER_TXN : DEFAULT_TILES_PER_TXN;
 }
 
-// Blocks the weight CB (c_3) holds: as many as fit in the 3-block budget of 14-tile transactions (84 tiles), and at
-// least 3 (3 for 14-tile and for 20-tile transactions, 4 for 10). dm0 keeps all but one of them in flight as DRAM
-// reads, so smaller transactions keep about the same bytes in flight. The streaming decode ring adds a fourth block
-// (the factory's "weight_slots" named arg, moe_compute_program_factory.cpp): the prefill ring forms' L1 has no room
-// for it (their feed halves are larger), the decode ring's has.
+// Blocks the weight CB (c_3) holds: as many as fit in three 14-tile-transaction blocks (84 tiles), at least 3.
+// dm0 keeps all but one of them in flight as DRAM reads.
 constexpr uint32_t weight_cb_slots(uint32_t tiles_per_txn) {
     const uint32_t fit = (3 * W0_W1_TXNS_PER_BLOCK * DEFAULT_TILES_PER_TXN) / (W0_W1_TXNS_PER_BLOCK * tiles_per_txn);
     return fit < 3 ? 3 : fit;
@@ -214,14 +193,24 @@ constexpr uint32_t w0_w1_bank_blocks_per_expert(
     return detail::div_up(expert_blocks, num_banks);
 }
 
-// W2 a2a iterations: ceil(max W2 output tiles per core / 4). With ALT_TILES_PER_TXN the last one is half width
-// when it has 1 or 2 output tiles; 14-tile layouts keep 4-wide iterations only (unchanged).
+// W2 a2a iterations: ceil(max W2 output tiles per core / 4). With 20-tile transactions the last one is half width
+// when it has 1 or 2 output tiles; 14-tile layouts keep 4-wide iterations only.
 constexpr uint32_t w2_num_a2a_iters(uint32_t Ht, uint32_t n_cores) {
     return detail::div_up(detail::div_up(Ht, n_cores), W2_TILES_PER_A2A_ITER_W);
 }
 constexpr bool w2_last_a2a_iter_half(uint32_t Ht, uint32_t n_cores, uint32_t tiles_per_txn) {
     const uint32_t last = detail::div_up(Ht, n_cores) % W2_TILES_PER_A2A_ITER_W;
     return tiles_per_txn != DEFAULT_TILES_PER_TXN && last != 0 && last <= W2_HALF_A2A_ITER_TILES_W;
+}
+
+// Combine columns [begin, end) fed by a ring core whose w2 width slice is `tiles` tiles starting at tile `offset`,
+// where a combine column is `col_tiles` tiles wide. A slice may straddle columns, since the ring size need not be a
+// multiple of the column count. A core with an empty slice (hidden_tiles < ring size, so the shard_tiles distribution
+// leaves it nothing) feeds no column: begin == end, so it signals no one and is in no contributor list. dm1 and the
+// program factory must agree on this, so both call these rather than restating the arithmetic.
+constexpr uint32_t w2_combine_col_begin(uint32_t offset, uint32_t col_tiles) { return offset / col_tiles; }
+constexpr uint32_t w2_combine_col_end(uint32_t offset, uint32_t tiles, uint32_t col_tiles) {
+    return tiles == 0 ? w2_combine_col_begin(offset, col_tiles) : (offset + tiles - 1) / col_tiles + 1;
 }
 
 // W2 blocks one ring core reads per (layer, expert): each full a2a iteration is ceil(K / block_tiles_h) blocks of
@@ -304,7 +293,7 @@ struct MoeRingConfig {
     static constexpr uint32_t num_a2a_iters =
         (max_w2_tiles_per_core + W2_TILES_PER_A2A_ITER_W - 1) / W2_TILES_PER_A2A_ITER_W;
     static constexpr uint32_t w2_tiles_per_expert_w = num_a2a_iters * W2_TILES_PER_A2A_ITER_W;
-    // With ALT_TILES_PER_TXN the last a2a iteration is half width (2 output tiles, w2_blocks_per_half_a2a_iter
+    // With 20-tile transactions the last a2a iteration is half width (2 output tiles, w2_blocks_per_half_a2a_iter
     // blocks of 2 wide x half_block_tiles_h) when every core's last iteration has at most 2 output tiles. The
     // output rows keep the w2_tiles_per_expert_w pitch: the half iteration still packs 4 DEST tiles, the two it does
     // not compute are zero (the packer clears the DEST half at every tile_regs_release) and dm1 copies only
@@ -325,12 +314,13 @@ struct MoeRingConfig {
 };
 
 //-----------------------------------------------------------------------------
-// Packed (token, k) lists of the local output path (tilize_reader / tilize_writer produce, dm1 consumes).
+// Packed (token, k) lists of the local output path (the ring: tilize_reader / tilize_writer produce them, dm1
+// consumes them; expert rows: rows_reader.cpp writes them).
 //-----------------------------------------------------------------------------
 // One page: `header_words` words of segment starts (`offsets[0..experts_per_device]`, the rest padding), then the
 // entries of every local expert back to back, expert e's `count_e` entries at `offsets[e]`. An entry is
 // `(k_slot << TOKEN_BITS) | token_id`. Segment starts are aligned to SEGMENT_ALIGN_ENTRIES entries (64 B) so that
-// dm1's per-chunk read of `tokens_per_chunk` entries at `(header_words + offsets[e] + tokens_per_chunk * c) * 4` B
+// a per-chunk read of `tokens_per_chunk` entries at `(header_words + offsets[e] + tokens_per_chunk * c) * 4` B
 // starts on a DRAM-aligned address; the capacity keeps one chunk of tail (the bound needs half of one) so that read
 // never leaves the page. Mirrored by ttnn/ttnn/_experimental/moe_compute_utils.py (token_list_*).
 namespace token_list {
@@ -367,69 +357,5 @@ constexpr uint32_t page_words(
 }
 
 }  // namespace token_list
-
-//-----------------------------------------------------------------------------
-// Chunk ownership over R replicated rings (the prefill mode's rings; R = 1 is today's single ring).
-//-----------------------------------------------------------------------------
-// The chunk stream is expert-major in id order and every role knows the per-expert counts, so each core derives
-// the same owner table from the counts alone. An expert with at least R chunks is split round-robin over all rings,
-// starting after the previous owner; a smaller expert goes whole to the least-loaded ring, ties to the lowest index,
-// never the previous owner (R >= 2). So no run of R consecutive same-owner chunks in feed order: the single drain,
-// R chunks ahead of the slowest owner, keeps every ring fed. Nothing here assumes a token count: 2048-row slabs and
-// 1-chunk decode experts take the same rule.
-namespace rings {
-
-// The ring cores' chunk input buffer (c_0) holds this many chunks, one per "half": two today (the drain runs one chunk
-// ahead of the ring), R + 1 with R prefill rings (R chunks ahead of the slowest owner = the owner table's run bound).
-// The drain keeps one credit semaphore per half; chunk g lands in, and frees, half g % chunk_halves.
-constexpr uint32_t MAX_CHUNK_HALVES = 5;
-constexpr uint32_t MAX_RINGS = MAX_CHUNK_HALVES - 1;
-constexpr uint32_t chunk_halves(uint32_t rings) { return rings < 2 ? 2u : rings + 1; }
-
-template <uint32_t R>
-struct ChunkOwners {
-    uint32_t load[R] = {};
-    uint32_t prev_owner = R;  // no expert yet
-    uint32_t first_owner = 0;
-    bool split = false;
-
-    // Once per expert in id order (zero-chunk experts included); then owner(c) for c in [0, chunks).
-    constexpr void begin_expert(uint32_t chunks) {
-        split = false;
-        if (chunks == 0) {
-            return;
-        }
-        split = chunks >= R;
-        if (split) {
-            first_owner = prev_owner == R ? 0u : (prev_owner + 1) % R;
-            for (uint32_t r = 0; r < R; ++r) {
-                load[r] += chunks / R;
-            }
-            for (uint32_t c = 0; c < chunks % R; ++c) {
-                load[(first_owner + c) % R] += 1;
-            }
-            prev_owner = (first_owner + chunks - 1) % R;
-            return;
-        }
-        uint32_t best = R;
-        for (uint32_t r = 0; r < R; ++r) {
-            if (r == prev_owner) {
-                continue;
-            }
-            if (best == R || load[r] < load[best]) {
-                best = r;
-            }
-        }
-        if (best == R) {  // R == 1: every expert on the one ring
-            best = 0;
-        }
-        first_owner = best;
-        load[best] += chunks;
-        prev_owner = best;
-    }
-    constexpr uint32_t owner(uint32_t chunk) const { return split ? (first_owner + chunk) % R : first_owner; }
-};
-
-}  // namespace rings
 
 }  // namespace moe_ring

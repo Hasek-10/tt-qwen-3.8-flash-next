@@ -281,6 +281,7 @@ void kernel_main() {
     // Alignment
     constexpr uint32_t l1_alignment = get_named_compile_time_arg_val("l1_alignment");
     constexpr uint32_t e_t_entry_size = get_named_compile_time_arg_val("e_t_entry_size");
+    static_assert(e_t_entry_size >= 2 * sizeof(uint32_t), "an e_t entry holds the token id and the k slot");
 
     // Number of pages
     constexpr uint32_t mapping_pages = get_named_compile_time_arg_val("mapping_pages");
@@ -356,12 +357,14 @@ void kernel_main() {
     constexpr uint32_t partial_metadata_ready_semaphore_id =
         get_named_compile_time_arg_val("partial_metadata_ready_semaphore_id");
     constexpr uint32_t metadata_ready_semaphore_id = get_named_compile_time_arg_val("metadata_ready_semaphore_id");
+    constexpr uint32_t previous_chunk_sent_semaphore_id =
+        get_named_compile_time_arg_val("previous_chunk_sent_semaphore_id");
     constexpr uint32_t combine_sync_semaphore_id = get_named_compile_time_arg_val("combine_sync_semaphore_id");
 
     // When compute_only=1, the fused selective_reduce_combine path is bypassed and no combine
     // kernels run on combine cores. Skip the metadata-ready signal to combine cores.
     constexpr bool compute_only = get_named_compile_time_arg_val("compute_only") == 1;
-    // When local_output=1 (moe_compute LocalOutput) there are no combine kernels either: no activation rows are
+    // When local_output=1 (moe_compute SingleCluster) there are no combine kernels either: no activation rows are
     // built and the expert -> token lists are packed (moe_ring::token_list) from per-RISC pair lists (NCRISC c_9,
     // BRISC c_10; the non-drain cores' lists staged on the drain in c_12) by the drain, which publishes the page
     // before releasing the matmul cores: dm1 reads it for its output rows.
@@ -372,6 +375,7 @@ void kernel_main() {
 
     Semaphore<> partial_metadata_ready_sem(partial_metadata_ready_semaphore_id);
     Semaphore<> metadata_ready_sem(metadata_ready_semaphore_id);
+    Semaphore<> previous_chunk_sent_sem(previous_chunk_sent_semaphore_id);
 
     // Device 2.0 migration: legacy primitives retained: these raw L1 semaphore addresses are
     // used as bases for multicast destinations (set_multicast / get_safe_multicast_noc_addr /
@@ -406,7 +410,7 @@ void kernel_main() {
     uint32_t expert_activation_output_address = get_arg_val<uint32_t>(rt_args_idx++);               // 5
     uint32_t e_t_output_address = get_arg_val<uint32_t>(rt_args_idx++);                             // 6
     bool is_drain_tilize_core = (bool)get_arg_val<uint32_t>(rt_args_idx++);                         // 7
-    bool is_secondary_mcaster = (bool)get_arg_val<uint32_t>(rt_args_idx++);                         // 8
+    [[maybe_unused]] bool is_secondary_mcaster = (bool)get_arg_val<uint32_t>(rt_args_idx++);  // 8 - not used by reader
     [[maybe_unused]] uint32_t initial_mcast_gather_core_nox_x =
         get_arg_val<uint32_t>(rt_args_idx++);  // 9 - not used by reader
     [[maybe_unused]] uint32_t initial_mcast_gather_core_nox_y =
@@ -420,10 +424,6 @@ void kernel_main() {
     uint32_t core_token_start = get_arg_val<uint32_t>(rt_args_idx++);  // 15
     uint32_t core_token_end = get_arg_val<uint32_t>(rt_args_idx++);    // 16
     uint32_t tilize_core_idx = get_arg_val<uint32_t>(rt_args_idx++);   // 17
-    // The chunk row reads go over the NoC this core's writer does not multicast on (a linked multicast needs its NoC
-    // idle on its core): the drain and the gathering cores read on NoC0, the secondary multicaster on NoC1. Reading
-    // the next chunk's rows under the current multicast is what pipelines the feed.
-    Noc noc_rows_obj(is_secondary_mcaster ? noc_index : (1 - noc_index));
 
     // TensorAccessorArgs are provided in order: input, indices, scores, mapping, output, expert_activation_output
     constexpr auto input_args = TensorAccessorArgs<0>();
@@ -1122,7 +1122,7 @@ void kernel_main() {
             num_activated_tokens_per_expert[e] = per_expert_counts[e];
         }
 
-        // Push per_expert_total_tokens_cb and total_chunks_cb so writer can read them
+        // Push per_expert_total_tokens_cb (read by the writer) and total_chunks_cb (read by the tilize compute kernel)
         // (drain core already pushed, non-drain cores need to mark as available)
         cb_per_expert_total_tokens.reserve_back(1);
         cb_per_expert_total_tokens.push_back(1);
@@ -1171,7 +1171,9 @@ void kernel_main() {
         // Process tokens in chunks of tokens_per_chunk
         for (uint32_t chunk_start = 0; chunk_start < num_tokens; chunk_start += tokens_per_chunk) {
             uint32_t tokens_in_chunk = std::min(tokens_per_chunk, num_tokens - chunk_start);
+
             cb_tilize_input.reserve_back(tokens_per_chunk);
+
             // Read each activated token from the sparse input buffer
             for (uint32_t i = 0; i < tokens_in_chunk; i++) {
                 // Get sparse token ID from e_t buffer (16B aligned entries) or the packed segment
@@ -1182,18 +1184,24 @@ void kernel_main() {
                     token_id = *reinterpret_cast<uint32_t*>(e_t_expert_addr + (chunk_start + i) * e_t_entry_size);
                 }
                 // read the token from the input tensor at the tilize subtoken offset and size
-                noc_rows_obj.async_read(
+                noc_obj.async_read(
                     input_tensor_addr_gen,
                     cb_tilize_input,
                     subtoken_size,
                     {.page_id = token_id, .offset_bytes = global_subtoken_offset},
                     {.offset_bytes = i * subtoken_size});
             }
-            noc_rows_obj.async_read_barrier();
+            noc_obj.async_read_barrier();
             cb_tilize_input.push_back(tokens_per_chunk);  // Push full chunk (padding is garbage, that's OK)
             num_chunks_sent++;
 
-            // The next chunk's rows are read at once: the one-chunk input CB (the tilize's pop) bounds the run-ahead.
+            // Wait until previous chunk arrives on the matmul cores before reading in another chunk of tokens.
+            // Since both the reader and writer use NoC1, we want writer to have priority access so that chunks
+            // arrive at the matmul cores earlier. Also, to do linked mcast transactions we need NoC to be completely
+            // idle during mcast. The very last wait is technically redundant since we won't be reading in another chunk
+            // of tokens, however it's still required so we don't use NoC1 to write out the output tensors until the
+            // last linked mcast completes.
+            previous_chunk_sent_sem.wait(num_chunks_sent);
         }
     }
 }

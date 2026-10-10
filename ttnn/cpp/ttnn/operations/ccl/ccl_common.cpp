@@ -156,6 +156,17 @@ bool is_axis_straight(const tt::tt_metal::distributed::MeshDevice& mesh_device, 
     return true;
 }
 
+// [tree B, from tenstorrent/tt-metal main 14565689d1e]
+tt::tt_metal::BufferType prefer_l1_small_buffer_type(const tt::tt_metal::distributed::MeshDevice& mesh_device) {
+    const size_t l1_small_bank_size = mesh_device.allocator()->get_bank_size(tt::tt_metal::BufferType::L1_SMALL);
+    return l1_small_bank_size > 0 ? tt::tt_metal::BufferType::L1_SMALL : tt::tt_metal::BufferType::L1;
+}
+
+size_t l1_small_floor_address(const tt::tt_metal::distributed::MeshDevice& mesh_device) {
+    const auto& allocator = mesh_device.allocator();
+    return allocator->get_worker_l1_size() - allocator->get_bank_size(tt::tt_metal::BufferType::L1_SMALL);
+}
+
 bool is_axis_wrap_wired(const tt::tt_metal::distributed::MeshDevice& mesh_device, uint32_t axis) {
     const auto& mesh_view = mesh_device.get_view();
     const auto& mesh_shape = mesh_view.shape();
