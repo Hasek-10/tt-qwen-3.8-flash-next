@@ -1115,7 +1115,6 @@ class Qwen38TTNNMoE:
             activation_type=MoEActivationFunction.SILU,
             compute_only=False,
             num_shared_experts_per_device=0,
-            prefill_rings=self.prefill_rings,
         )
         phase_observer("after-moe-compute-launch")
         if len(outputs) != 6 or outputs[5].tensor_id != self.local_combine_output.tensor_id:
@@ -1350,7 +1349,6 @@ class Qwen38TTNNMoE:
             activation_type=MoEActivationFunction.SILU,
             compute_only=False,
             num_shared_experts_per_device=0,
-            prefill_rings=self.prefill_rings,
         )
         phase_observer("after-moe-compute-launch")
         if len(outputs) != 6 or outputs[5].tensor_id != self.local_combine_output.tensor_id:
@@ -1664,7 +1662,6 @@ class Qwen38TTNNMoE:
                 activation_type=MoEActivationFunction.SILU,
                 compute_only=False,
                 num_shared_experts_per_device=0,
-                prefill_rings=self.prefill_rings,
             )
             phase_observer("after-moe-compute-launch")
             if len(outputs) != 6 or outputs[5].tensor_id != self.local_combine_output.tensor_id:
