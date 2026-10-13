@@ -114,7 +114,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.builder import (
     RESIDENT_QSA_CACHE_CAPACITIES,
     Qwen38ResidentContext,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import CHUNK_ROWS, is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gdn_rows_scan as gdn_rows_scan_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.moe import (
     MOE_CHUNK_ROWS_FORM,
@@ -1628,6 +1628,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
         decode_seconds = 0.0 if first_token_at is None or last_token_at is None else last_token_at - first_token_at
         tokens_per_second = (consumed - 1) / decode_seconds if consumed >= 2 and decode_seconds > 0 else None
         admitted = ticket.admitted_at if ticket.admitted_at is not None else started
+        reused = int(ticket.prefill.get("prefix_reused") or 0)
         extension = {
             "finish": finish,
             "queue_wait_seconds": round(ticket.queue_wait, 4),
@@ -1641,13 +1642,15 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             "tool_calls": len(assembler.calls),
             "tool_parse_errors": assembler.parse_errors,
             "truncated_tool_call": assembler.truncated_tool_call,
-            "prefix_reused": 0,
-            "reset": True,
-            # The snapshot vocabulary of the single stream's ledger: a lane admission is a fresh prefill of the prompt
-            # from position 0 (the chunk driver, or the teacher-forced form of a short prompt) and leaves no snapshot.
-            "snapshot_schedule": "chunked",
-            "snapshot_captured": False,
-            "prefill_tokens": len(prompt_ids),
+            # The snapshot vocabulary of the single stream's ledger: a fresh lane admission prefills exactly the
+            # prompt's ids from position 0 (``chunked``); under --lanes-prefix-reuse one that restored the shared
+            # prefix or split its prefill to capture it equals that to rounding (``forced-tail``), and the prefix it
+            # captured is a prefill of exactly those ids from position 0 (``chunked``).
+            "prefix_reused": reused,
+            "reset": not reused,
+            "snapshot_schedule": "chunked" if ticket.prefill.get("reuse", "fresh") == "fresh" else "forced-tail",
+            "snapshot_captured": "chunked" if ticket.prefill.get("prefix_captured") else None,
+            "prefill_tokens": len(prompt_ids) - reused,
             "prefill_seconds": round(ticket.admission_segments.get("prefill", 0.0), 4),
             "prefill_mode": ticket.prefill.get("mode"),
             "prefill_forced_tokens": ticket.prefill.get("forced_tokens"),
@@ -2190,6 +2193,94 @@ def replay_acceptance_lanes(
     }
 
 
+def replay_prefix_reuse(
+    lanes_session: Any,
+    record: Mapping[str, Any],
+    *,
+    lanes: int,
+    drafts: int,
+    single_stream: Mapping[str, Any],
+    require_gate: bool,
+    continuation: int = ACCEPTANCE_CONTINUATION,
+    stall_budget_seconds: float | None = DEFAULT_STALL_BUDGET_SECONDS,
+) -> dict[str, Any]:
+    """The prompt reuse's startup pin (``--lanes-prefix-reuse``): the gate record three times through the scheduler
+    from clean records, the reuse threshold at one chunk so the record's prompt reaches it.  The first admission is
+    fresh, the second shares the whole prompt with it (it prefills the shared ids, takes the snapshot, prefills the
+    rest), the third restores that snapshot.  The restore must equal the capture token for token (from the snapshot on
+    it repeats the capture's arithmetic) and both must match the CPU record 96/96; whether they equal the
+    single-stream replay is reported (the split's numerics class).  ``require_gate`` refuses a miss."""
+
+    from models.demos.blackhole.qwen38_flash_next.tools.qwen38_lanes_session import REUSE_PLANS
+
+    expected = record["generated_token_ids"][:continuation]
+    prompt = list(record["prompt_token_ids"])
+    if len(prompt) - 1 < CHUNK_ROWS:
+        return {"schema": "qwen38-chat-server-prefix-reuse/v1", "skipped": f"{len(prompt)}-token prompt"}
+    scheduler = Qwen38LaneScheduler(
+        lanes=lanes, drafts=drafts, queue_limit=len(REUSE_PLANS), stall_budget_seconds=stall_budget_seconds
+    )
+    min_tokens = lanes_session.reuse_min_tokens
+    lanes_session.forget()
+    lanes_session.reuse_min_tokens = CHUNK_ROWS
+    try:
+        tickets = {
+            plan: scheduler.submit(
+                Qwen38LaneTicket(
+                    request_id=f"lanes-prefix-reuse-{plan}",
+                    prompt_ids=prompt,
+                    max_tokens=len(expected),
+                    stop_ids=(),
+                    think_budget=None,
+                )
+            )
+            for plan in REUSE_PLANS
+        }
+        scheduler.run(lanes_session, forever=False)
+    finally:
+        lanes_session.reuse_min_tokens = min_tokens
+        lanes_session.forget()  # serving starts from clean records and counts
+    single = next(
+        (row.get("device_token_ids") for row in single_stream["prompts"] if row["prompt"] == record["prompt"]), None
+    )
+    rows = {}
+    for plan, ticket in tickets.items():
+        if not ticket.done.is_set():
+            raise Qwen38ChatChainError(f"lanes prefix reuse: ticket {ticket.request_id} did not finish")
+        actual = _drain_ticket(ticket)
+        rows[plan] = {
+            "plan": ticket.prefill.get("reuse"),
+            "prefix_reused": ticket.prefill.get("prefix_reused"),
+            "prefix_captured": ticket.prefill.get("prefix_captured"),
+            "divergence_index": _divergence(actual, expected),
+            "equals_single_stream": single is not None and actual == list(single),
+            "admission": {name: round(value, 4) for name, value in ticket.admission_segments.items()},
+            "device_token_ids": actual,
+        }
+        _log("prefix_reuse_pin", **{key: value for key, value in rows[plan].items() if key != "device_token_ids"})
+    plans_ran = all(row["plan"] == plan for plan, row in rows.items())
+    restore_exact = rows["restored"]["device_token_ids"] == rows["captured"]["device_token_ids"]
+    gate_pass = all(rows[plan]["divergence_index"] is None for plan in ("captured", "restored"))
+    passed = plans_ran and restore_exact and gate_pass and len(expected) == continuation
+    if require_gate and not passed:
+        raise Qwen38ChatChainError(
+            f"lanes prefix reuse pin on {record['prompt']}: plans {[row['plan'] for row in rows.values()]}, the restore "
+            f"{'equals' if restore_exact else 'differs from'} the capture, CPU divergence "
+            f"{ {plan: row['divergence_index'] for plan, row in rows.items()} }"
+        )
+    return {
+        "schema": "qwen38-chat-server-prefix-reuse/v1",
+        "prompt": record["prompt"],
+        "prompt_tokens": len(prompt),
+        "continuation": continuation,
+        "pass": passed,
+        "plans_ran": plans_ran,
+        "restore_equals_capture": restore_exact,
+        "gate_pass": gate_pass,
+        "rows": rows,
+    }
+
+
 def _drain_ticket(ticket: Qwen38LaneTicket) -> list[int]:
     """Every delivered id of a finished ticket."""
 
@@ -2426,6 +2517,13 @@ def _parser() -> argparse.ArgumentParser:
         "two segments of an admission (0: a pass at every segment; 'off': every admission runs whole and stalls the "
         f"lanes for its length); default {DEFAULT_STALL_BUDGET_SECONDS} (docs/SERVER.md)",
     )
+    parser.add_argument(
+        "--lanes-prefix-reuse",
+        action="store_true",
+        help="--lanes only: a prompt that shares at least 128 tokens with the last admitted one (a system prompt, the "
+        "tools) prefills them once; the chain's prompt snapshot is taken there and later prompts that start with them "
+        "restore it and prefill the rest (pinned at start on the json record; docs/SERVER.md)",
+    )
     return parser
 
 
@@ -2483,6 +2581,10 @@ def main() -> int:
     lanes_switch = lanes_switches(os.environ, args)  # the lanes' geometry and refusals
     if lanes_switch is None and args.lanes_stall_budget != DEFAULT_STALL_BUDGET_SECONDS:
         raise SystemExit("--lanes-stall-budget needs --lanes (the budget is the lane scheduler's)")
+    if args.lanes_prefix_reuse and lanes_switch is None:
+        raise SystemExit("--lanes-prefix-reuse needs --lanes (the single stream keeps its own prompt-end snapshot)")
+    if args.lanes_prefix_reuse and args.prefill_mode != "chunked":
+        raise SystemExit("--lanes-prefix-reuse needs --prefill-mode chunked (the reuse splits the chunked prefill)")
     # The 128-row chunks are the served default of the chunked prefill (bitwise the 32-row chunks; the 560-token chat
     # prompt prefills in 0.81 s against 1.19 s in 32-row chunks alone, docs/PREFILL.md): the flag is accepted, the
     # teacher-forced mode has no chunk trace to extend.
@@ -2658,6 +2760,7 @@ def main() -> int:
                 "drafts": lanes_switch["drafts"],
                 "rows": lanes_switch["rows"],
                 "greedy_only": True,
+                "prefix_reuse": args.lanes_prefix_reuse,
                 "admission": None,
             }
         ),
@@ -2980,6 +3083,26 @@ def main() -> int:
                     json.dumps(report["acceptance_lanes"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
                 )
                 marker("after-lanes-acceptance-replay")
+            # Prompt reuse turns on after the lanes' pin (every record there prefills from position 0, as the single
+            # stream's replay does) and is pinned on its own: the gate record fresh, captured and restored.
+            lanes_session.prefix_reuse = args.lanes_prefix_reuse
+            lanes_session.forget()
+            gate_record = next((record for record in records if record["prompt"] == ACCEPTANCE_GATE_PROMPT), None)
+            if args.lanes_prefix_reuse and gate_record is not None:
+                marker("before-lanes-prefix-reuse-pin")
+                report["prefix_reuse"] = replay_prefix_reuse(
+                    lanes_session,
+                    gate_record,
+                    stall_budget_seconds=args.lanes_stall_budget,
+                    lanes=lanes_switch["lanes"],
+                    drafts=lanes_switch["drafts"],
+                    single_stream=report["acceptance"],
+                    require_gate=args.require_json_96,
+                )
+                (evidence / "prefix-reuse.json").write_text(
+                    json.dumps(report["prefix_reuse"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                marker("after-lanes-prefix-reuse-pin")
         if args.agreement_reference is not None:
             marker("before-agreement-records")
             report["agreement"] = record_agreement(
@@ -3079,6 +3202,14 @@ def main() -> int:
                             else {
                                 key: report["acceptance_lanes"][key]
                                 for key in ("gate_pass", "equals_single_stream", "equal_prompts", "compared_prompts")
+                            }
+                        ),
+                        "prefix_reuse_pin": (
+                            None
+                            if "prefix_reuse" not in report
+                            else {
+                                key: report["prefix_reuse"].get(key)
+                                for key in ("pass", "restore_equals_capture", "gate_pass", "skipped")
                             }
                         ),
                     }

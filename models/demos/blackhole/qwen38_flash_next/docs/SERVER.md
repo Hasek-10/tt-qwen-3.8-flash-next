@@ -221,10 +221,24 @@ feeds it through the verify body (the rows form of the GDN fold on the lanes, `d
 rows, budgets 3 / 5 / 6 / 7 / 9 / 12 on the 177-token chat record, both forced forms (inside a pass and on the last
 emitted token): the reasoning and `</think>` equal on 6 of 6, the answers byte-identical to the end on 3 (budgets 3, 5,
 6) and equal for 611-1023 characters after `</think>` on the other 3 (12, 7, 9), then different; the same budgeted
-request twice on the lanes is byte-identical (8 of 8 repeats, the lanes' own determinism gate).  No prompt-prefix reuse
-in this wave: every request prefills from position 0, so `qwen38.snapshot_schedule` is `chunked` (the admission's own
-schedule: a prefill of exactly the prompt's ids from position 0) and `qwen38.snapshot_captured` is false (a lane leaves
-no prompt-end snapshot; the single stream's restore does not exist here).  Image parts are served on the lanes as on
+request twice on the lanes is byte-identical (8 of 8 repeats, the lanes' own determinism gate).  By default every
+request prefills from position 0, so `qwen38.snapshot_schedule` is `chunked` (the admission's own schedule: a prefill
+of exactly the prompt's ids from position 0) and `qwen38.snapshot_captured` is null.  `--lanes-prefix-reuse` (opt-in)
+reads a shared prompt prefix once: between admissions nothing touches the single-stream chain's state, so its caches
+still hold the last admitted prompt.  An admission whose prompt shares more than 128 ids with that one prefills the
+shared ids up to the last 32-row chunk boundary below them, takes the chain's prompt snapshot there (the recurrent
+buffers; the caches are positional and stay) and prefills the rest; a later admission whose prompt starts with the
+snapshot's ids and the one after them (the MTP layer's last prefix row read it) restores the snapshot and prefills only
+the rest.  The snapshot lives until an admission that does not start with it prefills from position 0, and an image
+prompt always does.  Agents that share a system prompt and tools pay for them once: `qwen38.prefix_reused` is the
+prompt ids not prefilled (`prefill_tokens` the rest), `snapshot_schedule` is `forced-tail` for an admission that
+restored or captured (equal to a fresh prefill to rounding: the split moves the slab and chunk groupings,
+`docs/PREFILL.md`; a restore repeats the capturing admission's arithmetic exactly), `snapshot_captured` is `chunked`
+on the admission that took it, and `/health.lanes` counts `prefix_reused_admissions` and `prefix_reused_tokens`.
+The lanes' startup pin runs without it (every record from position 0, as the single stream's replay); the reuse then
+has its own pin: the `json` record fresh, captured and restored, the restore equal to the capture token for token
+and both 96/96 against the CPU record (`prefix-reuse.json`, `READY.lanes.prefix_reuse_pin`; refused under
+`--require-json-96`).  Image parts are served on the lanes as on
 the single stream (2026-09-29): the tower runs inside the lane admission as its first segment
 (`qwen38.lanes.admission.tower`; the decoding lanes' pass may run between it and the chunks), the prompt prefills
 through the chunk driver with its positions and feature rows, and the lane takes the prompt's rotary shift; a lane's

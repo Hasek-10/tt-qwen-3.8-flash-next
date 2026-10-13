@@ -124,9 +124,10 @@ def test_long_chunks_and_a_slab_combine_with_mtp(tmp_path) -> None:
 
 
 def test_lanes_reach_the_server_greedy(tmp_path) -> None:
-    """``--lanes B`` and ``--lanes-stall-budget S`` reach the server, and the lanes imply ``--no-sampling`` (the lane
-    body resolves by argmax; the server refuses ``--sampling`` beside ``--lanes``).  What the launcher can tell
-    without the server is refused before it starts: B outside 2..8, lanes without ``--mtp``, a budget without lanes."""
+    """``--lanes B``, ``--lanes-stall-budget S`` and ``--lanes-prefix-reuse`` reach the server, and the lanes imply
+    ``--no-sampling`` (the lane body resolves by argmax; the server refuses ``--sampling`` beside ``--lanes``).  What
+    the launcher can tell without the server is refused before it starts: B outside 2..8, lanes without ``--mtp``, a
+    budget or the prompt reuse without lanes."""
 
     if subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], stdout=subprocess.DEVNULL).returncode:
         pytest.skip("the launcher records the checkout's head: not a git checkout")
@@ -135,7 +136,16 @@ def test_lanes_reach_the_server_greedy(tmp_path) -> None:
     stub.chmod(0o755)
     checkpoint, cache_root = tmp_path / "checkpoint", tmp_path / "cache"
     checkpoint.mkdir()
-    common = ("--profile", "qb2", "--checkpoint", str(checkpoint), "--cache-root", str(cache_root), "--python", str(stub))
+    common = (
+        "--profile",
+        "qb2",
+        "--checkpoint",
+        str(checkpoint),
+        "--cache-root",
+        str(cache_root),
+        "--python",
+        str(stub),
+    )
 
     def server_args(*extra: str) -> list[str]:
         run = run_launcher(tmp_path, *common, *extra, "--validate-only")
@@ -147,11 +157,14 @@ def test_lanes_reach_the_server_greedy(tmp_path) -> None:
     lanes = server_args("--mtp", "4", "--lanes", "4", "--lanes-stall-budget", "off")
     assert lanes[lanes.index("--lanes") + 1] == "4" and lanes[lanes.index("--mtp") + 1] == "4"
     assert lanes[lanes.index("--lanes-stall-budget") + 1] == "off" and "--sampling" not in lanes
+    assert "--lanes-prefix-reuse" not in lanes and "--lanes-prefix-reuse" not in single
+    assert "--lanes-prefix-reuse" in server_args("--mtp", "4", "--lanes", "6", "--lanes-prefix-reuse")
     for extra, refusal in (
         (("--mtp", "4", "--lanes", "1"), "--lanes takes 2..8, got 1"),
         (("--mtp", "4", "--lanes", "9"), "--lanes takes 2..8, got 9"),
         (("--lanes", "4"), "--lanes needs --mtp"),
         (("--mtp", "4", "--lanes-stall-budget", "0.25"), "--lanes-stall-budget needs --lanes"),
+        (("--mtp", "4", "--lanes-prefix-reuse"), "--lanes-prefix-reuse needs --lanes"),
     ):
         run = run_launcher(tmp_path, *common, *extra, "--validate-only")
         assert run.returncode == 2 and refusal in run.stderr and run.stdout == "", (extra, run.stderr)
@@ -160,7 +173,7 @@ def test_lanes_reach_the_server_greedy(tmp_path) -> None:
 def test_help_lists_the_lanes_and_ends_at_the_comment_block() -> None:
     run = run_launcher(MODEL_DIR, "--help")
     assert run.returncode == 2
-    assert "--lanes B" in run.stderr and "--lanes-stall-budget S" in run.stderr
+    assert "--lanes B" in run.stderr and "--lanes-stall-budget S" in run.stderr and "--lanes-prefix-reuse" in run.stderr
     assert "combines with --mtp" in run.stderr and "not with --mtp" not in run.stderr
     assert run.stderr.rstrip().endswith("the model's own ttnn/ package never shadows ttnn.")
 

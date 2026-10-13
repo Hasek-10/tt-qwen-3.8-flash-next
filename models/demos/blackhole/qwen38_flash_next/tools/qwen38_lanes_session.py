@@ -28,6 +28,16 @@ hand-off, the eviction, the import) follows a device synchronize or a blocking r
 Greedy only (the lane body resolves by argmax; the sampled lanes form is a later wave).  The verify-rows fold
 (``gdn_rows_scan``) serves the lanes through its lanes form (its prefix states are allocated with the lane verify state,
 its dispatch is the registry's), so the referee chain and the lanes run the served default set, bitwise alike.
+
+Prompt reuse (``prefix_reuse``, the server's ``--lanes-prefix-reuse``): between admissions nothing touches the traced
+chain's state, so its caches still hold the last admitted prompt.  An admission whose prompt shares at least
+``reuse_min_tokens`` ids with that one prefills the shared part from position 0, takes the chain's prompt snapshot
+there (the recurrent buffers; the caches are positional and stay) and prefills the rest; a later admission whose prompt
+starts with the same ids restores the snapshot and prefills only what follows (:func:`reuse_plan`).  Agents that share
+a system prompt and tools then pay for them once.  The split sits on a 32-row chunk boundary and the snapshot's key
+includes the token after it (the MTP layer's last prefix row reads it), so a restore runs no 1-row step and repeats the
+capturing admission's arithmetic exactly; against a fresh prefill of the same prompt it is the single stream's
+``forced-tail`` class (the slab and chunk groupings differ: equal to rounding, ``docs/PREFILL.md``).
 """
 
 from __future__ import annotations
@@ -40,8 +50,11 @@ import ttnn
 from ttnn.unsafe_allocation_tracker import UnsafeAllocationTracker
 
 from models.demos.blackhole.qwen38_flash_next.tools import resident_decode
-from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import CHUNK_PREFILL_MIN_ROWS
-from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import LONG_CHUNK_ROWS
+from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
+    CHUNK_PREFILL_MIN_ROWS,
+    Qwen38PromptSnapshot,
+)
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import CHUNK_ROWS, LONG_CHUNK_ROWS
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_lane_scheduler import (
     Qwen38LaneAdmitted,
     Qwen38LaneTicket,
@@ -69,10 +82,51 @@ ADMISSION_EVENT_ROWS = LONG_CHUNK_ROWS
 # of the prefill, the forced last step and the row read, the eviction into the host slot; the import into the lane
 # ends the admission.
 ADMISSION_SEGMENTS = ("tower", "chunks", "prefilled", "evicted")
+# Prompt reuse: the fewest shared ids worth a snapshot (four 32-row chunks; a capture costs its admission one more
+# hand-off), and how an admission met the chain (``reuse_plan``).
+REUSE_MIN_TOKENS = 128
+REUSE_PLANS = ("fresh", "captured", "restored")
 
 
 class Qwen38LanesSessionError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class Qwen38LanePrefix:
+    """The chain's prompt snapshot as the lanes keep it: the state after ``key[:-1]`` (``position``, a multiple of 32)
+    with the MTP layer's row at ``position - 1`` taken over ``key[-1]``, and the n-gram context there.  It stays valid
+    while the chain's caches below ``position`` hold these ids: a restoring admission writes from ``position`` on."""
+
+    key: tuple[int, ...]
+    ple_context: tuple[int, int] | None
+
+    @property
+    def position(self) -> int:
+        return len(self.key) - 1
+
+
+def shared_prefix(a: Sequence[int], b: Sequence[int]) -> int:
+    """The count of leading ids ``a`` and ``b`` share."""
+
+    count = min(len(a), len(b))
+    return next((index for index in range(count) if a[index] != b[index]), count)
+
+
+def reuse_plan(
+    ids: Sequence[int], resident: Sequence[int], prefix: Qwen38LanePrefix | None, *, min_tokens: int
+) -> tuple[str, int]:
+    """How an admission of ``ids`` meets the chain: ``("restored", P)`` when ``ids`` start with the snapshot's key
+    (restore it, prefill ``ids[P:]``); ``("captured", L)`` when ``ids`` share more than ``min_tokens`` ids with
+    ``resident``, the prompt the chain's caches hold (prefill ``ids[:L]`` from position 0, snapshot there, prefill the
+    rest; L is the last multiple of 32 below the shared ids, so the snapshot's key is shared too); else
+    ``("fresh", 0)``."""
+
+    if prefix is not None and tuple(ids[: len(prefix.key)]) == prefix.key:
+        return "restored", prefix.position
+    common = shared_prefix(ids, resident)
+    split = (common - 1) // CHUNK_ROWS * CHUNK_ROWS if common else 0
+    return ("captured", split) if split >= min_tokens else ("fresh", 0)
 
 
 def _dram_view(mesh) -> dict[str, int]:
@@ -98,6 +152,14 @@ class Qwen38LanesSession:
     # images -> the splice's prompt object and the request's record), set once the tower is resident; None on a
     # text-only process, where an image ticket never reaches the driver (the handler refuses it).
     tower: Callable[..., tuple[Any, dict[str, Any]]] | None = None
+    # Prompt reuse (module docstring): off until the server turns it on after the lanes' startup pin.  ``resident`` is
+    # the text prompt the chain's caches hold from position 0 (empty when unknown: none yet, or an image prompt),
+    # ``prefix`` the snapshot taken inside it, ``reuse`` the admissions by plan and the prompt ids restored.
+    prefix_reuse: bool = False
+    reuse_min_tokens: int = REUSE_MIN_TOKENS
+    resident: tuple[int, ...] = ()
+    prefix: Qwen38LanePrefix | None = None
+    reuse: dict[str, int] = field(default_factory=lambda: {**dict.fromkeys(REUSE_PLANS, 0), "restored_tokens": 0})
     rows: int = field(init=False)
     chain: Any = None
     session: Any = None
@@ -335,7 +397,23 @@ class Qwen38LanesSession:
             "dram": {name: dict(view) for name, view in self.dram.items()},
             "dram_growth_bytes_per_bank": None if "after_captures" not in self.dram else self.growth_bytes_per_bank(),
             "admission": dict(self.admission),
+            "prefix_reuse": (
+                None
+                if not self.prefix_reuse
+                else {
+                    "min_tokens": self.reuse_min_tokens,
+                    "snapshot_position": None if self.prefix is None else self.prefix.position,
+                    **self.reuse,
+                }
+            ),
         }
+
+    def forget(self) -> None:
+        """Start the reuse over (the startup pins): no records, so the next admission prefills from position 0, and no
+        counts.  The chain's state is unchanged."""
+
+        self.resident, self.prefix = (), None
+        self.reuse = {**dict.fromkeys(REUSE_PLANS, 0), "restored_tokens": 0}
 
     # -- the device protocol (the driver thread) ------------------------------------------------
 
@@ -348,7 +426,9 @@ class Qwen38LanesSession:
         into ``lane``.  An image prompt (``ticket.images``) runs its images through the resident tower first (the
         ``"tower"`` segment) and prefills through the chunk driver with its rotary positions and feature rows, as
         the single stream does; the lane takes the prompt's rotary shift at the import (the decode shift the
-        single stream sets at its hand-off), 0 for text.
+        single stream sets at its hand-off), 0 for text.  With ``prefix_reuse`` a text prompt meets the chain by
+        :func:`reuse_plan`: the snapshot restored instead of the reset, or the shared ids prefilled and the snapshot
+        taken before the rest; ``prefill["reuse"]`` names the plan and ``prefix_reused`` the ids not prefilled.
 
         ``between`` is the scheduler's yield point between the admission's device segments: called after the
         tower (``"tower"``), after every 128 prompt rows of the chunked prefill (``"chunks"``, with the rows consumed
@@ -382,24 +462,45 @@ class Qwen38LanesSession:
             if between is not None:
                 between("tower", len(ids), len(ids))
         started = self.clock_ns()
-        session.reset()
-        suffix = list(ids)
-        chunked = None
+        chunked = []  # the chunk driver's results, in prefill order
+
+        def prefill_chunks(token_ids: Sequence[int], following: int, chunk_vision) -> None:
+            result = session._prefill_chunked(
+                token_ids,
+                following,
+                None,
+                chunk_vision,
+                between_chunks=None if between is None else between_chunks,
+                event_rows=None if between is None else ADMISSION_EVENT_ROWS,
+            )
+            if result.stopped is not None:
+                raise Qwen38LanesSessionError(f"the chunked prefill stopped: {result.stopped!r}")
+            chunked.append(result)
+
+        # Prompt reuse (module docstring): an image prompt always prefills from position 0, and so does every prompt
+        # of a chain without the chunk trace.  The records describe the chain's caches: they are dropped until this
+        # admission's prefill has ended.
+        plan, split = "fresh", 0
+        if self.prefix_reuse and vision is None and session.prefill_mode == "chunked":
+            plan, split = reuse_plan(ids, self.resident, self.prefix, min_tokens=self.reuse_min_tokens)
+        prefix, captured = self.prefix, None
+        self.resident, self.prefix = (), None
+        if plan == "restored":
+            session.snapshot = Qwen38PromptSnapshot(prefix.key[:-1], prefix.ple_context)
+            session._restore_prompt_snapshot()  # the chain's state at the split: position, phases, n-gram context
+        else:
+            session.reset()
+        if plan == "captured":
+            prefill_chunks(ids[:split], ids[split], None)
+            chain.capture_prompt_snapshot(split)
+            captured = Qwen38LanePrefix(tuple(ids[: split + 1]), session.ple_context)
+        suffix = list(ids[split:])
         if vision is not None and (
             session.prefill_mode != "chunked" or session.chunk_prefill_rows(len(suffix) - 1) < CHUNK_PREFILL_MIN_ROWS
         ):
             raise Qwen38LanesSessionError("an image prompt needs the chunked prefill (its pads never take 1-row steps)")
         if session.prefill_mode == "chunked" and session.chunk_prefill_rows(len(suffix) - 1) >= CHUNK_PREFILL_MIN_ROWS:
-            chunked = session._prefill_chunked(
-                suffix[:-1],
-                suffix[-1],
-                None,
-                vision,
-                between_chunks=None if between is None else between_chunks,
-                event_rows=None if between is None else ADMISSION_EVENT_ROWS,
-            )
-            if chunked.stopped is not None:
-                raise Qwen38LanesSessionError(f"the chunked prefill stopped: {chunked.stopped!r}")
+            prefill_chunks(suffix[:-1], suffix[-1], vision)
             suffix = suffix[-1:]
         with chain.loop_guard():
             finish = session._prefill(suffix, None, None)
@@ -409,6 +510,12 @@ class Qwen38LanesSession:
         position = int(chain.position())
         if position != len(ids):
             raise Qwen38LanesSessionError(f"device position {position} after prefilling {len(ids)} tokens")
+        if vision is None:
+            self.resident = tuple(ids)
+            self.prefix = prefix if plan == "restored" else captured
+        if self.prefix_reuse:
+            self.reuse[plan] += 1
+            self.reuse["restored_tokens"] += split if plan == "restored" else 0
         ple_context = session.ple_context
         prefilled = self.clock_ns()
         if between is not None:
@@ -439,7 +546,7 @@ class Qwen38LanesSession:
         )
         ttnn.synchronize_device(self.mesh)
         imported = self.clock_ns()
-        timing = None if chunked is None else chunked.timing
+        timings = [result.timing for result in chunked]
         seconds = {
             "prefill": (prefilled - started) / 1e9 - spent,
             "evict": (evicted - evict_started) / 1e9,
@@ -454,12 +561,15 @@ class Qwen38LanesSession:
             seconds=seconds,
             vision=vision_record,
             prefill={
-                "mode": "teacher_forced" if chunked is None else "chunked",
+                "mode": "chunked" if chunked else "teacher_forced",
                 "tokens": len(ids),
-                "forced_tokens": len(ids) if chunked is None else timing.alignment_steps + 1,
-                "chunks": 0 if timing is None else timing.chunks,
-                "long_chunks": 0 if timing is None else timing.long_chunks,
-                "slabs": 0 if timing is None else timing.slabs,
+                "forced_tokens": len(suffix) + sum(timing.alignment_steps for timing in timings),
+                "chunks": sum(timing.chunks for timing in timings),
+                "long_chunks": sum(timing.long_chunks for timing in timings),
+                "slabs": sum(timing.slabs for timing in timings),
+                "reuse": plan,
+                "prefix_reused": split if plan == "restored" else 0,
+                "prefix_captured": split if plan == "captured" else 0,
             },
         )
 

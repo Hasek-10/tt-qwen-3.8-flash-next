@@ -466,8 +466,11 @@ def test_scheduler_and_session_modules_split_the_device_from_the_rules() -> None
         "prefilled",
         "evicted",
     )
-    # the chunk driver takes the vision inputs as the single stream passes them (the positional ``vision``)
-    assert "                vision,\n                between_chunks=" in session_source
+    # the chunk driver takes the vision inputs as the single stream passes them (positional), the prompt's own on the
+    # prefill after any reused or captured text prefix (an image prompt never reuses)
+    assert "                chunk_vision,\n                between_chunks=" in session_source
+    assert "prefill_chunks(suffix[:-1], suffix[-1], vision)" in session_source
+    assert "if self.prefix_reuse and vision is None and session.prefill_mode == " in session_source
     # the scheduler's between: a pass once the admission work since the last pass reached the budget
     assert (
         "if budget is None or self.active_count == 0 or now - self.lanes_progressed_at < budget:" in scheduler_source

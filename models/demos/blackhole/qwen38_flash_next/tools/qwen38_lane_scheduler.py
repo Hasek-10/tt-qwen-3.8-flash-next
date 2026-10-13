@@ -427,6 +427,10 @@ class Qwen38LaneScheduler:
         self.fatal: BaseException | None = None
         self.passes = 0
         self.admissions = 0
+        # The admissions that restored a prompt prefix and the prompt ids they did not prefill (the device's
+        # ``prefill["prefix_reused"]``; 0 without prompt reuse).
+        self.prefix_reused_admissions = 0
+        self.prefix_reused_tokens = 0
         self.requests_done = 0
         self.stalled_seconds_total = 0.0
         self.last_progress: float = clock()  # the last completed device call (a pass, an admission)
@@ -498,6 +502,8 @@ class Qwen38LaneScheduler:
                 "queue_limit": self.queue_limit,
                 "passes": self.passes,
                 "admissions": self.admissions,
+                "prefix_reused_admissions": self.prefix_reused_admissions,
+                "prefix_reused_tokens": self.prefix_reused_tokens,
                 "requests_done": self.requests_done,
                 "stalled_seconds_total": round(self.stalled_seconds_total, 3),
                 "last_pass_seconds": None if self.last_pass_seconds is None else round(self.last_pass_seconds, 4),
@@ -565,6 +571,9 @@ class Qwen38LaneScheduler:
         ticket.position = admitted.position
         ticket.ple_context = admitted.ple_context
         self.admissions += 1
+        reused = int(admitted.prefill.get("prefix_reused") or 0)
+        self.prefix_reused_admissions += 1 if reused else 0
+        self.prefix_reused_tokens += reused
         self.last_progress = ticket.admitted_at
         # The device's segment seconds (the passes excluded) over the yield-point intervals by wall share: each lane
         # carries the intervals it was active for, so a lane whose request ended inside an interleaved pass is

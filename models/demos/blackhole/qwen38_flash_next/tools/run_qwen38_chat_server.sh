@@ -23,6 +23,8 @@
 #                           needs --mtp; greedy only, so it implies --no-sampling); off by default
 #   --lanes-stall-budget S  --lanes only: seconds of admission work the decoding lanes wait before their next pass
 #                           (default 0.5; 0 = a pass at every admission segment; off = every admission runs whole)
+#   --lanes-prefix-reuse    --lanes only: prompts that share at least 128 tokens with the last admitted one (a system
+#                           prompt, the tools) prefill them once; later prompts restore the chain's snapshot there
 #   --stall-seconds N       a request with no completed device step for N seconds ends the server with exit 1 so a
 #                           supervisor restarts it (default 300; every decode step, prefill event and admission from
 #                           the queue restarts the clock, so a long prompt never trips it); 0 disables the watchdog
@@ -60,7 +62,7 @@ die() { printf 'run_qwen38_chat_server: %s\n' "$*" >&2; exit 2; }
 usage() { sed -n '2,/^[^#]/s/^# \{0,1\}//p' "$0" >&2; exit 2; }  # the comment block above, however long
 
 profile= instance=0 devices= checkpoint= cache_root= allocated_context=32768 mtp= port=8000 host=0.0.0.0 long_chunks=
-prefill_slab= lanes= lanes_stall_budget=
+prefill_slab= lanes= lanes_stall_budget= lanes_prefix_reuse=
 acceptance= acceptance_prompts= require_json_96= prepare_only= bf4_stage_limit= bf4_corpus= bf4_corpus_verification=
 serve_seconds= python= validate_only= prefill_mode=chunked sampling=1 stall_seconds=300
 agreement_reference= agreement_parts= agreement_full_logits=
@@ -78,6 +80,7 @@ while [[ $# -gt 0 ]]; do
         --no-sampling) sampling=; shift ;;
         --lanes) lanes=${2-}; shift 2 ;;
         --lanes-stall-budget) lanes_stall_budget=${2-}; shift 2 ;;
+        --lanes-prefix-reuse) lanes_prefix_reuse=1; shift ;;
         --stall-seconds) stall_seconds=${2-}; shift 2 ;;
         --port) port=${2-}; shift 2 ;;
         --host) host=${2-}; shift 2 ;;
@@ -112,6 +115,7 @@ done
 [[ -z "$lanes" || "$lanes" =~ ^[2-8]$ ]] || die "--lanes takes 2..8, got $lanes"
 [[ -z "$lanes" || -n "$mtp" ]] || die "--lanes needs --mtp (the lanes are the MTP lane chain)"
 [[ -z "$lanes_stall_budget" || -n "$lanes" ]] || die "--lanes-stall-budget needs --lanes"
+[[ -z "$lanes_prefix_reuse" || -n "$lanes" ]] || die "--lanes-prefix-reuse needs --lanes"
 [[ -z "$lanes" ]] || sampling=  # the lanes resolve by argmax: the server refuses --sampling beside --lanes
 [[ -z "${TT_METAL_HOME:-}" || "$(cd -- "$TT_METAL_HOME" && pwd -P)" == "$REPO_ROOT" ]] \
     || die "TT_METAL_HOME=$TT_METAL_HOME is not this checkout ($REPO_ROOT); unset it or run that checkout's launcher"
@@ -185,6 +189,7 @@ if [[ -n "$mtp" ]]; then
 fi
 [[ -z "$lanes" ]] || args+=(--lanes "$lanes")
 [[ -z "$lanes_stall_budget" ]] || args+=(--lanes-stall-budget "$lanes_stall_budget")
+[[ -z "$lanes_prefix_reuse" ]] || args+=(--lanes-prefix-reuse)
 [[ -z "$long_chunks" ]] || args+=(--long-chunks)
 if [[ -n "$prefill_slab" ]]; then
     [[ "$prefill_slab" =~ ^[0-9]+$ && $((prefill_slab % 128)) == 0 && "$prefill_slab" -ge 256 && "$prefill_slab" -le 4096 ]] \
