@@ -1022,17 +1022,23 @@ def write_verify_inputs(
     model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState, tokens: Sequence[int]
 ) -> tuple[tuple[int, int] | None, ...]:
     """Host writes of one pass's inputs (outside any trace): the R tokens ``[t_P, d_1 .. d_k]`` into the token row,
-    the k drafts into the draft lanes, and their n-gram rows (looked up from the PLE rows state's committed
-    context) into the persistent PLE rows.  Returns the R + 1 contexts (``contexts[c]`` after committing c rows)."""
+    the k drafts into the draft lanes (:func:`write_verify_tokens`), and their n-gram rows (looked up from the PLE
+    rows state's committed context) into the persistent PLE rows.  Returns the R + 1 contexts (``contexts[c]`` after
+    committing c rows)."""
+
+    tokens = write_verify_tokens(model, verify, tokens)
+    return write_verify_ple_rows(model, verify, tokens)
+
+
+def write_verify_tokens(model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState, tokens: Sequence[int]) -> list[int]:
+    """Host writes of the R tokens ``[t_P, d_1 .. d_k]`` into the token row and of the k drafts into the draft lanes
+    (outside any trace): the bootstrap pass's inputs, and a host-drafted pass's (the device draft body assembles the
+    same two rows otherwise).  The PLE rows follow (:func:`write_verify_ple_rows`).  Returns the tokens as ints."""
 
     _validate_verify_state(model, verify)
     tokens = [int(token) for token in tokens]
     if len(tokens) != verify.rows:
         raise ValueError(f"a k={verify.drafts} verify pass takes {verify.rows} tokens, got {len(tokens)}")
-    ple = model.layers[PLE_CHECKPOINT_LAYER].ple
-    ple_state = verify.layers[PLE_CHECKPOINT_LAYER].ple
-    if ple is None or ple_state is None:
-        raise RuntimeError("checkpoint layer 1 PLE owner/rows state is unavailable")
     replicate = replicate_tensor_2d_mesh_mapper(model.mesh_device)
     ttnn.copy_host_to_device_tensor(
         ttnn.from_torch(
@@ -1049,7 +1055,7 @@ def write_verify_inputs(
         ttnn.from_torch(drafts, dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=replicate),
         verify.draft_lanes,
     )
-    return write_verify_ple_rows(model, verify, tokens)
+    return tokens
 
 
 @dataclass(frozen=True)
@@ -2698,6 +2704,7 @@ class Qwen38TTNNMTPPassRecord:
     arithmetic: str | None = None
     guard_deviations: int | None = None
     candidate_rows: Any | None = None
+    source: str = "device"  # who drafted the NEXT pass's k ids: the device draft body, or the host drafter ("host")
 
 
 class Qwen38TTNNMTPChain:
@@ -2739,6 +2746,15 @@ class Qwen38TTNNMTPChain:
     are looked up while the draft runs, and the next ``step`` looks up only rows 2..k before the one upload: the
     same rows from the same contexts, row for row.  The host-decided split form keeps today's order: its head
     readback already blocks the host before the tail, so its lanes arrive with the pass row anyway.
+
+    With ``host_drafter`` (``extend(tokens)`` and ``propose(next_token) -> k ids | None``, e.g.
+    ``ngram_draft.Qwen38NgramDrafter``; the fused greedy form only: no split, no device-decided form, no commit queue,
+    no separate draft history, no early rows reader) a pass takes the host-first form: the verify row is read alone,
+    the drafter is told the pass's committed rows and asked for the next pass's k ids, and a proposal is written into
+    the token row and the draft lanes (:func:`write_verify_tokens`) in place of the device draft, whose k - 1
+    sequential rows are what a proposal saves; a decline launches the device draft as the fused form does (its body
+    reads the same verify row; nothing ran in between) and reads the pass row.  The accept rule reads only the
+    target's argmaxes, so a proposal of any quality commits the target's stream exactly.
     """
 
     def __init__(
@@ -2761,6 +2777,7 @@ class Qwen38TTNNMTPChain:
         before_verify_sampled: Callable[[list[int]], Any] | None = None,
         record_candidate_rows: bool = False,
         early_reader: Qwen38TTNNEarlyRowsReader | None = None,
+        host_drafter: Any | None = None,
     ) -> None:
         _validate_draft_state(model, verify, draft)
         if not isinstance(traces, Qwen38TTNNMTPTraces) or not callable(replay):
@@ -2790,6 +2807,18 @@ class Qwen38TTNNMTPChain:
                 # The host-decided split form keeps today's order: its head readback already blocks the host before
                 # the tail, so (a, t') are known before the draft anyway and d_1 only lands with the tail.
                 raise ValueError("the early rows reader serves the fused and the device-decided forms, not the split")
+        if host_drafter is not None:
+            if not callable(getattr(host_drafter, "propose", None)) or not callable(getattr(host_drafter, "extend", None)):
+                raise TypeError("host_drafter needs propose(next_token) and extend(tokens)")
+            if traces.split or traces.device_sampled or commit_queue is not None or traces.draft_history is not None:
+                raise ValueError(
+                    "a host drafter takes the fused greedy form: no split or device-decided verify, no commit queue, "
+                    "no separate draft history"
+                )
+            if early_reader is not None:
+                raise ValueError("a host drafter reads the verify row on the main queue: no early rows reader")
+        self.host_drafter = host_drafter
+        self.host_passes = 0  # passes whose next drafts the host drafter proposed
         self.early_reader = early_reader
         self._early_rows: Qwen38TTNNPLEEarlyRows | None = None
         self.before_verify_sampled, self.record_candidate_rows = before_verify_sampled, record_candidate_rows
@@ -2822,6 +2851,8 @@ class Qwen38TTNNMTPChain:
         return result
 
     def _finish_pass(self, tokens: Sequence[int], segments: dict[str, int]) -> Qwen38TTNNMTPPassRecord:
+        if self.host_drafter is not None:
+            return self._finish_pass_host_first(tokens, segments)
         launch, form = (self.replay, "replay") if self.enqueue is None else (self.enqueue, "enqueue")
         decision = None
         early_reader = self.early_reader
@@ -2922,6 +2953,81 @@ class Qwen38TTNNMTPChain:
         self.next_token, self.first_draft = readback.next_token, readback.first_draft
         self._early_rows = early_rows  # the next step's rows 0-1 (None: it looks every row up)
         return record
+
+    def _finish_pass_host_first(self, tokens: Sequence[int], segments: dict[str, int]) -> Qwen38TTNNMTPPassRecord:
+        """The pass with a host drafter: the verify, its row read alone (the device idles through the host segment
+        instead of drafting), the drafter told this pass's committed rows and asked for the next pass's k ids, then
+        either the proposal written into the token row and the draft lanes, or, on a decline, the device draft
+        launched as in the fused form and the pass row read.  A pass that commits EOS drafts nothing."""
+
+        launch, form = (self.replay, "replay") if self.enqueue is None else (self.enqueue, "enqueue")
+        verify_trace = (
+            self.traces.verify_catch_up if self.records and self.traces.commit is None else self.traces.verify_first
+        )
+        self._timed(segments, f"verify_{form}", lambda: launch(verify_trace))
+        readback = self._timed(
+            segments, "verify_readback", lambda: read_verify_output(self.verify_output, rows=self.verify.rows)
+        )
+        if readback.first_draft is None:
+            raise RuntimeError("the verify readback carries no first draft; the chain needs the alignment rows")
+        committed = list(readback.argmaxes[: readback.accepted + 1])
+        first_eos = next((i for i, token in enumerate(committed) if token in self.eos_token_ids), None)
+        if first_eos is None and committed[-1] != readback.next_token:
+            raise RuntimeError(f"verify readback next token {readback.next_token} is not argmax {readback.accepted}")
+        self.host_drafter.extend(list(tokens[: readback.accepted + 1]))  # this pass's rows: t_P, the accepted drafts
+        source, first_draft = "device", readback.first_draft
+        proposal = None
+        if first_eos is None:
+            proposal = self._timed(segments, "host_draft", lambda: self._host_proposal(readback.next_token))
+        if proposal is not None:
+            source, first_draft = "host", proposal[0]
+            self.next_tokens = (readback.next_token, *proposal)
+            self._timed(
+                segments, "host_tokens", lambda: write_verify_tokens(self.model, self.verify, self.next_tokens)
+            )
+            self.host_passes += 1
+        elif first_eos is None:
+            self._timed(segments, f"draft_{form}", lambda: launch(self.traces.draft))
+            row, self.next_tokens = self._timed(segments, "readback", lambda: read_pass_row(self.verify, self.draft))
+            if (row.accepted, row.next_token, row.argmaxes) != (
+                readback.accepted,
+                readback.next_token,
+                readback.argmaxes,
+            ):
+                raise RuntimeError("the pass row's verify lanes are not the verify row the host read")
+        else:
+            self.next_tokens = None  # EOS: the chain is finished, no next pass to draft for
+        commit_verify_host(self.verify, readback.accepted)
+        if first_eos is not None:
+            committed = committed[: first_eos + 1]
+            self.finished = True
+        record = Qwen38TTNNMTPPassRecord(
+            index=len(self.records),
+            position=self.position,
+            tokens=tuple(tokens),
+            accepted=readback.accepted,
+            committed=tuple(committed),
+            argmaxes=readback.argmaxes,
+            next_token=readback.next_token,
+            first_draft=first_draft,
+            finished=self.finished,
+            segments_ns=segments,
+            source=source,
+        )
+        self.records.append(record)
+        self.position += readback.accepted + 1
+        self.next_token, self.first_draft = readback.next_token, first_draft
+        self._early_rows = None
+        return record
+
+    def _host_proposal(self, next_token: int) -> tuple[int, ...] | None:
+        proposal = self.host_drafter.propose(next_token)
+        if proposal is None:
+            return None
+        proposal = tuple(int(token) for token in proposal)
+        if len(proposal) != self.verify.drafts or any(token < 0 for token in proposal):
+            raise RuntimeError(f"the host drafter must propose {self.verify.drafts} non-negative ids, got {proposal!r}")
+        return proposal
 
     def bootstrap(self, tokens: Sequence[int]) -> Qwen38TTNNMTPPassRecord:
         """The first traced pass after :func:`seed_verify_state_inplace`: host-written ``[t_P, d_1 .. d_k]`` (the

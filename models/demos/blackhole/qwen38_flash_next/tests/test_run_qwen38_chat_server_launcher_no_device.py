@@ -157,6 +157,31 @@ def test_lanes_reach_the_server_greedy(tmp_path) -> None:
         assert run.returncode == 2 and refusal in run.stderr and run.stdout == "", (extra, run.stderr)
 
 
+def test_the_wider_draft_counts_and_the_draft_source_reach_the_server(tmp_path) -> None:
+    """``--mtp`` takes 3..15 (k > 5 single-stream) and ``--draft-source`` (needs ``--mtp``) reaches the server."""
+
+    if subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], stdout=subprocess.DEVNULL).returncode:
+        pytest.skip("the launcher records the checkout's head: not a git checkout")
+    stub = tmp_path / "python"
+    stub.write_text(STUB_PYTHON)
+    stub.chmod(0o755)
+    checkpoint, cache_root = tmp_path / "checkpoint", tmp_path / "cache"
+    checkpoint.mkdir()
+    common = ("--profile", "qb2", "--checkpoint", str(checkpoint), "--cache-root", str(cache_root), "--python", str(stub))
+    run = run_launcher(tmp_path, *common, "--mtp", "15", "--draft-source", "hybrid", "--validate-only")
+    assert run.returncode == 0, run.stderr
+    args = [line[len("arg=") :] for line in run.stdout.splitlines()[1:]]
+    assert args[args.index("--mtp") + 1] == "15" and args[args.index("--draft-source") + 1] == "hybrid"
+    for extra, refusal in (
+        (("--mtp", "16"), "--mtp takes 3..15, got 16"),
+        (("--mtp", "2"), "--mtp takes 3..15, got 2"),
+        (("--draft-source", "hybrid"), "--draft-source needs --mtp"),
+        (("--mtp", "4", "--draft-source", "lookahead"), "--draft-source takes mtp, hybrid or ngram"),
+    ):
+        run = run_launcher(tmp_path, *common, *extra, "--validate-only")
+        assert run.returncode == 2 and refusal in run.stderr and run.stdout == "", (extra, run.stderr)
+
+
 def test_help_lists_the_lanes_and_ends_at_the_comment_block() -> None:
     run = run_launcher(MODEL_DIR, "--help")
     assert run.returncode == 2

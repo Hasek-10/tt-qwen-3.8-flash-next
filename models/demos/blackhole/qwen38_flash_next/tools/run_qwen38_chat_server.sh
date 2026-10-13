@@ -15,6 +15,9 @@
 #   --allocated-context N   32768 (default) | 65536 | 131072 | 262144
 #   --mtp K                 multi-token-prediction drafting depth, 3..15 (off by default; greedy chunked-mode requests draft;
 #                           k > 5 is unrun on silicon and single-stream only)
+#   --draft-source SRC      mtp (the MTP head drafts, default) | hybrid (the host's prompt-lookup drafter when the last
+#                           n tokens recur in the request's text, the MTP head otherwise) | ngram (the host alone);
+#                           needs --mtp; the host forms run one command queue and have no lanes form
 #   --long-chunks           accepted for compatibility: the 128-row chunks are the server's default (combines with --mtp)
 #   --prefill-slab ROWS     prefill in slabs of ROWS rows (a multiple of 128, 256..4096; 2048 is the measured form)
 #                           ahead of the 128-row chunks (off by default; implies --long-chunks; combines with --mtp)
@@ -61,7 +64,7 @@ die() { printf 'run_qwen38_chat_server: %s\n' "$*" >&2; exit 2; }
 usage() { sed -n '2,/^[^#]/s/^# \{0,1\}//p' "$0" >&2; exit 2; }  # the comment block above, however long
 
 profile= instance=0 devices= checkpoint= cache_root= allocated_context=32768 mtp= port=8000 host=0.0.0.0 long_chunks=
-prefill_slab= lanes= lanes_stall_budget=
+prefill_slab= lanes= lanes_stall_budget= draft_source=
 acceptance= acceptance_prompts= require_json_96= prepare_only= bf4_stage_limit= bf4_corpus= bf4_corpus_verification=
 serve_seconds= python= validate_only= prefill_mode=chunked sampling=1 stall_seconds=300
 agreement_reference= agreement_parts= agreement_full_logits=
@@ -78,6 +81,7 @@ while [[ $# -gt 0 ]]; do
         --prefill-slab) prefill_slab=${2-}; shift 2 ;;
         --no-sampling) sampling=; shift ;;
         --lanes) lanes=${2-}; shift 2 ;;
+        --draft-source) draft_source=${2-}; shift 2 ;;
         --lanes-stall-budget) lanes_stall_budget=${2-}; shift 2 ;;
         --stall-seconds) stall_seconds=${2-}; shift 2 ;;
         --port) port=${2-}; shift 2 ;;
@@ -113,6 +117,8 @@ done
 [[ -z "$lanes" || "$lanes" =~ ^[2-8]$ ]] || die "--lanes takes 2..8, got $lanes"
 [[ -z "$lanes" || -n "$mtp" ]] || die "--lanes needs --mtp (the lanes are the MTP lane chain)"
 [[ -z "$lanes_stall_budget" || -n "$lanes" ]] || die "--lanes-stall-budget needs --lanes"
+[[ -z "$draft_source" || "$draft_source" =~ ^(mtp|hybrid|ngram)$ ]] || die "--draft-source takes mtp, hybrid or ngram, got $draft_source"
+[[ -z "$draft_source" || -n "$mtp" ]] || die "--draft-source needs --mtp"
 [[ -z "$lanes" ]] || sampling=  # the lanes resolve by argmax: the server refuses --sampling beside --lanes
 [[ -z "${TT_METAL_HOME:-}" || "$(cd -- "$TT_METAL_HOME" && pwd -P)" == "$REPO_ROOT" ]] \
     || die "TT_METAL_HOME=$TT_METAL_HOME is not this checkout ($REPO_ROOT); unset it or run that checkout's launcher"
@@ -185,6 +191,7 @@ if [[ -n "$mtp" ]]; then
     args+=(--mtp "$mtp")
 fi
 [[ -z "$lanes" ]] || args+=(--lanes "$lanes")
+[[ -z "$draft_source" ]] || args+=(--draft-source "$draft_source")
 [[ -z "$lanes_stall_budget" ]] || args+=(--lanes-stall-budget "$lanes_stall_budget")
 [[ -z "$long_chunks" ]] || args+=(--long-chunks)
 if [[ -n "$prefill_slab" ]]; then

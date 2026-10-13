@@ -81,6 +81,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_protocol import 
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     CHUNK_PREFILL_MIN_ROWS,
     DEFAULT_PREFILL_MODE,
+    DRAFT_SOURCES,
     LONG_CHUNKS_BYTES_PER_BANK_AFTER_CAPTURES,
     MAX_TOKENS_BOUND,
     MTP_DRAFTS,
@@ -233,13 +234,28 @@ MTP_DRAFTS_PER_REQUEST_PAIR = (4, 5)
 def mtp_drafts_per_request_switch(environment: Mapping[str, str], *, drafts: int | None) -> tuple[int, ...]:
     """``QWEN38_MTP_DRAFTS_PER_REQUEST``: 1 captures the other chain of :data:`MTP_DRAFTS_PER_REQUEST_PAIR` beside the
     server's ``--mtp`` chain and admits ``mtp_drafts`` in requests; the result is the admitted draft counts, the default
-    first (empty = one chain, the field refused).  Unset or 0 leaves one chain; 1 needs ``--mtp`` in the pair."""
+    first (empty = one chain, the field refused).  Unset or 0 leaves one chain; 1 needs ``--mtp`` in the pair.  A
+    comma-separated list of draft counts (``4,8,15``) captures exactly those chains: distinct counts of
+    :data:`MTP_DRAFTS`, ``--mtp`` among them (the open's live admission still decides whether they fit)."""
 
     value = environment.get(MTP_DRAFTS_PER_REQUEST_VARIABLE)
     if value is None or value == "0":
         return ()
+    if "," in value:
+        try:
+            counts = tuple(int(part) for part in value.split(","))
+        except ValueError:
+            raise SystemExit(
+                f"{MTP_DRAFTS_PER_REQUEST_VARIABLE} must be 0 or 1 or a list of draft counts, got {value!r}"
+            ) from None
+        if len(set(counts)) != len(counts) or any(count not in MTP_DRAFTS for count in counts) or drafts not in counts:
+            raise SystemExit(
+                f"{MTP_DRAFTS_PER_REQUEST_VARIABLE}={value} needs distinct draft counts of {MTP_DRAFTS} with --mtp "
+                f"among them, got --mtp {drafts}"
+            )
+        return (drafts,) + tuple(count for count in counts if count != drafts)
     if value != "1":
-        raise SystemExit(f"{MTP_DRAFTS_PER_REQUEST_VARIABLE} must be 0 or 1, got {value!r}")
+        raise SystemExit(f"{MTP_DRAFTS_PER_REQUEST_VARIABLE} must be 0 or 1 or a list of draft counts, got {value!r}")
     if drafts not in MTP_DRAFTS_PER_REQUEST_PAIR:
         raise SystemExit(
             f"{MTP_DRAFTS_PER_REQUEST_VARIABLE}=1 needs --mtp in {MTP_DRAFTS_PER_REQUEST_PAIR} (the chains it captures), "
@@ -317,8 +333,11 @@ def lanes_switches(environment: Mapping[str, str], args: Any) -> dict[str, Any] 
         raise SystemExit(
             f"{PLE_EARLY_VARIABLE}=1 has no lanes form: unset it under --lanes (the lanes run the one-queue form)"
         )
-    if environment.get(MTP_DRAFTS_PER_REQUEST_VARIABLE, "").strip() == "1":
-        raise SystemExit(f"{MTP_DRAFTS_PER_REQUEST_VARIABLE}=1 has no lanes form: unset it under --lanes")
+    per_request = environment.get(MTP_DRAFTS_PER_REQUEST_VARIABLE, "").strip()
+    if per_request not in ("", "0"):
+        raise SystemExit(f"{MTP_DRAFTS_PER_REQUEST_VARIABLE}={per_request} has no lanes form: unset it under --lanes")
+    if getattr(args, "draft_source", "mtp") != "mtp":
+        raise SystemExit(f"--draft-source {args.draft_source} has no lanes form (the lanes draft on the device)")
     return {"lanes": lanes, "rows": rows, "drafts": int(args.mtp)}
 
 
@@ -2410,6 +2429,15 @@ def _parser() -> argparse.ArgumentParser:
         help="MTP: the GDN state re-anchor (layer0 = layer 0's commits run the 1-row fp32 step recurrence)",
     )
     parser.add_argument(
+        "--draft-source",
+        choices=DRAFT_SOURCES,
+        default="mtp",
+        help="MTP: who drafts a greedy pass's k ids: the MTP head on the device (mtp, the default); the host's "
+        "prompt-lookup drafter when the last n tokens recur in the request's text, the MTP head otherwise (hybrid); "
+        "the host alone, fill tokens when nothing recurs (ngram, the drafter measured by itself).  The host forms run "
+        "the one-queue pass loop (QWEN38_MTP_PLE_EARLY off) and have no lanes form",
+    )
+    parser.add_argument(
         "--lanes",
         type=int,
         default=0,
@@ -2556,6 +2584,13 @@ def main() -> int:
         raise SystemExit(f"{PLE_EARLY_VARIABLE}=1 needs --mtp (the early rows are the MTP pass loop's)")
     if lanes_switch is not None:
         mtp_ple_early = False  # the lanes run the one-queue form: the second queue's early read has no lanes form
+    # A host draft source reads the verify row on the main queue before it drafts: the one-queue pass loop.
+    if args.draft_source != "mtp" and args.mtp is None:
+        raise SystemExit(f"--draft-source {args.draft_source} needs --mtp (it drafts the MTP pass loop)")
+    if args.draft_source != "mtp" and os.environ.get(PLE_EARLY_VARIABLE) == "1":
+        raise SystemExit(f"--draft-source {args.draft_source} runs the one-queue pass loop: unset {PLE_EARLY_VARIABLE}")
+    if args.draft_source != "mtp":
+        mtp_ple_early = False
     # The open captures these forms; its gate evaluates the same configuration.
     forms = mtp_verify_forms(mtp_sampled, mtp_device_accept)
     # QWEN38_MTP_MOE_ROWS (diagnostic, default unset): the verify MoE row count forced on the chain (5, 6 or 32);
@@ -2644,6 +2679,7 @@ def main() -> int:
             "sampled": mtp_sampled,
             "device_accept": mtp_device_accept,
             "ple_early": mtp_ple_early,
+            "draft_source": args.draft_source if args.mtp is not None else None,  # --draft-source: who drafts
             "moe_rows": mtp_moe_rows,  # the switch's forced verify MoE rows, None = moe_rows_for(k + 1)
             # QWEN38_MTP_DRAFTS_PER_REQUEST=1: the chains captured at open, the default first; a request picks one
             # with extra_body.mtp_drafts (the fingerprint and the acceptance baselines are the default chain's)
@@ -2847,6 +2883,7 @@ def main() -> int:
             mtp_moe_rows=mtp_moe_rows,
             mtp_alternates=mtp_drafts_admitted[1:],
             mtp_ple_early=mtp_ple_early,
+            mtp_draft_source=args.draft_source,
             warm_hook=warm_hook,
         )
         if chain.allocated_context != resident_context.allocated_context:

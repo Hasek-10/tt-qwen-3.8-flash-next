@@ -101,7 +101,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_prefill_driver import
     alignment_steps,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn import gdn as gdn_module
-from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_v2
+from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_v2, ngram_draft
 from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import ZERO_EMBEDDING_TOKEN
 from models.demos.blackhole.qwen38_flash_next.config import LAYER_PATTERN
 from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_module
@@ -166,6 +166,11 @@ THINK_END_ID = protocol.THINK_END_ID
 # commits run the 1-row fp32 step recurrence over the committed rows), the bootstrap pass's placeholder drafts, the
 # resident expert pairs with the MTP layer's.
 MTP_DRAFTS = tuple(range(3, 16))
+# Who drafts a greedy pass's k ids: the MTP head on the device (``mtp``); the host's prompt-lookup drafter
+# (``ttnn/ngram_draft.py``) when the last n tokens recur in the request's text, the MTP head otherwise (``hybrid``);
+# the host alone, fill tokens when nothing recurs (``ngram``: the arm that measures the drafter by itself).  The host
+# forms run the fused greedy pass loop on one command queue; sampled requests keep the device draft.
+DRAFT_SOURCES = ("mtp", "hybrid", "ngram")
 MTP_GDN_ANCHORS = ("off", "layer0")
 MTP_GDN_ANCHOR_LAYERS = {"off": (), "layer0": (0,)}
 MTP_BOOTSTRAP_DRAFT_TOKEN = 0
@@ -1406,6 +1411,9 @@ class Qwen38ChatSession:
                         before_verify_sampled=before_verify_sampled,
                         record_candidate_rows=record_rows,
                     )
+                elif decide is None and getattr(self.mtp, "draft_source", "mtp") != "mtp":
+                    # A host draft source: the committed ids are the prompt-lookup drafter's history.
+                    record = self.chain.mtp_enter(pending, self.ple_context, history=tuple(self.committed))
                 elif decide is None:
                     record = self.chain.mtp_enter(pending, self.ple_context)
                 else:
@@ -2206,6 +2214,18 @@ class Qwen38ChainMTP:
     sampled_fallbacks: int = 0
     device_accept_passes: int = 0  # sampled passes the device decided (counted in the sampled_* counters too)
     device_accept_guard_deviations: int = 0  # rows of those passes whose kept minimum did not clear the shard floor
+    # Who drafts the greedy passes (DRAFT_SOURCES): "mtp" the device; "hybrid" / "ngram" the host's prompt-lookup
+    # drafter (mtp_enter builds one per request from the committed ids).  A host source runs one command queue (no
+    # early rows reader).  Its counter and the two summary fields exist only on a host source, so the default
+    # chain's records are unchanged.
+    draft_source: str = "mtp"
+    host_drafted_passes: int = 0  # passes whose next drafts the host drafter proposed
+
+    def __post_init__(self) -> None:
+        if self.draft_source not in DRAFT_SOURCES:
+            raise ValueError(f"draft_source must be one of {DRAFT_SOURCES}, got {self.draft_source!r}")
+        if self.draft_source != "mtp" and self.ple_early:
+            raise ValueError("a host draft source reads the verify row on the main queue: no early rows reader")
 
     @property
     def alignment(self) -> mtp_v2.Qwen38TTNNVerifyAlignment:
@@ -2226,6 +2246,8 @@ class Qwen38ChainMTP:
         if len(self.pass_accepts) == self.pass_accepts.maxlen:
             self.pass_accepts_dropped += 1
         self.pass_accepts.append(pass_record.accepted)
+        if getattr(pass_record, "source", "device") == "host":
+            self.host_drafted_passes += 1
         statistics = {} if pass_record.decision is None else pass_record.decision.statistics
         self.accept_checks += int(statistics.get("accept_checks", 0))
         if statistics.get("sampled"):
@@ -2259,7 +2281,10 @@ class Qwen38ChainMTP:
     )
 
     def counters(self) -> dict[str, int]:
-        return {name: getattr(self, name) for name in self.COUNTERS}
+        counts = {name: getattr(self, name) for name in self.COUNTERS}
+        if self.draft_source != "mtp":
+            counts["host_drafted_passes"] = self.host_drafted_passes
+        return counts
 
     def summary(self, *, since: Mapping[str, int] | None = None) -> dict[str, Any]:
         """The ``qwen38.mtp`` object: k, anchor, the switch, passes, accepted drafts and tokens per pass (``a + 1``
@@ -2295,6 +2320,8 @@ class Qwen38ChainMTP:
             "accepted_histogram": None if (since is not None and per_pass is None) else histogram,
             "accepted_per_pass": per_pass,
         }
+        if self.draft_source != "mtp":
+            summary.update(draft_source=self.draft_source, host_drafted_passes=counts["host_drafted_passes"])
         if self.sampled:
             sampled_passes, sampled_accepted = counts["sampled_passes"], counts["sampled_accepted_drafts"]
             summary.update(
@@ -2544,6 +2571,7 @@ class Qwen38TracedChain:
         decide: Callable[..., Any] | None = None,
         before_verify_sampled: Callable[[list[int]], Any] | None = None,
         record_candidate_rows: bool = False,
+        history: Sequence[int] = (),
     ) -> mtp_v2.Qwen38TTNNMTPPassRecord:
         """Eager switch into verify mode at the device position (the host's committed count), then the bootstrap
         pass whose row 0 is ``first_token`` (placeholder drafts).  Returns the pass record.  The pass loop's form:
@@ -2552,7 +2580,9 @@ class Qwen38TracedChain:
         split traces, the host deciding between the head and the tail (``mtp_sampled`` chains only);
         ``before_verify_sampled`` (a sampled request the device acceptance admits: the callable writes the pass's
         uniforms to the accept program's constants) runs the device-decided traces (``mtp_device_accept`` chains
-        only), ``record_candidate_rows`` putting the rows the device decided on into every pass record."""
+        only), ``record_candidate_rows`` putting the rows the device decided on into every pass record.  On a host
+        draft source a greedy request's pass loop drafts on the host: ``history`` (the committed ids before
+        ``first_token``) seeds the request's prompt-lookup drafter."""
 
         mtp = self.mtp
         model = self.built_target.model
@@ -2585,6 +2615,15 @@ class Qwen38TracedChain:
             # The fused and the device-decided forms: the verify lanes read on the second queue under the draft.
             # The host-decided split keeps today's order (its head readback blocks the host before the tail).
             early_reader = mtp_v2.Qwen38TTNNEarlyRowsReader(self.mesh, verify_output.readback, cq_id=1, main_cq_id=0)
+        host_drafter = None
+        if mtp.draft_source != "mtp" and decide is None and before_verify_sampled is None:
+            # The fused greedy form drafts on the host: the request's text so far is the lookup history.
+            host_drafter = ngram_draft.Qwen38NgramDrafter(
+                mtp.drafts,
+                history=history,
+                fill_token=MTP_BOOTSTRAP_DRAFT_TOKEN,
+                decline=mtp.draft_source == "hybrid",
+            )
         mtp.chain = mtp_v2.Qwen38TTNNMTPChain(
             model,
             mtp.verify,
@@ -2599,6 +2638,8 @@ class Qwen38TracedChain:
             before_verify_sampled=before_verify_sampled,
             record_candidate_rows=record_candidate_rows,
             early_reader=early_reader,
+            # the host drafter only when there is one: a default chain's call form is unchanged
+            **({} if host_drafter is None else {"host_drafter": host_drafter}),
         )
         return mtp.record(mtp.chain.bootstrap([first_token] + [MTP_BOOTSTRAP_DRAFT_TOKEN] * mtp.drafts))
 
@@ -2655,6 +2696,7 @@ class Qwen38TracedChain:
         mtp_moe_rows: int | None = None,
         mtp_alternates: Sequence[int] = (),
         mtp_ple_early: bool = False,
+        mtp_draft_source: str = "mtp",
     ) -> Qwen38TracedChain:
         """Target build, generic state (+ chunk state), warm pass (+ one eager chunk and both hand-off forms), miss
         guard, 8 decode captures (+ the chunk capture): the runner's chain prologue and the full-model gate's order.
@@ -2687,8 +2729,15 @@ class Qwen38TracedChain:
         ``mtp_ple_early`` (``QWEN38_MTP_PLE_EARLY``; the mesh opened with two command queues) makes the fused and the
         device-decided pass loops read the verify lanes on the second queue and look the next pass's PLE rows 0-1 up
         under the draft (``mtp_enter`` builds the reader; the host-decided split keeps its order).
+        ``mtp_draft_source`` (:data:`DRAFT_SOURCES`; ``mtp`` by default) ``hybrid`` or ``ngram`` drafts the greedy
+        pass loops on the host (``mtp_enter`` builds a prompt-lookup drafter per request; one command queue, so not
+        with ``mtp_ple_early``); every chain, the alternates included, takes it.
         """
 
+        if mtp_draft_source not in DRAFT_SOURCES:
+            raise ValueError(f"mtp_draft_source must be one of {DRAFT_SOURCES}, got {mtp_draft_source!r}")
+        if mtp_draft_source != "mtp" and (mtp is None or mtp_ple_early):
+            raise ValueError("a host draft source needs mtp and the one-queue pass loop (no mtp_ple_early)")
         if type(chunk_gdn_step_anchor) is not bool:
             raise ValueError(f"chunk_gdn_step_anchor must be a bool, got {chunk_gdn_step_anchor!r}")
         if type(long_chunks) is not bool:
@@ -2865,6 +2914,7 @@ class Qwen38TracedChain:
                 sampled=mtp_sampled,
                 device_accept=mtp_device_accept,
                 ple_early=mtp_ple_early,
+                draft_source=mtp_draft_source,
             )
             if long_chunk_state is not None:
                 # The 128-row twin runs the MTP layer's rows inside the 128-row chunk body (base= the 32-row extension,
@@ -2959,6 +3009,7 @@ class Qwen38TracedChain:
                     dram_bytes_per_bank=alternate_dram,
                     sampled=mtp_sampled,
                     ple_early=mtp_ple_early,
+                    draft_source=mtp_draft_source,
                 )
                 synchronize()
                 alternate_dram["states"] = dram_allocated_per_bank() - allocated_before_alternate
@@ -3739,6 +3790,7 @@ def construct_chain(
     mtp_moe_rows: int | None = None,
     mtp_alternates: Sequence[int] = (),
     mtp_ple_early: bool = False,
+    mtp_draft_source: str = "mtp",
     warm_hook: Callable[[Qwen38TracedChain], None] | None = None,
 ) -> Qwen38TracedChain:
     """Live construction on the open mesh (missing BF4 layers converted first), then the chain prologue.
@@ -3767,5 +3819,6 @@ def construct_chain(
         mtp_moe_rows=mtp_moe_rows,
         mtp_alternates=mtp_alternates,
         mtp_ple_early=mtp_ple_early,
+        mtp_draft_source=mtp_draft_source,
         warm_hook=warm_hook,
     )
