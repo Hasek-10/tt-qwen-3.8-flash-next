@@ -15,9 +15,9 @@
 #   --allocated-context N   32768 (default) | 65536 | 131072 | 262144
 #   --mtp K                 multi-token-prediction drafting depth, 3..15 (off by default; greedy chunked-mode requests draft;
 #                           k > 5 is unrun on silicon and single-stream only)
-#   --draft-source SRC      mtp (the MTP head drafts, default) | hybrid (the host's prompt-lookup drafter when the last
-#                           n tokens recur in the request's text, the MTP head otherwise) | ngram (the host alone);
-#                           needs --mtp; the host forms run one command queue and have no lanes form
+#   --draft-source SRC      who drafts a request that names no draft_source: mtp (the MTP head, default) | hybrid
+#                           (the host's prompt lookup when the request's text recurs, the MTP head otherwise) |
+#                           ngram (the host alone); needs --mtp; no lanes form
 #   --long-chunks           accepted for compatibility: the 128-row chunks are the server's default (combines with --mtp)
 #   --prefill-slab ROWS     prefill in slabs of ROWS rows (a multiple of 128, 256..4096; 2048 is the measured form)
 #                           ahead of the 128-row chunks (off by default; implies --long-chunks; combines with --mtp)

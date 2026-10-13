@@ -177,6 +177,7 @@ KNOWN_REQUEST_FIELDS = frozenset(
         "ignore_eos",
         "prefill_mode",
         "mtp_drafts",
+        "draft_source",
     )
     + sampling_step.SAMPLING_REQUEST_FIELDS
 )
@@ -342,7 +343,12 @@ def lanes_switches(environment: Mapping[str, str], args: Any) -> dict[str, Any] 
 
 
 def parse_chat_request(
-    document: Any, *, seed: int | None = None, sampling_available: bool = True, mtp_drafts_admitted: Sequence[int] = ()
+    document: Any,
+    *,
+    seed: int | None = None,
+    sampling_available: bool = True,
+    mtp_drafts_admitted: Sequence[int] = (),
+    draft_sources_admitted: Sequence[str] = (),
 ) -> dict[str, Any]:
     """The fields the server honours, validated with actual-vs-expected messages (one completion; the sampling
     fields per ``qwen38_sampling_step``, ``extra_body`` merged under the top level, JSON null an absent field,
@@ -487,6 +493,27 @@ def parse_chat_request(
             "logprobs need a sampled request (temperature > 0): the greedy loop reads no candidate row",
             param="logprobs",
         )
+    draft_source = document.get("draft_source")
+    if draft_source is not None:
+        # Who drafts this request's passes (extra_body.draft_source): the device's MTP head (mtp) or the host's
+        # prompt lookup (hybrid, ngram) on a single-stream --mtp server; refused, never dropped, where the server
+        # has no pass loop to give it (no --mtp, the lanes) and on a sampled request (the host forms are greedy).
+        if not draft_sources_admitted:
+            raise Qwen38ChatRequestRejected(
+                f"draft_source is not admitted by this server (no single-stream MTP pass loop): drop it, got "
+                f"{draft_source!r}",
+                param="draft_source",
+            )
+        if draft_source not in draft_sources_admitted:
+            raise Qwen38ChatRequestRejected(
+                f"draft_source must be one of {list(draft_sources_admitted)}, got {draft_source!r}",
+                param="draft_source",
+            )
+        if draft_source != "mtp" and sampling is not None:
+            raise Qwen38ChatRequestRejected(
+                f"draft_source {draft_source} drafts greedy requests only: drop the sampling fields or the field",
+                param="draft_source",
+            )
     if sampling is not None and not sampling_available:
         explicit = [
             name
@@ -513,6 +540,7 @@ def parse_chat_request(
         "ignore_eos": ignore_eos,
         "prefill_mode": prefill_mode,
         "mtp_drafts": mtp_drafts,
+        "draft_source": draft_source,
         "sampling": sampling,
         "logprobs": logprobs,
         "top_logprobs": top_logprobs,
@@ -660,6 +688,7 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
         system_fingerprint: str | None = None,
         dram_after_captures: Mapping[str, Any] | None = None,
         mtp_drafts_admitted: Sequence[int] = (),
+        draft_sources_admitted: Sequence[str] = (),
         listen: bool = True,
         lanes: Qwen38LaneScheduler | None = None,
     ) -> None:
@@ -688,6 +717,7 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
         self.progress: dict[str, Any] | None = None  # the request holding the device: start, last poll, polls
         self.system_fingerprint = system_fingerprint  # source head + runtime .so: what a seed reproduces against
         self.mtp_drafts_admitted = tuple(mtp_drafts_admitted)  # the chains a request may pick (extra_body.mtp_drafts)
+        self.draft_sources_admitted = tuple(draft_sources_admitted)  # who may draft a request (extra_body.draft_source)
         # The mesh allocator read after the traces were captured (hardware_profiles.symmetric_mesh_dram_memory: one observation
         # that applies to every card): free_bytes_per_bank is the build's headroom, reported as read, never updated.
         self.dram_after_captures = dram_after_captures
@@ -1099,6 +1129,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 json.loads(self.rfile.read(int(length)).decode("utf-8")),
                 sampling_available=session.sampling is not None,
                 mtp_drafts_admitted=self.server.mtp_drafts_admitted,
+                draft_sources_admitted=self.server.draft_sources_admitted,
             )
             # The reference render is the device prompt (usage.prompt_tokens is the client's own count); it validates
             # the whole request and resolves the budget (the remaining context when max_tokens is absent) before any
@@ -1374,6 +1405,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 prefill_mode=request["prefill_mode"],
                 sampling=sampling,
                 mtp_drafts=request["mtp_drafts"],
+                draft_source=request["draft_source"],
                 **vision_inputs_kw,
             )
             final_deltas = assembler.finish()
@@ -2432,10 +2464,10 @@ def _parser() -> argparse.ArgumentParser:
         "--draft-source",
         choices=DRAFT_SOURCES,
         default="mtp",
-        help="MTP: who drafts a greedy pass's k ids: the MTP head on the device (mtp, the default); the host's "
-        "prompt-lookup drafter when the last n tokens recur in the request's text, the MTP head otherwise (hybrid); "
-        "the host alone, fill tokens when nothing recurs (ngram, the drafter measured by itself).  The host forms run "
-        "the one-queue pass loop (QWEN38_MTP_PLE_EARLY off) and have no lanes form",
+        help="MTP: who drafts a greedy request's passes when the request names none (extra_body.draft_source picks "
+        "per request): the MTP head on the device (mtp, the default); the host's prompt-lookup drafter when the last "
+        "n tokens recur in the request's text, the MTP head otherwise (hybrid); the host alone, fill tokens when "
+        "nothing recurs (ngram, the drafter measured by itself).  No lanes form",
     )
     parser.add_argument(
         "--lanes",
@@ -2584,13 +2616,12 @@ def main() -> int:
         raise SystemExit(f"{PLE_EARLY_VARIABLE}=1 needs --mtp (the early rows are the MTP pass loop's)")
     if lanes_switch is not None:
         mtp_ple_early = False  # the lanes run the one-queue form: the second queue's early read has no lanes form
-    # A host draft source reads the verify row on the main queue before it drafts: the one-queue pass loop.
+    # --draft-source is the default for requests that name none; a request picks with extra_body.draft_source on a
+    # single-stream --mtp server.  A host-drafted request reads its verify row on the main queue (its pass loop takes
+    # no early rows read); the device-drafted requests keep the second queue's.
     if args.draft_source != "mtp" and args.mtp is None:
         raise SystemExit(f"--draft-source {args.draft_source} needs --mtp (it drafts the MTP pass loop)")
-    if args.draft_source != "mtp" and os.environ.get(PLE_EARLY_VARIABLE) == "1":
-        raise SystemExit(f"--draft-source {args.draft_source} runs the one-queue pass loop: unset {PLE_EARLY_VARIABLE}")
-    if args.draft_source != "mtp":
-        mtp_ple_early = False
+    draft_sources_admitted = DRAFT_SOURCES if args.mtp is not None and lanes_switch is None else ()
     # The open captures these forms; its gate evaluates the same configuration.
     forms = mtp_verify_forms(mtp_sampled, mtp_device_accept)
     # QWEN38_MTP_MOE_ROWS (diagnostic, default unset): the verify MoE row count forced on the chain (5, 6 or 32);
@@ -2680,6 +2711,7 @@ def main() -> int:
             "device_accept": mtp_device_accept,
             "ple_early": mtp_ple_early,
             "draft_source": args.draft_source if args.mtp is not None else None,  # --draft-source: who drafts
+            "draft_sources_admitted": list(draft_sources_admitted),  # a request picks with extra_body.draft_source
             "moe_rows": mtp_moe_rows,  # the switch's forced verify MoE rows, None = moe_rows_for(k + 1)
             # QWEN38_MTP_DRAFTS_PER_REQUEST=1: the chains captured at open, the default first; a request picks one
             # with extra_body.mtp_drafts (the fingerprint and the acceptance baselines are the default chain's)
@@ -2757,6 +2789,7 @@ def main() -> int:
                 stall_seconds=args.stall_seconds,
                 system_fingerprint=summary["system_fingerprint"],
                 mtp_drafts_admitted=mtp_drafts_admitted,
+                draft_sources_admitted=draft_sources_admitted,
                 listen=False,
                 lanes=scheduler,
             )

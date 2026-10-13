@@ -981,6 +981,8 @@ class Qwen38ChatSession:
         self.snapshot: Qwen38PromptSnapshot | None = None
         self.committed: list[int] = []
         self.ple_context: tuple[int, int] | None = None
+        # Who drafts the running request's greedy passes (complete's draft_source, else the chain's default).
+        self.request_draft_source = "mtp"
         self.last_finish: str | None = None
         self.row_unconsumed = False  # the next token sits in the row (after length, disconnected, a hook stop)
         self.row_token: int | None = None  # a length finish's last token: read, delivered to the client, not committed
@@ -1411,9 +1413,15 @@ class Qwen38ChatSession:
                         before_verify_sampled=before_verify_sampled,
                         record_candidate_rows=record_rows,
                     )
-                elif decide is None and getattr(self.mtp, "draft_source", "mtp") != "mtp":
-                    # A host draft source: the committed ids are the prompt-lookup drafter's history.
-                    record = self.chain.mtp_enter(pending, self.ple_context, history=tuple(self.committed))
+                elif decide is None and {self.request_draft_source, getattr(self.mtp, "draft_source", "mtp")} != {"mtp"}:
+                    # A host source is involved (the request's or the chain's default): the request's source goes to
+                    # the chain explicitly, and the committed ids are a prompt-lookup drafter's history.
+                    record = self.chain.mtp_enter(
+                        pending,
+                        self.ple_context,
+                        history=tuple(self.committed),
+                        draft_source=self.request_draft_source,
+                    )
                 elif decide is None:
                     record = self.chain.mtp_enter(pending, self.ple_context)
                 else:
@@ -1627,6 +1635,7 @@ class Qwen38ChatSession:
         verify_each_step: bool = False,
         mtp_drafts: int | None = None,
         vision: vision_splice.Qwen38VisionPrompt | None = None,
+        draft_source: str | None = None,
     ) -> Qwen38ChatCompletion:
         """Prefill what the device does not already hold, then generate up to ``max_tokens`` tokens (the remaining
         context when ``None``; ``require_budget``).
@@ -1686,6 +1695,12 @@ class Qwen38ChatSession:
             raise Qwen38ChatRequestError("sampling is unavailable: this chain captured no candidate row (greedy only)")
         if self.poisoned:
             raise Qwen38ChatChainError("session is poisoned by an earlier device failure")
+        # Who drafts this request's greedy passes (extra_body.draft_source): the device's MTP head or the host's
+        # prompt lookup, the bound chain's default when the request names none; refused where it cannot run.
+        if draft_source is not None and (self.mtp is None or draft_source not in DRAFT_SOURCES):
+            raise Qwen38ChatRequestError(f"draft_source {draft_source!r} needs an MTP chain and one of {DRAFT_SOURCES}")
+        if draft_source not in (None, "mtp") and sampling is not None:
+            raise Qwen38ChatRequestError(f"draft_source {draft_source} drafts greedy requests only")
         # The request's drafting chain (extra_body.mtp_drafts on a QWEN38_MTP_DRAFTS_PER_REQUEST server): bound as
         # the session's and the traced chain's ``mtp`` for the request (the pass loop, the 1-row decode's step write,
         # the settle, the summary go through it), the default restored on the way out.
@@ -1695,6 +1710,9 @@ class Qwen38ChatSession:
                     f"mtp_drafts {mtp_drafts!r} is not a chain of this session (captured: {sorted(self.mtp_chains)})"
                 )
             self._bind_mtp(self.mtp_chains[mtp_drafts])
+        self.request_draft_source = (
+            draft_source if draft_source is not None else getattr(self.mtp, "draft_source", "mtp")
+        )
         # MTP drafting serves the greedy requests of the chunked mode and, with the chain's switch on, the sampled
         # requests the pass loop can bound (drafting_admission); the rest take the 1-row loops (speculative=False is
         # the diagnostic form: a greedy request on the 1-row loop of an MTP chain).
@@ -1783,6 +1801,7 @@ class Qwen38ChatSession:
             hook_stopped = chunk_stopped
             first_ns = last_ns = started_ns
             mtp_before = None if not drafting else self.mtp.counters()
+            host_before = None if not drafting else self.mtp.host_drafted_passes
 
             def consume(steps) -> None:
                 nonlocal finish, hook_stopped, first_ns, last_ns
@@ -1904,10 +1923,23 @@ class Qwen38ChatSession:
             prefill_slab_prepare_ms=0.0 if chunked is None else sum(chunked.timing.slab_prepare_ms),
             prefill_slab_upload_ms=0.0 if chunked is None else sum(chunked.timing.slab_upload_ms),
             prefill_slab_wait_ms=0.0 if chunked is None else sum(chunked.timing.slab_wait_ms),
-            mtp=None if not drafting else self.mtp.summary(since=mtp_before),
+            mtp=None if not drafting else self._mtp_summary(mtp_before, host_before),
         )
         self._bind_mtp(self.mtp_default)
         return completion
+
+    def _mtp_summary(self, before: Mapping[str, int], host_before: int) -> dict[str, Any]:
+        """The request's ``qwen38.mtp``: the bound chain's counters since the request began, plus who drafted (the
+        request's source) and its host-drafted passes whenever a host source is involved (the request's or the
+        chain's default), so a device-drafted request on a default chain reports the pinned fields alone."""
+
+        summary = self.mtp.summary(since=before)
+        if self.request_draft_source != "mtp" or "draft_source" in summary:
+            summary.update(
+                draft_source=self.request_draft_source,
+                host_drafted_passes=self.mtp.host_drafted_passes - host_before,
+            )
+        return summary
 
     # -- teacher forcing with rows (the agreement records) -----------------------------------------
 
@@ -2214,18 +2246,17 @@ class Qwen38ChainMTP:
     sampled_fallbacks: int = 0
     device_accept_passes: int = 0  # sampled passes the device decided (counted in the sampled_* counters too)
     device_accept_guard_deviations: int = 0  # rows of those passes whose kept minimum did not clear the shard floor
-    # Who drafts the greedy passes (DRAFT_SOURCES): "mtp" the device; "hybrid" / "ngram" the host's prompt-lookup
-    # drafter (mtp_enter builds one per request from the committed ids).  A host source runs one command queue (no
-    # early rows reader).  Its counter and the two summary fields exist only on a host source, so the default
-    # chain's records are unchanged.
+    # Who drafts a greedy request's passes when it names no source (DRAFT_SOURCES; a request picks per request):
+    # "mtp" the device; "hybrid" / "ngram" the host's prompt-lookup drafter (mtp_enter builds one per request from
+    # the committed ids; that request's pass loop reads its verify row on the main queue, no early rows read).  The
+    # counter and the two summary fields exist only on a host default, so the default chain's records are unchanged;
+    # a request's own host passes are reported by the session.
     draft_source: str = "mtp"
     host_drafted_passes: int = 0  # passes whose next drafts the host drafter proposed
 
     def __post_init__(self) -> None:
         if self.draft_source not in DRAFT_SOURCES:
             raise ValueError(f"draft_source must be one of {DRAFT_SOURCES}, got {self.draft_source!r}")
-        if self.draft_source != "mtp" and self.ple_early:
-            raise ValueError("a host draft source reads the verify row on the main queue: no early rows reader")
 
     @property
     def alignment(self) -> mtp_v2.Qwen38TTNNVerifyAlignment:
@@ -2572,6 +2603,7 @@ class Qwen38TracedChain:
         before_verify_sampled: Callable[[list[int]], Any] | None = None,
         record_candidate_rows: bool = False,
         history: Sequence[int] = (),
+        draft_source: str | None = None,
     ) -> mtp_v2.Qwen38TTNNMTPPassRecord:
         """Eager switch into verify mode at the device position (the host's committed count), then the bootstrap
         pass whose row 0 is ``first_token`` (placeholder drafts).  Returns the pass record.  The pass loop's form:
@@ -2580,9 +2612,10 @@ class Qwen38TracedChain:
         split traces, the host deciding between the head and the tail (``mtp_sampled`` chains only);
         ``before_verify_sampled`` (a sampled request the device acceptance admits: the callable writes the pass's
         uniforms to the accept program's constants) runs the device-decided traces (``mtp_device_accept`` chains
-        only), ``record_candidate_rows`` putting the rows the device decided on into every pass record.  On a host
-        draft source a greedy request's pass loop drafts on the host: ``history`` (the committed ids before
-        ``first_token``) seeds the request's prompt-lookup drafter."""
+        only), ``record_candidate_rows`` putting the rows the device decided on into every pass record.  A greedy
+        request on a host draft source (``draft_source``, the chain's default when None) drafts on the host:
+        ``history`` (the committed ids before ``first_token``) seeds its prompt-lookup drafter, and its pass loop
+        reads the verify row on the main queue (no early rows reader)."""
 
         mtp = self.mtp
         model = self.built_target.model
@@ -2615,14 +2648,16 @@ class Qwen38TracedChain:
             # The fused and the device-decided forms: the verify lanes read on the second queue under the draft.
             # The host-decided split keeps today's order (its head readback blocks the host before the tail).
             early_reader = mtp_v2.Qwen38TTNNEarlyRowsReader(self.mesh, verify_output.readback, cq_id=1, main_cq_id=0)
+        source = mtp.draft_source if draft_source is None else draft_source
+        if source not in DRAFT_SOURCES:
+            raise Qwen38ChatChainError(f"draft_source must be one of {DRAFT_SOURCES}, got {source!r}")
         host_drafter = None
-        if mtp.draft_source != "mtp" and decide is None and before_verify_sampled is None:
-            # The fused greedy form drafts on the host: the request's text so far is the lookup history.
+        if source != "mtp" and decide is None and before_verify_sampled is None:
+            # The fused greedy form drafts on the host: the request's text so far is the lookup history, and the
+            # verify row is read on the main queue before the draft (the early reader has no host-first form).
+            early_reader = None
             host_drafter = ngram_draft.Qwen38NgramDrafter(
-                mtp.drafts,
-                history=history,
-                fill_token=MTP_BOOTSTRAP_DRAFT_TOKEN,
-                decline=mtp.draft_source == "hybrid",
+                mtp.drafts, history=history, fill_token=MTP_BOOTSTRAP_DRAFT_TOKEN, decline=source == "hybrid"
             )
         mtp.chain = mtp_v2.Qwen38TTNNMTPChain(
             model,
@@ -2729,15 +2764,15 @@ class Qwen38TracedChain:
         ``mtp_ple_early`` (``QWEN38_MTP_PLE_EARLY``; the mesh opened with two command queues) makes the fused and the
         device-decided pass loops read the verify lanes on the second queue and look the next pass's PLE rows 0-1 up
         under the draft (``mtp_enter`` builds the reader; the host-decided split keeps its order).
-        ``mtp_draft_source`` (:data:`DRAFT_SOURCES`; ``mtp`` by default) ``hybrid`` or ``ngram`` drafts the greedy
-        pass loops on the host (``mtp_enter`` builds a prompt-lookup drafter per request; one command queue, so not
-        with ``mtp_ple_early``); every chain, the alternates included, takes it.
+        ``mtp_draft_source`` (:data:`DRAFT_SOURCES`; ``mtp`` by default) is the draft source of the greedy requests
+        that name none: ``hybrid`` or ``ngram`` draft on the host (``mtp_enter`` builds a prompt-lookup drafter per
+        request); every chain, the alternates included, takes it.
         """
 
         if mtp_draft_source not in DRAFT_SOURCES:
             raise ValueError(f"mtp_draft_source must be one of {DRAFT_SOURCES}, got {mtp_draft_source!r}")
-        if mtp_draft_source != "mtp" and (mtp is None or mtp_ple_early):
-            raise ValueError("a host draft source needs mtp and the one-queue pass loop (no mtp_ple_early)")
+        if mtp_draft_source != "mtp" and mtp is None:
+            raise ValueError("a host draft source needs mtp: it drafts the MTP pass loop")
         if type(chunk_gdn_step_anchor) is not bool:
             raise ValueError(f"chunk_gdn_step_anchor must be a bool, got {chunk_gdn_step_anchor!r}")
         if type(long_chunks) is not bool:
