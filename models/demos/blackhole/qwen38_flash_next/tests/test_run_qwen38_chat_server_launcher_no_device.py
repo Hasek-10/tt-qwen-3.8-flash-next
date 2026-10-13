@@ -123,6 +123,48 @@ def test_long_chunks_and_a_slab_combine_with_mtp(tmp_path) -> None:
     assert "accepted for compatibility: the 128-row chunks are the server's default (combines with --mtp)" in launcher
 
 
+def test_lanes_reach_the_server_greedy(tmp_path) -> None:
+    """``--lanes B`` and ``--lanes-stall-budget S`` reach the server, and the lanes imply ``--no-sampling`` (the lane
+    body resolves by argmax; the server refuses ``--sampling`` beside ``--lanes``).  What the launcher can tell
+    without the server is refused before it starts: B outside 2..8, lanes without ``--mtp``, a budget without lanes."""
+
+    if subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], stdout=subprocess.DEVNULL).returncode:
+        pytest.skip("the launcher records the checkout's head: not a git checkout")
+    stub = tmp_path / "python"
+    stub.write_text(STUB_PYTHON)
+    stub.chmod(0o755)
+    checkpoint, cache_root = tmp_path / "checkpoint", tmp_path / "cache"
+    checkpoint.mkdir()
+    common = ("--profile", "qb2", "--checkpoint", str(checkpoint), "--cache-root", str(cache_root), "--python", str(stub))
+
+    def server_args(*extra: str) -> list[str]:
+        run = run_launcher(tmp_path, *common, *extra, "--validate-only")
+        assert run.returncode == 0, run.stderr
+        return [line[len("arg=") :] for line in run.stdout.splitlines()[1:]]
+
+    single = server_args("--mtp", "4")
+    assert "--sampling" in single and "--lanes" not in single and "--lanes-stall-budget" not in single
+    lanes = server_args("--mtp", "4", "--lanes", "4", "--lanes-stall-budget", "off")
+    assert lanes[lanes.index("--lanes") + 1] == "4" and lanes[lanes.index("--mtp") + 1] == "4"
+    assert lanes[lanes.index("--lanes-stall-budget") + 1] == "off" and "--sampling" not in lanes
+    for extra, refusal in (
+        (("--mtp", "4", "--lanes", "1"), "--lanes takes 2..8, got 1"),
+        (("--mtp", "4", "--lanes", "9"), "--lanes takes 2..8, got 9"),
+        (("--lanes", "4"), "--lanes needs --mtp"),
+        (("--mtp", "4", "--lanes-stall-budget", "0.25"), "--lanes-stall-budget needs --lanes"),
+    ):
+        run = run_launcher(tmp_path, *common, *extra, "--validate-only")
+        assert run.returncode == 2 and refusal in run.stderr and run.stdout == "", (extra, run.stderr)
+
+
+def test_help_lists_the_lanes_and_ends_at_the_comment_block() -> None:
+    run = run_launcher(MODEL_DIR, "--help")
+    assert run.returncode == 2
+    assert "--lanes B" in run.stderr and "--lanes-stall-budget S" in run.stderr
+    assert "combines with --mtp" in run.stderr and "not with --mtp" not in run.stderr
+    assert run.stderr.rstrip().endswith("the model's own ttnn/ package never shadows ttnn.")
+
+
 def test_the_launcher_changes_directory_before_the_interpreter_runs() -> None:
     launcher = LAUNCHER.read_text(encoding="utf-8")
     change = launcher.index('cd "$REPO_ROOT"')

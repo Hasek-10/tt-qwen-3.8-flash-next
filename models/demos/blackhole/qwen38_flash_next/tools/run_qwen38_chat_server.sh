@@ -16,9 +16,13 @@
 #   --mtp K                 multi-token-prediction drafting depth, 3, 4 or 5 (off by default; greedy chunked-mode requests draft)
 #   --long-chunks           accepted for compatibility: the 128-row chunks are the server's default (combines with --mtp)
 #   --prefill-slab ROWS     prefill in slabs of ROWS rows (a multiple of 128, 256..4096; 2048 is the measured form)
-#                           ahead of the 128-row chunks (off by default; implies --long-chunks; not with --mtp)
+#                           ahead of the 128-row chunks (off by default; implies --long-chunks; combines with --mtp)
 #   --no-sampling           serve greedy requests only (the default server takes --sampling: a request naming no
 #                           sampling field is still the bitwise greedy stream, temperature > 0 samples)
+#   --lanes B               serve up to B requests at once through the MTP lane chain (2..8 with B x (k + 1) <= 32;
+#                           needs --mtp; greedy only, so it implies --no-sampling); off by default
+#   --lanes-stall-budget S  --lanes only: seconds of admission work the decoding lanes wait before their next pass
+#                           (default 0.5; 0 = a pass at every admission segment; off = every admission runs whole)
 #   --stall-seconds N       a request with no completed device step for N seconds ends the server with exit 1 so a
 #                           supervisor restarts it (default 300; every decode step, prefill event and admission from
 #                           the queue restarts the clock, so a long prompt never trips it); 0 disables the watchdog
@@ -53,10 +57,10 @@ readonly REPO_ROOT="$(cd -- "$MODEL_DIR/../../../.." && pwd -P)"
 readonly SERVER="$HERE/qwen38_chat_server.py"
 
 die() { printf 'run_qwen38_chat_server: %s\n' "$*" >&2; exit 2; }
-usage() { sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,/^[^#]/s/^# \{0,1\}//p' "$0" >&2; exit 2; }  # the comment block above, however long
 
 profile= instance=0 devices= checkpoint= cache_root= allocated_context=32768 mtp= port=8000 host=0.0.0.0 long_chunks=
-prefill_slab=
+prefill_slab= lanes= lanes_stall_budget=
 acceptance= acceptance_prompts= require_json_96= prepare_only= bf4_stage_limit= bf4_corpus= bf4_corpus_verification=
 serve_seconds= python= validate_only= prefill_mode=chunked sampling=1 stall_seconds=300
 agreement_reference= agreement_parts= agreement_full_logits=
@@ -72,6 +76,8 @@ while [[ $# -gt 0 ]]; do
         --long-chunks) long_chunks=1; shift ;;
         --prefill-slab) prefill_slab=${2-}; shift 2 ;;
         --no-sampling) sampling=; shift ;;
+        --lanes) lanes=${2-}; shift 2 ;;
+        --lanes-stall-budget) lanes_stall_budget=${2-}; shift 2 ;;
         --stall-seconds) stall_seconds=${2-}; shift 2 ;;
         --port) port=${2-}; shift 2 ;;
         --host) host=${2-}; shift 2 ;;
@@ -103,6 +109,10 @@ done
 [[ -z "$bf4_corpus" && -z "$bf4_corpus_verification" || -n "$bf4_corpus" && -n "$bf4_corpus_verification" ]] \
     || die "--bf4-corpus and --bf4-corpus-verification go together"
 [[ -z "$acceptance" || -z "$acceptance_prompts" ]] || die "--acceptance and --acceptance-prompts are alternatives"
+[[ -z "$lanes" || "$lanes" =~ ^[2-8]$ ]] || die "--lanes takes 2..8, got $lanes"
+[[ -z "$lanes" || -n "$mtp" ]] || die "--lanes needs --mtp (the lanes are the MTP lane chain)"
+[[ -z "$lanes_stall_budget" || -n "$lanes" ]] || die "--lanes-stall-budget needs --lanes"
+[[ -z "$lanes" ]] || sampling=  # the lanes resolve by argmax: the server refuses --sampling beside --lanes
 [[ -z "${TT_METAL_HOME:-}" || "$(cd -- "$TT_METAL_HOME" && pwd -P)" == "$REPO_ROOT" ]] \
     || die "TT_METAL_HOME=$TT_METAL_HOME is not this checkout ($REPO_ROOT); unset it or run that checkout's launcher"
 for name in checkpoint cache_root acceptance_prompts bf4_corpus bf4_corpus_verification python agreement_reference agreement_full_logits; do
@@ -173,6 +183,8 @@ if [[ -n "$mtp" ]]; then
     [[ "$mtp" == 3 || "$mtp" == 4 || "$mtp" == 5 ]] || die "--mtp takes 3, 4 or 5, got $mtp"
     args+=(--mtp "$mtp")
 fi
+[[ -z "$lanes" ]] || args+=(--lanes "$lanes")
+[[ -z "$lanes_stall_budget" ]] || args+=(--lanes-stall-budget "$lanes_stall_budget")
 [[ -z "$long_chunks" ]] || args+=(--long-chunks)
 if [[ -n "$prefill_slab" ]]; then
     [[ "$prefill_slab" =~ ^[0-9]+$ && $((prefill_slab % 128)) == 0 && "$prefill_slab" -ge 256 && "$prefill_slab" -le 4096 ]] \
