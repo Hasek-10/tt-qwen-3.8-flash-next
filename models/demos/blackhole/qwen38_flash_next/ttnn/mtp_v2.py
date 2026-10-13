@@ -99,11 +99,14 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.ple import (
     Qwen38TTNNPLERowsState,
 )
 
-# k = 3 and 4 run the 5-row verify MoE form, k = 5 the 32-row form (``moe_rows_for``, which holds every k up to 31);
-# the QSA verify path admits k + 1 <= qsa.VERIFY_MAX_ROWS = 6 rows per pass (two compressed blocks completed, two KV
-# blocks spanned, so the op sequence never depends on P), so k = 5 is the largest draft count until that path is
-# proven wider on silicon.
-SUPPORTED_DRAFTS = (3, 4, 5)
+# k = 3 and 4 run the 5-row verify MoE form, k = 5 the 6-row form, k = 6 .. 15 the 32-row form (``moe_rows_for``,
+# which holds every k up to 31).  The QSA verify path admits k + 1 <= qsa.VERIFY_MAX_ROWS = 16 rows per pass: it
+# writes every compressed block the row count can complete (two up to 8 rows, three to 12, four to 16) and spans two
+# KV blocks, so the op sequence never depends on P.  k = 6 .. 15 are unrun on silicon: the acceptance replay at each
+# k (json 96/96, the --mtp 4 divergence indices unchanged) is their proof.
+SUPPORTED_DRAFTS = tuple(range(3, 16))
+# The lanes' draft counts (ttnn/mtp_lanes.py): the ones whose k + 1 rows per lane fit the QSA lane verify (k <= 5).
+LANE_DRAFTS = tuple(drafts for drafts in SUPPORTED_DRAFTS if drafts + 1 <= qsa_module.LANE_VERIFY_MAX_ROWS)
 DEFAULT_DRAFTS = 4
 RESIDUAL_ROWS_SHAPE = (1, RESIDUAL_BRANCHES, CHUNK_ROWS, LOCAL_HIDDEN_SIZE)
 BLOCK_ROWS_SHAPE = (1, 1, CHUNK_ROWS, LOCAL_HIDDEN_SIZE)

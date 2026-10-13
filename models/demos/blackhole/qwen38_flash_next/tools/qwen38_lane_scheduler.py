@@ -71,6 +71,9 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_protocol import 
 MIN_LANES = 2
 MAX_LANES = 8  # B x (k + 1) <= 32 with k >= 3
 ONE_TILE_ROWS = 32
+# The lane verify's rows per lane (ttnn/qsa.py LANE_VERIFY_MAX_ROWS: the two compressed blocks every lane pass
+# writes): k <= 5 serves the lanes, the wider draft counts are single-stream only.
+LANE_MAX_ROWS = 6
 # Placeholder drafts of a host-written block (the bootstrap's form; any exact ids would do: acceptance is a filter).
 PLACEHOLDER_DRAFT_TOKEN = 0
 IDLE_WAIT_SECONDS = 0.25  # the driver's wait on the condition between submits when no lane is active
@@ -95,6 +98,11 @@ def lane_geometry(lanes: int, drafts: int) -> tuple[int, int]:
     if isinstance(drafts, bool) or type(drafts) is not int or drafts < 1:
         raise ValueError(f"the lanes need the MTP draft count (--mtp), got {drafts!r}")
     rows = drafts + 1
+    if rows > LANE_MAX_ROWS:
+        raise ValueError(
+            f"--lanes runs k <= {LANE_MAX_ROWS - 1} (the lane verify's {LANE_MAX_ROWS} rows per lane); "
+            f"--mtp {drafts} is single-stream only"
+        )
     if lanes * rows > ONE_TILE_ROWS:
         raise ValueError(
             f"--lanes {lanes} --mtp {drafts}: B x (k + 1) = {lanes * rows} rows exceed the {ONE_TILE_ROWS}-row tile"

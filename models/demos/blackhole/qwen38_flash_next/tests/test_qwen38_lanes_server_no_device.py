@@ -24,6 +24,7 @@ from models.demos.blackhole.qwen38_flash_next.tools import qwen38_lanes_session 
 from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gdn_rows_scan
 from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_lanes, mtp_v2
+from models.demos.blackhole.qwen38_flash_next.ttnn import qsa as qsa_module
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER_SOURCE = ROOT / "tools" / "qwen38_chat_server.py"
@@ -478,4 +479,5 @@ def test_scheduler_and_session_modules_split_the_device_from_the_rules() -> None
     assert lanes_module.EAGER_PASSES == 2
     # the geometry helpers agree
     assert mtp_lanes._validate_lane_geometry(4, 4) == (4, 5) and scheduler_module.lane_geometry(4, 4) == (4, 5)
-    assert mtp_v2.SUPPORTED_DRAFTS == (3, 4, 5)
+    assert mtp_v2.SUPPORTED_DRAFTS == tuple(range(3, 16)) and mtp_v2.LANE_DRAFTS == (3, 4, 5)
+    assert scheduler_module.LANE_MAX_ROWS == qsa_module.LANE_VERIFY_MAX_ROWS == max(mtp_v2.LANE_DRAFTS) + 1

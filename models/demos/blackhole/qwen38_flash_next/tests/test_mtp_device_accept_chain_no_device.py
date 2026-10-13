@@ -219,7 +219,10 @@ def test_forms_table_and_the_admission_count_include_the_device_form() -> None:
     three = session_module.mtp_capacity_admission(32768, drafts=K, verify_forms=3)
     assert three["verify_forms"] == 3 and three["mtp_growth_remainders_bytes_per_bank"]["traces"] == 15_825_664
     assert three["required_free_bytes_per_bank"] == 82_285_051 > two["required_free_bytes_per_bank"] and three["fits"]
-    assert len(session_module.MTP_WARM_ACCEPT_UNIFORMS) >= max(mtp_v2.SUPPORTED_DRAFTS) + 1
+    # the device-decided form's warm takes k + 1 of them; it admits k <= ADMITTED_DRAFTS (the wider single-stream k
+    # run the host-decided split for sampled requests)
+    assert len(session_module.MTP_WARM_ACCEPT_UNIFORMS) >= device_accept_module.ADMITTED_DRAFTS + 1
+    assert max(mtp_v2.SUPPORTED_DRAFTS) > device_accept_module.ADMITTED_DRAFTS
     for uniform in session_module.MTP_WARM_ACCEPT_UNIFORMS:
         assert 0 <= uniform < 1 and uniform * 2**24 == int(uniform * 2**24)
     assert len(set(session_module.MTP_WARM_ACCEPT_UNIFORMS)) == len(session_module.MTP_WARM_ACCEPT_UNIFORMS)

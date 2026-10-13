@@ -77,7 +77,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.mtp import Qwen38TTNNMTPInput
 from models.demos.blackhole.qwen38_flash_next.ttnn.mtp_v2 import (
     BLOCK_ROWS_SHAPE,
     RESIDUAL_ROWS_SHAPE,
-    SUPPORTED_DRAFTS,
+    LANE_DRAFTS,
     Qwen38TTNNVerifyOutput,
     _allocate_hidden_sharded_zeros,
     _deallocate,
@@ -130,8 +130,8 @@ def lane_of_rows(lanes: int, rows: int) -> tuple[tuple[int, ...], tuple[int, ...
 
 def _validate_lane_geometry(lanes: int, drafts: int) -> tuple[int, int]:
     lanes = require_lane_count(lanes, label="MTP lanes")
-    if drafts not in SUPPORTED_DRAFTS:
-        raise ValueError(f"MTP lanes admit k in {SUPPORTED_DRAFTS}, got {drafts!r}")
+    if drafts not in LANE_DRAFTS:
+        raise ValueError(f"MTP lanes admit k in {LANE_DRAFTS}, got {drafts!r}")
     rows = drafts + 1
     if lanes * rows > CHUNK_ROWS:
         raise ValueError(f"MTP lanes admit B x R <= {CHUNK_ROWS} rows in one tile, got {lanes} x {rows}")

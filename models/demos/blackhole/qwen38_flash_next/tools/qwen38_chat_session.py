@@ -160,12 +160,12 @@ REASONING_EFFORT = "low"
 RESIDUE_CLASSES = resident_decode.SINGLE_TRACE_RESIDUE_CLASS_TRACES
 SEED_TOKEN_ID = IM_START_ID
 THINK_END_ID = protocol.THINK_END_ID
-# MTP drafting: the draft counts a server may be opened with (the chain timing tool's measured arms; k = 3 and 4
-# run the 5-row verify MoE form, k = 5 the 32-row form, and the QSA verify path admits no more than k + 1 = 6 rows),
+# MTP drafting: the draft counts a server may be opened with (k = 3 and 4 run the 5-row verify MoE form, k = 5 the
+# 6-row form, k = 6 .. 15 the 32-row form; the QSA verify path admits k + 1 <= 16 rows; k > 5 is unrun on silicon),
 # the GDN state re-anchor settings (off = every GDN layer commits through the chunk kernel; layer0 = layer 0's
 # commits run the 1-row fp32 step recurrence over the committed rows), the bootstrap pass's placeholder drafts, the
 # resident expert pairs with the MTP layer's.
-MTP_DRAFTS = (3, 4, 5)
+MTP_DRAFTS = tuple(range(3, 16))
 MTP_GDN_ANCHORS = ("off", "layer0")
 MTP_GDN_ANCHOR_LAYERS = {"off": (), "layer0": (0,)}
 MTP_BOOTSTRAP_DRAFT_TOKEN = 0
@@ -634,8 +634,8 @@ def lanes_capacity_admission(
 
     if isinstance(lanes, bool) or type(lanes) is not int or not 2 <= lanes <= 8:
         raise ValueError(f"lanes must be an int in [2, 8], got {lanes!r}")
-    if isinstance(drafts, bool) or type(drafts) is not int or drafts not in mtp_v2.SUPPORTED_DRAFTS:
-        raise ValueError(f"drafts must be one of {mtp_v2.SUPPORTED_DRAFTS}, got {drafts!r}")
+    if isinstance(drafts, bool) or type(drafts) is not int or drafts not in mtp_v2.LANE_DRAFTS:
+        raise ValueError(f"the lanes' drafts must be one of {mtp_v2.LANE_DRAFTS}, got {drafts!r}")
     rows = drafts + 1
     total_rows = lanes * rows
     if total_rows > CHUNK_ROWS:
