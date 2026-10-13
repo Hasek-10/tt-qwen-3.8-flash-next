@@ -302,6 +302,18 @@ conversation.  DRAM: the second chain adds its verify window, draft state and tr
 MTP components, the alignment history, the decode step's MTP inputs and the prefill extensions are shared), admitted per
 chain at open.  The switch does not combine with `QWEN38_MTP_DEVICE_ACCEPT=1` (the device acceptance's
 constants are one k's; the open refuses the pair).
+A comma-separated list instead of `1` (`QWEN38_MTP_DRAFTS_PER_REQUEST=4,8,15`) opens exactly those chains: distinct
+draft counts of 3..15 with `--mtp` among them, the `--mtp` chain the default, each admitted at open as the pair is (a
+chain that does not fit is refused with its shortfall).  k = 6..15 are unrun on silicon (`docs/PERF-QB2.md`).
+`--draft-source hybrid|ngram` (needs `--mtp`; default `mtp`) drafts a greedy request's passes on the host:
+`ttnn/ngram_draft.py` proposes the k ids that followed the most recent earlier occurrence of the longest recurring
+n-gram (4 down to 2 tokens) ending in the target's next token, over the request's committed ids, and the pass writes
+them in place of the device draft, whose k - 1 sequential rows it saves; `hybrid` falls back to the device draft when
+nothing recurs, `ngram` pads with fill tokens instead (the drafter measured by itself).  Acceptance reads only the
+target's argmaxes, so the committed stream is the device-drafted stream's, exact; only the tokens per pass change.
+The host forms read the verify row on the main queue (`QWEN38_MTP_PLE_EARLY` off; an explicit 1 is refused), serve
+greedy requests only (sampled requests keep the device draft) and have no lanes form; `qwen38.mtp` carries
+`draft_source` and `host_drafted_passes`.
 `--mtp-gdn-anchor layer0` (a server flag) re-anchors the layer-0 GDN state from the 1-row recurrence.
 Since 2026-09-25 the `--mtp` admission reads the mesh allocator's free bytes per DRAM bank after the resident weights
 are built (less the build's own remaining state and traces) and refuses only when the MTP pair, state and growth

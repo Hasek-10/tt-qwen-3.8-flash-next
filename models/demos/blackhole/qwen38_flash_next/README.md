@@ -138,7 +138,9 @@ that leaves earlier than the pinned table is a regression (`docs/NUMERICS.md`).
 | `--prepare-only --bf4-stage-limit N` | convert at most N missing expert layers into the BF4 cache and stop |
 | `--long-chunks` | accepted for compatibility: the 128-row prefill chunks where the prompt allows are the served default since 2026-09-29 (section 6, bitwise the 32-row chunks); with `--mtp` the MTP layer's rows run inside the 128-row chunks too |
 | `--prefill-slab 2048` | prefill slabs of 2048 rows ahead of the 128-row chunks: one matmul per dense linear, the routed experts in one `moe_compute` call on three rings, tolerance-class against the chunk bodies (`docs/PREFILL.md`); off by default; combines with `--mtp 4` since 2026-09-27 (+99 ms per traced slab, 2,645 tok/s at 31.7k prompt tokens; pinned `A3-slab2048-mtp4-32k`; the TTFT table in `docs/PREFILL.md`) |
-| `--mtp 3\|4\|5` | speculative drafting on greedy requests (section 6); off by default; `QWEN38_MTP_DRAFTS_PER_REQUEST=1` opens the k = 4 and k = 5 chains together and a request picks with `extra_body.mtp_drafts` (`docs/SERVER.md`) |
+| `--mtp 3..15` | speculative drafting on greedy requests (section 6); off by default; k = 6..15 verify up to 16 rows per pass and are unrun on silicon (`docs/PERF-QB2.md`); `QWEN38_MTP_DRAFTS_PER_REQUEST=1` opens the k = 4 and k = 5 chains together (a list such as `4,8,15` opens those chains) and a request picks with `extra_body.mtp_drafts` (`docs/SERVER.md`) |
+| `--draft-source mtp\|hybrid\|ngram` | who drafts a greedy pass: the MTP head (default), the host's prompt lookup when the request's text recurs and the MTP head otherwise, or the host alone; needs `--mtp`, one command queue, no lanes form (`docs/SERVER.md`) |
+| `--lanes B` | serve B greedy requests at once through the MTP lane chain (2..8, B x (k + 1) <= 32, k <= 5; needs `--mtp`; implies `--no-sampling`; `docs/SERVER.md`) |
 | `--port`, `--host` | the listening port; `--host` default `0.0.0.0`: the QuietBox and p150-line profiles serve the LAN |
 | `--serve-seconds N` | stop after N seconds (a drain: the request in flight gets its reply) |
 | `--sampling` / `--no-sampling` | the launcher passes `--sampling`: sampled requests are served, a request naming no sampling field is still the bitwise greedy stream; `--no-sampling` refuses sampling fields with HTTP 400 (+0.3 ms per token saved) |
@@ -191,7 +193,8 @@ readers, deadlines, the stall watchdog and the `/health` fields: `docs/SERVER.md
 - The chunked prefill runs 128-row chunks where the prompt allows (the remainder in 32-row chunks) by default since 2026-09-29;
   `--long-chunks` changes nothing: 1.16 ms per prompt token through the server (a 6,874-token prompt in 8.0 s, 2026-09-30, three-ring
   expert form) against 3.3 with 32-row chunks alone, the same tokens bitwise; the MTP stream is unchanged (`docs/NUMERICS.md`).
-- `--mtp 3|4|5` drafts K tokens per pass with exact acceptance; off by default.  It fits at 32k, 64k and 128k at any k,
+- `--mtp 3..15` drafts K tokens per pass with exact acceptance; off by default (k = 6..15 are unrun on silicon,
+  `docs/PERF-QB2.md`).  At k = 3..5 it fits at 32k, 64k and 128k,
   not at 256k (94 MB free per bank against the pair's 128 MiB contiguous).  The committed stream is not bitwise with plain decode
   on 3 of the 12 acceptance prompts: near-ties within one bf16 step, not a defect (`docs/NUMERICS.md` has the indices
   and the pinned table).  On an `--mtp --sampling` server sampled requests draft too, by exact speculative sampling
