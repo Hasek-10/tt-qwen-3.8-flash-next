@@ -514,33 +514,95 @@ def _largest_divisor(value: int, cap: int) -> int:
     return next(divisor for divisor in range(min(value, cap), 0, -1) if value % divisor == 0)
 
 
-def prefill_matmul_program_config(mesh_device, rows: int, k: int, n: int):
-    """The 2D-multicast program config of a ``[rows, k] x [k, n]`` prefill-slab linear on interleaved operands.
+# The circular-buffer bytes per core a slab linear's program may take: Blackhole's 1,572,864 B of L1 above the
+# 111,616 B where the circular buffers start (the matmul factory's L1 overflow report, p150, 2026-10-13), less 384 KiB
+# for the L1 buffers alive through a slab.
+PREFILL_CB_BUDGET_BYTES = 1_572_864 - 111_616 - 384 * 1024
+PREFILL_MAX_IN0_BLOCK_W = 16
+_BF16_TILE_BYTES = 2048
+_FP32_TILE_BYTES = 4096
 
-    The grid width is the one that keeps the widest output subblock (the runtime's automatic config is 2-2.5x slower
-    on the K = 2560 linears), ``in0_block_w`` the largest divisor of the K tiles up to 8, the output subblock one tile
-    high and up to four wide (fp32 accumulation halves the destination registers), ``per_core_M`` the row tiles over
-    the grid's rows.  Measured 2026-09-09 on 4x p150: 10-12x the per-tile DRAM-sharded form at 2048 rows, within one
-    bf16 ULP of it.
+
+def prefill_circular_buffer_bytes(
+    per_core_m: int, per_core_n: int, in0_block_w: int, k_tiles: int, weight_dtype
+) -> int:
+    """The 1D/2D-multicast factories' circular buffers per core for a bf16 activation: the in0 and in1 K blocks
+    (double-buffered when K takes more than one block), the bf16 output block and its fp32 partials (an upper bound:
+    an fp32 output shares one buffer with its partials)."""
+
+    depth = 2 if k_tiles > in0_block_w else 1
+    return depth * in0_block_w * (per_core_m * _BF16_TILE_BYTES + per_core_n * DENSE_TILE_BYTES[weight_dtype]) + (
+        per_core_m * per_core_n * (_BF16_TILE_BYTES + _FP32_TILE_BYTES)
+    )
+
+
+def prefill_matmul_program_config(mesh_device, rows: int, k: int, n: int, *, weight_dtype=ttnn.bfloat16):
+    """The multicast program config of a ``[rows, k] x [k, n]`` prefill-slab linear on interleaved operands.
+
+    The form runs the most cores: a 2D grid of any column count over the grid's rows, or the 1D form (``in1``
+    multicast, one row block per core across every column) when the row tiles outnumber what the 2D grid reaches on a
+    narrow N; forms with a one-tile output subblock rank last, and a tie keeps the 2D grid.  ``in0_block_w`` is the
+    largest divisor of the K tiles up to ``PREFILL_MAX_IN0_BLOCK_W`` whose circular buffers fit
+    ``PREFILL_CB_BUDGET_BYTES`` (fewer partial reloads per output block).  The output subblock is one tile high and up
+    to four wide (fp32 accumulation halves the destination registers).
+
+    Every form is bitwise the same output: under the slab's compute configs (fp32 accumulation, ``packer_l1_acc``
+    off) each output tile sums its K tiles in order in the destination registers, the partials reloaded exactly
+    between K blocks, so the grid, the form and the K block move no bits.  ``packer_l1_acc`` stays off: over more than
+    two K blocks it sums each block from zero and adds the blocks in L1, another fp32 rounding order.
     """
 
     grid = mesh_device.compute_with_storage_grid_size()
+    grid_x, grid_y = int(grid.x), int(grid.y)
     m_tiles, k_tiles, n_tiles = rows // ttnn.TILE_SIZE, k // ttnn.TILE_SIZE, math.ceil(n / ttnn.TILE_SIZE)
     if rows % ttnn.TILE_SIZE or k % ttnn.TILE_SIZE:
         raise ValueError(f"prefill linear needs whole row and K tiles, got rows={rows} k={k}")
-    best_cols, best_key = 1, None
-    for cols in range(1, min(int(grid.x), n_tiles) + 1):
-        key = (_largest_divisor(math.ceil(n_tiles / cols), 4), cols)
-        if best_key is None or key > best_key:
-            best_key, best_cols = key, cols
-    grid_rows = min(int(grid.y), m_tiles)
-    per_core_n = math.ceil(n_tiles / best_cols)
+    grid_rows = min(grid_y, m_tiles)
+    # (per_core_M, per_core_N, 1D): every 2D column count, then the 1D form.
+    forms = [
+        (math.ceil(m_tiles / grid_rows), math.ceil(n_tiles / cols), False)
+        for cols in range(1, min(grid_x, n_tiles) + 1)
+    ]
+    forms.append((math.ceil(m_tiles / (grid_x * grid_y)), n_tiles, True))
+
+    def rank(form):
+        per_core_m, per_core_n, one_d = form
+        subblock = _largest_divisor(per_core_n, 4)
+        cores = math.ceil(m_tiles / per_core_m) * math.ceil(n_tiles / per_core_n)
+        fits = (
+            prefill_circular_buffer_bytes(per_core_m, per_core_n, 1, k_tiles, weight_dtype) <= PREFILL_CB_BUDGET_BYTES
+        )
+        return fits, subblock > 1, cores, subblock, not one_d
+
+    per_core_m, per_core_n, one_d = max(forms, key=rank)
+    in0_block_w = max(
+        (
+            width
+            for width in range(1, min(k_tiles, PREFILL_MAX_IN0_BLOCK_W) + 1)
+            if k_tiles % width == 0
+            and prefill_circular_buffer_bytes(per_core_m, per_core_n, width, k_tiles, weight_dtype)
+            <= PREFILL_CB_BUDGET_BYTES
+        ),
+        default=1,
+    )
+    if one_d:
+        return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=(grid_x, grid_y),
+            in0_block_w=in0_block_w,
+            out_subblock_h=1,
+            out_subblock_w=_largest_divisor(per_core_n, 4),
+            per_core_M=per_core_m,
+            per_core_N=per_core_n,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=False,
+        )
     return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
-        compute_with_storage_grid_size=(best_cols, grid_rows),
-        in0_block_w=_largest_divisor(k_tiles, 8),
+        compute_with_storage_grid_size=(math.ceil(n_tiles / per_core_n), grid_rows),
+        in0_block_w=in0_block_w,
         out_subblock_h=1,
         out_subblock_w=_largest_divisor(per_core_n, 4),
-        per_core_M=math.ceil(m_tiles / grid_rows),
+        per_core_M=per_core_m,
         per_core_N=per_core_n,
         transpose_mcast=False,
         fused_activation=None,
