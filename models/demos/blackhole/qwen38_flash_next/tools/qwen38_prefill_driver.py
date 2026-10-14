@@ -9,8 +9,10 @@ traces and ``forced_step``, which teacher-forces one token through the decode tr
 returns the next n-gram context.  :meth:`Qwen38ChunkPrefill.run` then prefills ``token_ids`` from ``start_position``:
 ``(32 - P % 32) % 32`` forced steps so the first chunk starts at ``P % 32 == 0``; the chunk carry seeded from the
 decode buffers (``reset_chunk_state_inplace``, the 32-row state first: the 128-row and slab states share its
-histories); ``N // S`` slabs of ``S`` rows when the chain captured a slab trace (``--prefill-slab``), then
-``M // 128`` long chunks of the remainder when the chain captured the 128-row trace; then ``M // 32`` full 32-row
+histories); ``N // S`` slabs of ``S`` rows when the chain captured a slab trace (``--prefill-slab``), with the
+remainder after them first taken by the chain's smaller tail slab forms (``--prefill-tail-slabs``: largest first, each
+as often as it fits, replayed ahead of the full slabs, smallest first, so the exposed first preparation is the
+smallest), then ``M // 128`` long chunks of the remainder when the chain captured the 128-row trace; then ``M // 32`` full 32-row
 chunks (accept scalar 31) over the remainder ``M``; if ``M % 32 = r > 0`` one padded chunk whose rows ``r .. 31`` are
 :data:`CHUNK_PAD_TOKEN_ID` with accept scalar ``r - 1``; ``finish_prefill`` from the 32-row state.  The host work of
 chunk i + 1 (``prepare_chunk_inputs``: the n-gram lookups from the running context and the row packing; then
@@ -101,6 +103,7 @@ class Qwen38PrefillTiming:
     long_chunk_host_ms: tuple[float, ...] = ()
     slabs: int = 0  # the slabs ahead of the 128-row chunks
     slab_rows: int = 0
+    tail_slabs: int = 0  # the smaller tail slab forms' replays, ahead of the slabs
     slab_replay_ms: tuple[float, ...] = ()  # raw blocking replays, one per slab; empty unless timed
     slab_host_ms: tuple[float, ...] = ()
     # The split of every slab's host work (every run): the input preparation (the n-gram lookup and the row
@@ -141,6 +144,7 @@ class Qwen38ChunkPrefill:
         slab_state: Any | None = None,
         slab_trace_id: Any | None = None,
         long_mtp: Any = None,
+        tail_slabs: Sequence[tuple[Any, Any | None]] = (),
     ) -> None:
         if isinstance(event_interval, bool) or type(event_interval) is not int or event_interval <= 0:
             raise ValueError(f"event interval must be a positive int, got {event_interval!r}")
@@ -165,6 +169,15 @@ class Qwen38ChunkPrefill:
             raise ValueError("a slab needs the 128-row chunk state (its remainder) and a slab row count")
         if slab_trace_id is not None and (slab_state is None or long_chunk_trace_id is None):
             raise ValueError("a slab trace needs the slab state and the long chunk trace")
+        tail_rows = [int(getattr(tail_state, "rows", 0)) for tail_state, _ in tail_slabs]
+        if tail_slabs and (slab_state is None or mtp is not None):
+            raise ValueError("tail slabs need the slab state and run without MTP drafting")
+        if any(not is_slab_rows(rows) or rows >= slab_state.rows for rows in tail_rows) or len(set(tail_rows)) != len(
+            tail_rows
+        ):
+            raise ValueError(f"tail slabs must be distinct slab row counts below {slab_state.rows}, got {tail_rows}")
+        if any((trace_id is None) != (slab_trace_id is None) for _, trace_id in tail_slabs):
+            raise ValueError("tail slab traces must be captured exactly when the slab trace is")
         if slab_state is not None and mtp is not None:
             # The slab's MTP rows run through the 128-row twin's slab form (mtp_v2: forward_slab_rows), captured in
             # the slab trace; a slab with drafting but without that form is refused.
@@ -183,6 +196,11 @@ class Qwen38ChunkPrefill:
         self.slab_state = slab_state
         self.slab_trace_id = slab_trace_id
         self.slab_rows = 0 if slab_state is None else int(slab_state.rows)
+        # Largest first: the remainder after the full slabs takes each tail form as often as it fits.
+        self.tail_slabs = tuple(sorted(tail_slabs, key=lambda form: -int(form[0].rows)))
+        self.slab_traces = {int(tail_state.rows): trace_id for tail_state, trace_id in self.tail_slabs}
+        if slab_state is not None:
+            self.slab_traces[self.slab_rows] = slab_trace_id
         self.forced_step = forced_step
         self.pad_token_id = pad_token_id
         self.event_interval = event_interval
@@ -197,16 +215,17 @@ class Qwen38ChunkPrefill:
         self.mtp = mtp
         self.long_mtp = long_mtp
 
-    def _run_chunk(self, *, blocking: bool, kind: str = "short") -> None:
+    def _run_chunk(self, chunk_state: Any, *, blocking: bool, kind: str = "short") -> None:
         """One chunk at the device position: the captured trace's replay, or the eager chunk body with the
         re-anchor flag and the MTP extension of the chunk's form passed per chunk (a blocking eager chunk
-        synchronizes so its wall is the chunk's).  ``kind`` is ``slab``, ``long`` (128 rows) or ``short`` (32 rows)."""
+        synchronizes so its wall is the chunk's).  ``kind`` is ``slab`` (any slab form), ``long`` (128 rows) or
+        ``short`` (32 rows)."""
 
-        chunk_state, trace_id = {
-            "slab": (self.slab_state, self.slab_trace_id),
-            "long": (self.long_chunk_state, self.long_chunk_trace_id),
-            "short": (self.chunk_state, self.chunk_trace_id),
-        }[kind]
+        trace_id = {
+            "slab": lambda: self.slab_traces[int(chunk_state.rows)],
+            "long": lambda: self.long_chunk_trace_id,
+            "short": lambda: self.chunk_trace_id,
+        }[kind]()
         if trace_id is not None:
             ttnn._ttnn_execute_trace(self.mesh, trace_id, cq_id=0, blocking=blocking)
             return
@@ -339,34 +358,26 @@ class Qwen38ChunkPrefill:
         remaining = tokens[aligned:]
         slabs = slab_count(len(remaining), slab_rows=self.slab_rows or None)
         after_slabs = len(remaining) - slabs * self.slab_rows
+        tail_states: list[Any] = []
+        for tail_state, _trace_id in self.tail_slabs:
+            fits = after_slabs // tail_state.rows
+            tail_states += [tail_state] * fits
+            after_slabs -= fits * tail_state.rows
         long_chunks = long_chunk_count(after_slabs, long_chunks=self.long_chunk_state is not None)
         accepts = chunk_accepts(after_slabs - long_chunks * LONG_CHUNK_ROWS)
-        # The chunk sequence: (chunk state, kind, rows, accept scalar or None): the slabs, then the long chunks,
-        # then the 32-row chunks and the padded tail.
-        plan: list[tuple[Any, str, list[int], int | None]] = [
-            (self.slab_state, "slab", remaining[self.slab_rows * index : self.slab_rows * (index + 1)], None)
-            for index in range(slabs)
-        ]
-        offset = slabs * self.slab_rows
-        plan += [
-            (
-                self.long_chunk_state,
-                "long",
-                remaining[offset + LONG_CHUNK_ROWS * index : offset + LONG_CHUNK_ROWS * (index + 1)],
-                None,
-            )
-            for index in range(long_chunks)
-        ]
-        offset += long_chunks * LONG_CHUNK_ROWS
-        plan += [
-            (
-                self.chunk_state,
-                "short",
-                remaining[offset + CHUNK_ROWS * index : offset + CHUNK_ROWS * (index + 1)],
-                accepted,
-            )
-            for index, accepted in enumerate(accepts)
-        ]
+        # The chunk sequence: (chunk state, kind, rows, accept scalar or None): the tail slabs (smallest first), the
+        # slabs, then the long chunks, then the 32-row chunks and the padded tail.
+        forms = (
+            [(tail_state, "slab", tail_state.rows, None) for tail_state in reversed(tail_states)]
+            + [(self.slab_state, "slab", self.slab_rows, None)] * slabs
+            + [(self.long_chunk_state, "long", LONG_CHUNK_ROWS, None)] * long_chunks
+            + [(self.chunk_state, "short", CHUNK_ROWS, accepted) for accepted in accepts]
+        )
+        plan: list[tuple[Any, str, list[int], int | None]] = []
+        offset = 0
+        for form_state, kind, width, accepted in forms:
+            plan.append((form_state, kind, remaining[offset : offset + width], accepted))
+            offset += width
         verify_ms = None
         handoff_ms = 0.0
         replay_ms: list[float] = []
@@ -383,20 +394,21 @@ class Qwen38ChunkPrefill:
         chunks = len(accepts)
         long_done = long_chunks
         slabs_done = slabs
+        tail_slabs_done = len(tail_states)
         if plan:
             if position % CHUNK_ROWS:
                 raise AssertionError(f"chunks must start at P % {CHUNK_ROWS} == 0, got P = {position}")
-            end = position + slabs * self.slab_rows + long_chunks * LONG_CHUNK_ROWS + CHUNK_ROWS * len(accepts)
+            end = position + offset
             if end > self.model.allocated_context:
                 raise ValueError(
                     f"the padded tail chunk ends at {end}, past the allocated context {self.model.allocated_context}"
                 )
             ttnn.synchronize_device(self.mesh)
             self.model.reset_chunk_state_inplace(self.state, self.chunk_state)
-            if long_chunks or slabs:
+            if long_chunks or slabs or tail_states:
                 self.model.reset_chunk_state_inplace(self.state, self.long_chunk_state)
-            if slabs:
-                self.model.reset_chunk_state_inplace(self.state, self.slab_state)
+            for slab_state in {id(entry[0]): entry[0] for entry in plan if entry[1] == "slab"}.values():
+                self.model.reset_chunk_state_inplace(self.state, slab_state)
             if self.mtp is not None:
                 self.mtp.reset_chunk()
                 if (long_chunks or slabs) and self.long_mtp is not None:
@@ -405,8 +417,8 @@ class Qwen38ChunkPrefill:
                 verify_started_ns = time.perf_counter_ns()
                 for trace_id in (
                     (self.chunk_trace_id,)
-                    + ((self.long_chunk_trace_id,) if long_chunks or slabs else ())
-                    + ((self.slab_trace_id,) if slabs else ())
+                    + ((self.long_chunk_trace_id,) if long_chunks or slabs or tail_states else ())
+                    + tuple({self.slab_traces[int(entry[0].rows)] for entry in plan if entry[1] == "slab"})
                 ):
                     if trace_id is not None:
                         UnsafeAllocationTracker(self.mesh).verify_before_replay(trace_id)
@@ -478,10 +490,10 @@ class Qwen38ChunkPrefill:
                     slab_upload_ms.append((replay_started_ns - upload_started_ns) / 1_000_000)
                 if time_each_chunk:
                     timings[kind][0].append((prepare_ns + replay_started_ns - host_started_ns) / 1_000_000)
-                    self._run_chunk(blocking=True, kind=kind)
+                    self._run_chunk(chunk_state, blocking=True, kind=kind)
                     timings[kind][1].append((time.perf_counter_ns() - replay_started_ns) / 1_000_000)
                 else:
-                    self._run_chunk(blocking=False, kind=kind)
+                    self._run_chunk(chunk_state, blocking=False, kind=kind)
                 # The next chunk's host half under this chunk's replay (its copies are queued behind the replay on the
                 # same command queue at the next iteration, so the device finishes reading the input buffers before
                 # they change); a slab's wait for the previous slab's event follows, so the host runs one slab ahead.
@@ -513,7 +525,8 @@ class Qwen38ChunkPrefill:
                     consumed = sum(len(done_rows) for _, _, done_rows, _ in done)
                     chunks = sum(1 for _, done_kind, _, _ in done if done_kind == "short")
                     long_done = sum(1 for _, done_kind, _, _ in done if done_kind == "long")
-                    slabs_done = sum(1 for _, done_kind, _, _ in done if done_kind == "slab")
+                    slabs_done = sum(1 for done_state, _, _, _ in done if done_state is self.slab_state)
+                    tail_slabs_done = sum(1 for _, done_kind, _, _ in done if done_kind == "slab") - slabs_done
                     break
                 if between_chunks is not None and kind != "slab":
                     between_chunks(row_offset, len(remaining))
@@ -545,6 +558,7 @@ class Qwen38ChunkPrefill:
             long_chunk_host_ms=tuple(long_host_ms),
             slabs=slabs_done,
             slab_rows=self.slab_rows,
+            tail_slabs=tail_slabs_done,
             slab_replay_ms=tuple(slab_replay_ms),
             slab_host_ms=tuple(slab_host_ms),
             slab_prepare_ms=tuple(slab_prepare_ms),

@@ -101,6 +101,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_prefill_driver import
     alignment_steps,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn import gdn as gdn_module
+from models.demos.blackhole.qwen38_flash_next.ttnn import moe as moe_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_v2, ngram_draft
 from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import ZERO_EMBEDDING_TOKEN
 from models.demos.blackhole.qwen38_flash_next.config import LAYER_PATTERN
@@ -261,6 +262,20 @@ MTP_LONG_CHUNK_EXTENSION_BYTES_PER_BANK = 15_339_392 - 15_313_792
 # page of 4,096 bytes) and, after the first slice, one UINT32 ``[1,1,1,1]`` position offset (one 32-byte DRAM page).
 MTP_SLAB_TOKEN_TILE_BYTES = 32 * 32 * 4
 MTP_SLAB_OFFSET_PAGE_BYTES = 32
+
+
+def tail_slab_rows_admitted(tail_slab_rows: Sequence[int], *, slab_rows: int | None) -> bool:
+    """Tail slab forms (``--prefill-tail-slabs``): distinct slab row counts below ``slab_rows``, each a whole number of
+    the slab body's 512-row blocks (the one-call MoE reduce and the QSA block scoring run in such blocks)."""
+
+    return (
+        slab_rows is not None
+        and len(set(tail_slab_rows)) == len(tail_slab_rows)
+        and all(
+            is_slab_rows(rows) and rows < slab_rows and rows % moe_module.SLAB_REDUCE_BLOCK_ROWS == 0
+            for rows in tail_slab_rows
+        )
+    )
 
 
 def mtp_slab_form_bytes_per_bank(slab_rows: int) -> int:
@@ -816,6 +831,7 @@ class Qwen38ChatCompletion:
     prefill_chunks: int = 0  # the 32-row chunk replays (full and the padded tail)
     prefill_long_chunks: int = 0  # the 128-row chunk replays ahead of them (--long-chunks / a slab's remainder)
     prefill_slabs: int = 0  # the slab replays ahead of those (--prefill-slab)
+    prefill_tail_slabs: int = 0  # the tail slab forms' replays ahead of the slabs (--prefill-tail-slabs)
     prefill_tail_rows: int = 0
     prefill_handoff_ms: float = 0.0
     # The slabs' host work, summed over the request's slabs: the input preparation (the n-gram lookup and the row
@@ -850,6 +866,7 @@ class Qwen38ChatCompletion:
             "prefill_chunks": self.prefill_chunks,
             "prefill_long_chunks": self.prefill_long_chunks,
             "prefill_slabs": self.prefill_slabs,
+            "prefill_tail_slabs": self.prefill_tail_slabs,
             "prefill_tail_rows": self.prefill_tail_rows,
             "prefill_handoff_ms": round(self.prefill_handoff_ms, 3),
             "prefill_slab_prepare_ms": round(self.prefill_slab_prepare_ms, 3),
@@ -1918,6 +1935,7 @@ class Qwen38ChatSession:
             prefill_chunks=0 if chunked is None else chunked.timing.chunks,
             prefill_long_chunks=0 if chunked is None else chunked.timing.long_chunks,
             prefill_slabs=0 if chunked is None else chunked.timing.slabs,
+            prefill_tail_slabs=0 if chunked is None else chunked.timing.tail_slabs,
             prefill_tail_rows=0 if chunked is None else chunked.timing.tail_rows,
             prefill_handoff_ms=0.0 if chunked is None else chunked.timing.handoff_ms,
             prefill_slab_prepare_ms=0.0 if chunked is None else sum(chunked.timing.slab_prepare_ms),
@@ -2405,6 +2423,11 @@ class Qwen38TracedChain:
     slab_state: Any = None
     slab_trace_id: int | None = None
     slab_capture_ms: float = 0.0
+    # (``tail_slab_rows``) the smaller slab forms for the remainder after the full slabs, captured after the slab:
+    # (state, trace id) per form; the driver replays them ahead of the full slabs.
+    tail_slabs: list[tuple[Any, int]] = field(default_factory=list)
+    tail_slab_capture_ms: float = 0.0
+    tail_slab_trace_bytes_per_bank: int = 0
     # The GDN state re-anchor the chunk trace was captured with (every chunk replay commits through it).
     chunk_gdn_step_anchor: bool = False
     # The allocation tracker verified every trace once after the captures; per-prefill re-verification (140-290 ms
@@ -2571,6 +2594,7 @@ class Qwen38TracedChain:
             slab_state=self.slab_state,
             slab_trace_id=self.slab_trace_id,
             long_mtp=None if self.mtp is None else self.mtp.long_chunk_extension,
+            tail_slabs=self.tail_slabs,
             **({} if event_rows is None else {"event_rows": event_rows}),
         ).run(
             token_ids,
@@ -2732,6 +2756,7 @@ class Qwen38TracedChain:
         mtp_alternates: Sequence[int] = (),
         mtp_ple_early: bool = False,
         mtp_draft_source: str = "mtp",
+        tail_slab_rows: Sequence[int] = (),
     ) -> Qwen38TracedChain:
         """Target build, generic state (+ chunk state), warm pass (+ one eager chunk and both hand-off forms), miss
         guard, 8 decode captures (+ the chunk capture): the runner's chain prologue and the full-model gate's order.
@@ -2789,6 +2814,14 @@ class Qwen38TracedChain:
             raise ValueError(f"mtp_gdn_anchor must be one of {MTP_GDN_ANCHORS}, got {mtp_gdn_anchor!r}")
         if slab_rows is not None and (not is_slab_rows(slab_rows) or not long_chunks):
             raise ValueError(f"a prefill slab needs a slab row count and the long chunks, got {slab_rows!r}")
+        tail_slab_rows = tuple(tail_slab_rows)
+        if tail_slab_rows and not tail_slab_rows_admitted(tail_slab_rows, slab_rows=slab_rows):
+            raise ValueError(
+                f"tail slabs must be distinct multiples of {moe_module.SLAB_REDUCE_BLOCK_ROWS} below the slab rows "
+                f"{slab_rows!r}, got {tail_slab_rows!r}"
+            )
+        if tail_slab_rows and mtp is not None:
+            raise ValueError("tail slabs run without MTP drafting (the 128-row twin has one slab form)")
         # A prefill slab with MTP drafting runs the MTP layer's rows through the 128-row twin's slab form (2026-09-26:
         # the slab as 128-row slices inside the slab body); the slab already requires the long chunks, so the twin exists.
         if type(mtp_sampled) is not bool:
@@ -2908,6 +2941,10 @@ class Qwen38TracedChain:
         if slab_rows is not None:
             slab_state = model.allocate_chunk_state(state, rows=slab_rows, base=chunk_state)
             model.reset_chunk_state_inplace(state, slab_state)
+        tail_slab_states = []
+        for rows in tail_slab_rows:
+            tail_slab_states.append(model.allocate_chunk_state(state, rows=rows, base=chunk_state))
+            model.reset_chunk_state_inplace(state, tail_slab_states[-1])
         # The MTP states sit beside the generic and chunk states, before any capture: every trace bakes their
         # addresses in (the verify / draft states, the TAIL step inputs, the chunk extension).  The split verify's
         # candidates epilogue rebases by the sampling chain's constants, so with the switch on the extension is
@@ -3285,15 +3322,17 @@ class Qwen38TracedChain:
             synchronize()
             marker("after-chat-mtp-warm-pass")
 
-        if slab_rows is not None:
-            # One eager slab from the reset state: its programs compile here, before the miss guard.
-            marker("before-chat-slab-warm-pass")
+        for warm_slab_state in ([] if slab_state is None else [slab_state]) + tail_slab_states:
+            # One eager slab of each form from the reset state: its programs compile here, before the miss guard.
+            warm_rows = warm_slab_state.rows
+            form = "slab" if warm_rows == slab_rows else f"tail-slab-{warm_rows}"
+            marker(f"before-chat-{form}-warm-pass")
             slab_extension = None if chain_mtp is None else chain_mtp.long_chunk_extension
             model.reset_generic_state_inplace(state)
             model.reset_chunk_state_inplace(state, chunk_state)
-            model.reset_chunk_state_inplace(state, slab_state)
-            warm_slab_tokens = list(WARM_LONG_CHUNK_TOKEN_IDS) * (slab_rows // LONG_CHUNK_ROWS)
-            model.write_chunk_inputs(slab_state, warm_slab_tokens, ple_context=None)
+            model.reset_chunk_state_inplace(state, warm_slab_state)
+            warm_slab_tokens = list(WARM_LONG_CHUNK_TOKEN_IDS) * (warm_rows // LONG_CHUNK_ROWS)
+            model.write_chunk_inputs(warm_slab_state, warm_slab_tokens, ple_context=None)
             if slab_extension is not None:
                 # With MTP the 128-row twin's slab form compiles here too (its slices' programs are the 128-row body's).
                 chain_mtp.alignment.layer.reset_generic_state_inplace(chain_mtp.alignment.generic_state)
@@ -3301,12 +3340,12 @@ class Qwen38TracedChain:
                 slab_extension.reset_chunk()
                 slab_extension.write_slab_tokens(model, [*warm_slab_tokens[1:], warm_slab_tokens[0]])
             synchronize()
-            model.forward_prefill_chunk_generic(slab_state, state, mtp=slab_extension)
+            model.forward_prefill_chunk_generic(warm_slab_state, state, mtp=slab_extension)
             synchronize()
             actual = state.position.read()
-            if actual != slab_rows:
-                raise Qwen38ChatChainError(f"warm slab position counter {actual} vs expected {slab_rows}")
-            marker("after-chat-slab-warm-pass")
+            if actual != warm_rows:
+                raise Qwen38ChatChainError(f"warm slab position counter {actual} vs expected {warm_rows}")
+            marker(f"after-chat-{form}-warm-pass")
         if long_chunks:
             # One eager 128-row chunk from the reset state: its programs compile here, before the miss guard (with
             # MTP the 128-row twin's too: the MTP layer's 128-row body, the mixer's 128-row form, the 128-row token
@@ -3568,6 +3607,28 @@ class Qwen38TracedChain:
             chain.slab_capture_ms = (clock_ns() - slab_capture_started_ns) / 1e6
             synchronize()
             marker("after-chat-slab-capture")
+        dram_after_slab_capture = dram_allocated_per_bank()
+        if tail_slab_states:
+            marker("before-chat-tail-slab-capture")
+            tail_capture_started_ns = clock_ns()
+            for tail_state in tail_slab_states:
+                chain.tail_slabs.append(
+                    (
+                        tail_state,
+                        model.capture_prefill_chunk(
+                            tail_state,
+                            state,
+                            guard=lambda label, rows=tail_state.rows: resident_decode.forbid_trace_body_host_io_and_sync(
+                                phase=f"chat tail slab {rows} {label}"
+                            ),
+                            cq_id=0,
+                        ),
+                    )
+                )
+            chain.tail_slab_capture_ms = (clock_ns() - tail_capture_started_ns) / 1e6
+            synchronize()
+            chain.tail_slab_trace_bytes_per_bank = dram_allocated_per_bank() - dram_after_slab_capture
+            marker("after-chat-tail-slab-capture")
         # Every prefill chunk trace is booked before the MTP captures: the MTP traces term of the growth record is what
         # the verify / commit / draft captures add after the last prefill capture (the 128-row trace, MTP rows
         # included, is its own term, as the 32-row chunk trace with the extension's rows always was).
@@ -3727,6 +3788,7 @@ class Qwen38TracedChain:
                 for trace_id in (self.chunk_trace_id, self.long_chunk_trace_id, self.slab_trace_id)
                 if trace_id is not None
             ]
+            + [trace_id for _, trace_id in self.tail_slabs]
             + [trace_id for chain_mtp in self.drafting_chains() for trace_id in chain_mtp.captured_trace_ids()]
         )
 
@@ -3747,6 +3809,7 @@ class Qwen38TracedChain:
         self.chunk_trace_id = None
         self.long_chunk_trace_id = None
         self.slab_trace_id = None
+        self.tail_slabs = [(tail_state, None) for tail_state, _ in self.tail_slabs]
         for chain_mtp in self.drafting_chains():
             chain_mtp.traces = None
             chain_mtp.split_traces = None
@@ -3772,6 +3835,9 @@ class Qwen38TracedChain:
         if self.prepared.active:
             self.prepared.release()
         ttnn.deallocate(self.token_row_io)
+        for tail_state, _ in self.tail_slabs:  # before the 32-row state whose histories they share
+            self.built_target.model.release_chunk_state(tail_state)
+        self.tail_slabs.clear()
         if self.slab_state is not None:  # before the 32-row state whose histories it shares
             self.built_target.model.release_chunk_state(self.slab_state)
             self.slab_state = None
@@ -3827,6 +3893,7 @@ def construct_chain(
     mtp_ple_early: bool = False,
     mtp_draft_source: str = "mtp",
     warm_hook: Callable[[Qwen38TracedChain], None] | None = None,
+    tail_slab_rows: Sequence[int] = (),
 ) -> Qwen38TracedChain:
     """Live construction on the open mesh (missing BF4 layers converted first), then the chain prologue.
     ``warm_hook`` is the open's (after the warm pass, before any capture: the lanes server allocates its lane states
@@ -3856,4 +3923,5 @@ def construct_chain(
         mtp_ple_early=mtp_ple_early,
         mtp_draft_source=mtp_draft_source,
         warm_hook=warm_hook,
+        tail_slab_rows=tail_slab_rows,
     )

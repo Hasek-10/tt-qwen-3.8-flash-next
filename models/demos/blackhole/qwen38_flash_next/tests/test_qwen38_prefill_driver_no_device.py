@@ -312,8 +312,8 @@ def test_driver_source_pins() -> None:
         "prepared, prepare_ns, feature_cursor = pending",
         "ple_context = prepared.contexts[real_rows]",
         "self.model.upload_chunk_inputs(chunk_state, prepared)",
-        "self._run_chunk(blocking=True, kind=kind)",
-        "self._run_chunk(blocking=False, kind=kind)",
+        "self._run_chunk(chunk_state, blocking=True, kind=kind)",
+        "self._run_chunk(chunk_state, blocking=False, kind=kind)",
         "pending = self._prepare(\n                    plan, starts, index + 1, ple_context, position, positions, features, feature_cursor\n                )",
         "ttnn.event_synchronize(ttnn.record_event(self.mesh, cq_id=0))",
         "between_chunks(row_offset, len(remaining))",
@@ -338,7 +338,9 @@ def test_driver_source_pins() -> None:
     )
     assert "slab_wait_ms.append((time.perf_counter_ns() - wait_started_ns)" in run
     # A slab waits for the previous slab's event once its own replay is queued (the host runs one slab ahead).
-    assert run.index("self._run_chunk(blocking=False, kind=kind)") < run.index("ttnn.event_synchronize(slab_event)")
+    assert run.index("self._run_chunk(chunk_state, blocking=False, kind=kind)") < run.index(
+        "ttnn.event_synchronize(slab_event)"
+    )
     assert run.index("ttnn.event_synchronize(slab_event)") < run.index(
         "slab_event = ttnn.record_event(self.mesh, cq_id=0)"
     )
@@ -435,3 +437,93 @@ def test_image_prompt_refusals(harness) -> None:
     with pytest.raises(ValueError, match="rotary positions for a prefill ending at"):
         harness.prefill.run(tokens + [5], start_position=0, ple_context=None, positions=positions, features=features)
     assert harness.log == []
+
+
+class _RowsFakeModel(_FakeModel):
+    """The fake at any chunk width (slabs and 128-row chunks): records each prepared width."""
+
+    allocated_context = 32768
+
+    def prepare_chunk_inputs(self, chunk_state, token_ids, *, ple_context, positions=None, features=None):
+        tokens = list(token_ids)
+        contexts = [ple_context]
+        for token in tokens:
+            contexts.append(_next_context(contexts[-1], token))
+        self.calls.append(("prepare_chunk_inputs", len(tokens)))
+        return SimpleNamespace(tokens=tuple(tokens), contexts=tuple(contexts))
+
+
+def _slab_driver(monkeypatch, tail_rows: tuple[int, ...]):
+    model = _RowsFakeModel()
+    replays: list[int] = []
+    monkeypatch.setattr(
+        driver_module,
+        "ttnn",
+        SimpleNamespace(
+            _ttnn_execute_trace=lambda mesh, trace_id, *, cq_id, blocking: replays.append(trace_id),
+            record_event=lambda mesh, cq_id: "event",
+            event_synchronize=lambda event: None,
+            synchronize_device=lambda mesh: None,
+        ),
+    )
+    monkeypatch.setattr(driver_module, "UnsafeAllocationTracker", lambda mesh: SimpleNamespace(verify_before_replay=id))
+    prefill = Qwen38ChunkPrefill(
+        model,
+        "mesh",
+        "state",
+        "chunk_state",
+        TRACE_ID,
+        forced_step=lambda token, context: _next_context(context, token),
+        long_chunk_state=SimpleNamespace(rows=128),
+        long_chunk_trace_id=128,
+        slab_state=SimpleNamespace(rows=2048),
+        slab_trace_id=2048,
+        tail_slabs=[(SimpleNamespace(rows=rows), rows) for rows in tail_rows],
+    )
+    return model, replays, prefill
+
+
+@pytest.mark.parametrize(
+    ("tail_rows", "count", "expected"),
+    (
+        # (the tail forms, prompt rows, the replayed trace per chunk: a slab or a long chunk by its rows)
+        ((), 2 * 2048 + 801, [2048, 2048] + [128] * 6 + [TRACE_ID] * 2),
+        ((1024, 512), 2 * 2048 + 801, [512, 2048, 2048] + [128] * 2 + [TRACE_ID] * 2),
+        ((512, 1024), 2048 + 1900, [512, 1024, 2048] + [128] * 2 + [TRACE_ID] * 4),
+        ((512,), 2048 + 1900, [512, 512, 512, 2048] + [128] * 2 + [TRACE_ID] * 4),
+        ((1024,), 1000, [128] * 7 + [TRACE_ID] * 4),
+        ((1536, 1024, 512), 2048 + 1536 + 256 + 64, [1536, 2048] + [128] * 2 + [TRACE_ID] * 2),
+    ),
+)
+def test_tail_slabs_take_the_remainder_ahead_of_the_full_slabs(monkeypatch, tail_rows, count, expected) -> None:
+    model, replays, prefill = _slab_driver(monkeypatch, tail_rows)
+    tokens = [1000 + index for index in range(count)]
+
+    result = prefill.run(tokens, start_position=0, ple_context=None)
+
+    assert replays == expected
+    assert result.position == count and result.ple_context == _expected_context(tokens, None)
+    timing = result.timing
+    assert timing.slabs == expected.count(2048) and timing.long_chunks == expected.count(128)
+    assert timing.tail_slabs == sum(1 for trace_id in expected if trace_id in tail_rows)
+    assert timing.chunks == expected.count(TRACE_ID)
+    prepared = [entry[1] for entry in model.calls if entry[0] == "prepare_chunk_inputs"]
+    assert prepared == [CHUNK_ROWS if trace_id == TRACE_ID else trace_id for trace_id in expected]
+    assert len(timing.slab_prepare_ms) == timing.slabs + timing.tail_slabs
+
+
+def test_tail_slab_refusals(monkeypatch, expect_error) -> None:
+    with expect_error(ValueError, "distinct slab row counts below 2048"):
+        _slab_driver(monkeypatch, (2048,))
+    with expect_error(ValueError, "distinct slab row counts below 2048"):
+        _slab_driver(monkeypatch, (100,))
+    with expect_error(ValueError, "tail slabs need the slab state"):
+        Qwen38ChunkPrefill(
+            _RowsFakeModel(),
+            "mesh",
+            "state",
+            "chunk_state",
+            TRACE_ID,
+            forced_step=_next_context,
+            tail_slabs=[(SimpleNamespace(rows=512), 512)],
+        )
