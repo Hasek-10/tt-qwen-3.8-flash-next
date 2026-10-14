@@ -843,87 +843,102 @@ class Qwen38TTNNGatedResidual:
         walks = slab and self.glue.enabled("gr_tile_walks")
         flat_rows_padded = (1, 1, tile_rows, FLAT_LOCAL_WIDTH)
         dram = ttnn.DRAM_MEMORY_CONFIG
-        stats = ttnn.rms_norm_pre_all_gather(
-            residual_rows, dtype=ttnn.bfloat16, memory_config=dram, compute_kernel_config=self.compute_config
-        )
-        stats = ttnn.reshape(stats, (1, RESIDUAL_BRANCHES, rows, 32))
+        # The slab's read front as two programs around the stats gather (prefill glue gr_slab_front):
+        # ttnn/fused/gr_read's stats and normalize over every row tile, each normalized tile written straight to its
+        # flat page; per row block the chain's LLK sequence, so rms_norm_post, the tile permute and the gamma multiply
+        # have no program of their own.
+        front = slab and self.weights.norm_scale_rows is not None and self.glue.enabled("gr_slab_front")
+        if front:
+            from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gr_read as fused_gr_read
+
+            stats = fused_gr_read.slab_stats(residual_rows)
+        else:
+            stats = ttnn.rms_norm_pre_all_gather(
+                residual_rows, dtype=ttnn.bfloat16, memory_config=dram, compute_kernel_config=self.compute_config
+            )
+            stats = ttnn.reshape(stats, (1, RESIDUAL_BRANCHES, rows, 32))
         self.mesh_contract.validate_tensor(stats, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
         gathered_stats = ttnn.all_gather(stats, dim=3, cluster_axis=TP_AXIS, memory_config=dram)
         _deallocate(stats)
         self.mesh_contract.validate_tensor(gathered_stats, placement=TensorPlacement.REPLICATED)
         if _shape(gathered_stats) != (1, RESIDUAL_BRANCHES, rows, 32 * TP_SIZE):
             raise RuntimeError(f"GR rows RMS statistics have shape {_shape(gathered_stats)}, expected [1,4,{rows},128]")
-        unit = ttnn.rms_norm_post_all_gather(
-            residual_rows,
-            gathered_stats,
-            epsilon=self.weights.epsilon,
-            memory_config=dram,
-            compute_kernel_config=self.compute_config,
-            dtype=ttnn.bfloat16,
-        )
-        _deallocate(gathered_stats)
-        self._validate_rows(unit, residual_rows_shape(rows), label="GR rows RMS unit")
-        # Branch-major -> one flat (branch, local hidden) row per token.  At 128 rows the four branches are
-        # whole row-tile blocks: sliced out and concatenated on the width, no token-major intermediate (whose
-        # 4-row branch dim would pad to a tile: 8x the bytes through a permute and a reshape).
-        if flat_views:
-            if rows > CHUNK_ROWS:
-                raise ValueError(f"GR rows flat views are the option of at most {CHUNK_ROWS} rows, got {rows} rows")
-            unit_flat = ttnn.experimental.view(unit, flat_rows_shape)  # the view owns unit's buffer
-        elif walks:
-            # [1, 4, rows, 640] read as [4, row tiles, 32, 640] (the same pages) and permuted to [row tiles, 4, 32, 640]:
-            # the flat rows' page order; whole tiles move unchanged.
-            unit_tiles = ttnn.experimental.view(
-                unit, (RESIDUAL_BRANCHES, rows // CHUNK_ROWS, CHUNK_ROWS, LOCAL_HIDDEN_SIZE)
-            )
-            unit_flat = ttnn.experimental.view(
-                ttnn.permute(unit_tiles, (1, 0, 2, 3), memory_config=dram), flat_rows_shape
-            )  # the view owns the permuted pages
-            _deallocate(unit_tiles)  # unit's buffer
-        elif rows > CHUNK_ROWS:
-            branches = [
-                ttnn.slice(unit, (0, b, 0, 0), (1, b + 1, rows, LOCAL_HIDDEN_SIZE), memory_config=dram)
-                for b in range(RESIDUAL_BRANCHES)
-            ]
-            _deallocate(unit)
-            unit_flat = ttnn.concat(branches, dim=3, memory_config=dram)
-            _deallocate(*branches)
+        if front:
+            normalized_ws = fused_gr_read.slab_normalize(residual_rows, gathered_stats, self.weights.norm_scale_rows)
+            _deallocate(gathered_stats)
         else:
-            unit_tokens = ttnn.permute(unit, (0, 2, 1, 3), memory_config=dram)
-            _deallocate(unit)
-            unit_flat = ttnn.reshape(unit_tokens, flat_rows_shape)
-            if not same_buffer(
-                unit_flat, unit_tokens
-            ):  # a copy today (the last dim changes); never free a view's source
-                _deallocate(unit_tokens)
-        if _shape(unit_flat) != flat_rows_shape or _padded_shape(unit_flat) != flat_rows_padded:
-            raise RuntimeError(
-                f"GR rows flat unit must be {flat_rows_shape} backed by {flat_rows_padded}, "
-                f"got {_shape(unit_flat)}/{_padded_shape(unit_flat)}"
-            )
-        # One tile is normalized straight into the down+inject activation shard; the long chunk normalizes
-        # interleaved (the same elementwise multiply) and moves each row tile into the shard for its call.
-        if slab and self.norm_scale_rows_flat is not None and self.glue.enabled("gr_gamma_rows"):
-            # The slab multiplies by the resident 32-row gamma broadcast over the row tiles ([1, row tiles, 32, 2560]
-            # x [1, 1, 32, 2560]): the same tile operands as the 1-row gamma's row broadcast, whose reader instead
-            # fills the 32 rows of an fp32 gamma tile on the RISC for every output tile.
-            normalized_ws = ttnn.experimental.view(
-                ttnn.multiply(
-                    ttnn.experimental.view(unit_flat, (1, rows // CHUNK_ROWS, CHUNK_ROWS, FLAT_LOCAL_WIDTH)),
-                    self.norm_scale_rows_flat,
-                    dtype=ttnn.bfloat16,
-                    memory_config=dram,
-                ),
-                flat_rows_shape,
-            )
-        else:
-            normalized_ws = ttnn.multiply(
-                unit_flat,
-                self.norm_scale_flat,
+            unit = ttnn.rms_norm_post_all_gather(
+                residual_rows,
+                gathered_stats,
+                epsilon=self.weights.epsilon,
+                memory_config=dram,
+                compute_kernel_config=self.compute_config,
                 dtype=ttnn.bfloat16,
-                memory_config=self.down_inject_act_memory_config if rows <= CHUNK_ROWS else dram,
             )
-        _deallocate(unit_flat)
+            _deallocate(gathered_stats)
+            self._validate_rows(unit, residual_rows_shape(rows), label="GR rows RMS unit")
+            # Branch-major -> one flat (branch, local hidden) row per token.  At 128 rows the four branches are
+            # whole row-tile blocks: sliced out and concatenated on the width, no token-major intermediate (whose
+            # 4-row branch dim would pad to a tile: 8x the bytes through a permute and a reshape).
+            if flat_views:
+                if rows > CHUNK_ROWS:
+                    raise ValueError(f"GR rows flat views are the option of at most {CHUNK_ROWS} rows, got {rows} rows")
+                unit_flat = ttnn.experimental.view(unit, flat_rows_shape)  # the view owns unit's buffer
+            elif walks:
+                # [1, 4, rows, 640] read as [4, row tiles, 32, 640] (the same pages) and permuted to
+                # [row tiles, 4, 32, 640]: the flat rows' page order; whole tiles move unchanged.
+                unit_tiles = ttnn.experimental.view(
+                    unit, (RESIDUAL_BRANCHES, rows // CHUNK_ROWS, CHUNK_ROWS, LOCAL_HIDDEN_SIZE)
+                )
+                unit_flat = ttnn.experimental.view(
+                    ttnn.permute(unit_tiles, (1, 0, 2, 3), memory_config=dram), flat_rows_shape
+                )  # the view owns the permuted pages
+                _deallocate(unit_tiles)  # unit's buffer
+            elif rows > CHUNK_ROWS:
+                branches = [
+                    ttnn.slice(unit, (0, b, 0, 0), (1, b + 1, rows, LOCAL_HIDDEN_SIZE), memory_config=dram)
+                    for b in range(RESIDUAL_BRANCHES)
+                ]
+                _deallocate(unit)
+                unit_flat = ttnn.concat(branches, dim=3, memory_config=dram)
+                _deallocate(*branches)
+            else:
+                unit_tokens = ttnn.permute(unit, (0, 2, 1, 3), memory_config=dram)
+                _deallocate(unit)
+                unit_flat = ttnn.reshape(unit_tokens, flat_rows_shape)
+                if not same_buffer(
+                    unit_flat, unit_tokens
+                ):  # a copy today (the last dim changes); never free a view's source
+                    _deallocate(unit_tokens)
+            if _shape(unit_flat) != flat_rows_shape or _padded_shape(unit_flat) != flat_rows_padded:
+                raise RuntimeError(
+                    f"GR rows flat unit must be {flat_rows_shape} backed by {flat_rows_padded}, "
+                    f"got {_shape(unit_flat)}/{_padded_shape(unit_flat)}"
+                )
+            # One tile is normalized straight into the down+inject activation shard; the long chunk normalizes
+            # interleaved (the same elementwise multiply) and moves each row tile into the shard for its call.
+            if slab and self.norm_scale_rows_flat is not None and self.glue.enabled("gr_gamma_rows"):
+                # The slab multiplies by the resident 32-row gamma broadcast over the row tiles
+                # ([1, row tiles, 32, 2560] x [1, 1, 32, 2560]): the same tile operands as the 1-row gamma's row
+                # broadcast, whose reader instead fills the 32 rows of an fp32 gamma tile on the RISC for every
+                # output tile.
+                normalized_ws = ttnn.experimental.view(
+                    ttnn.multiply(
+                        ttnn.experimental.view(unit_flat, (1, rows // CHUNK_ROWS, CHUNK_ROWS, FLAT_LOCAL_WIDTH)),
+                        self.norm_scale_rows_flat,
+                        dtype=ttnn.bfloat16,
+                        memory_config=dram,
+                    ),
+                    flat_rows_shape,
+                )
+            else:
+                normalized_ws = ttnn.multiply(
+                    unit_flat,
+                    self.norm_scale_flat,
+                    dtype=ttnn.bfloat16,
+                    memory_config=self.down_inject_act_memory_config if rows <= CHUNK_ROWS else dram,
+                )
+            _deallocate(unit_flat)
         self.mesh_contract.validate_tensor(normalized_ws, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
         if _shape(normalized_ws) != flat_rows_shape or (
             rows <= CHUNK_ROWS and normalized_ws.memory_config() != self.down_inject_act_memory_config

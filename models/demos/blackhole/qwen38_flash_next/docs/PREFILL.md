@@ -316,16 +316,16 @@ never see one).  Bitwise forms keep every output element's arithmetic and reduct
 summation order or a rounding point and are judged like the slab itself (`NUMERICS.md`, the long windows against the
 references).
 
-The two bitwise forms run by default.  Measured on the 4-chip line (1x4 p150, a 32k context, `--prefill-slab 2048`,
-2026-09-25) against the previous slab body in the same process form: the acceptance pins 12/12 identical; the device
-column of the agreement corpus's two long windows identical at all 160 scored positions (KL 0.0, top-1 1.0 between
-the two columns; both 0.9812 / 0.0225 top-1 / KL against the HF reference); the slab's kernel time 1584.6 -> 1524.3 ms
-per 2048-row slab (-60.3 ms, -3.8 %: the gather 34.0 of it, the hoist 26.5, additive to 0.2 ms), 1283 -> 1334 prompt
-tokens per second on the body, TTFT at 32k 27.57 -> 26.64 s (-3.4 %), 220 fewer programs per slab.  On the landed
-base (BF8 dense weights, the compact expert layout, two DRAM readers per bank; 2026-09-25) the same pair measured in
-the served path: TTFT 24.55 -> 23.64 s at 31,716 tokens (0.773 -> 0.744 ms per prompt token, -3.7 %) and 1.979 ->
-1.910 s at 2,118 tokens, with the acceptance pins 12/12, all 3,232 scored positions of the agreement corpus and the
-four probe completions identical between the two bodies.
+The bitwise forms run by default.  The first two (the gather and the hoist below) measured on the 4-chip line (1x4
+p150, a 32k context, `--prefill-slab 2048`, 2026-09-25) against the previous slab body in the same process form: the
+acceptance pins 12/12 identical; the device column of the agreement corpus's two long windows identical at all 160
+scored positions (KL 0.0, top-1 1.0 between the two columns; both 0.9812 / 0.0225 top-1 / KL against the HF reference);
+the slab's kernel time 1584.6 -> 1524.3 ms per 2048-row slab (-60.3 ms, -3.8 %: the gather 34.0 of it, the hoist 26.5,
+additive to 0.2 ms), 1283 -> 1334 prompt tokens per second on the body, TTFT at 32k 27.57 -> 26.64 s (-3.4 %), 220 fewer
+programs per slab.  On the landed base (BF8 dense weights, the compact expert layout, two DRAM readers per bank;
+2026-09-25) the same pair measured in the served path: TTFT 24.55 -> 23.64 s at 31,716 tokens (0.773 -> 0.744 ms per
+prompt token, -3.7 %) and 1.979 -> 1.910 s at 2,118 tokens, with the acceptance pins 12/12, all 3,232 scored positions
+of the agreement corpus and the four probe completions identical between the two bodies.
 `QWEN38_PREFILL_GLUE=today` restores the previous slab body; `QWEN38_PREFILL_GLUE=<name>[,...]` runs exactly the
 named forms (a list that wants a default form names it); an unknown name, an exclusive pair or `today` beside a name
 refuses to start.
@@ -345,6 +345,14 @@ refuses to start.
   (the dense-linear admission's term: 988.5 MiB at 2048 rows).  So contexts to 64k hoist their masks when that DRAM
   is free; 128k and 256k contexts, or a process short of the headroom, derive the masks per layer as before (the
   bitwise slab body either way; only the mask programs' count differs).
+- `gr_slab_front` (bitwise, default): the gated-residual read's front as two fused programs around the stats
+  `all_gather` (`ttnn/fused/gr_read`'s `slab_stats` and `slab_normalize`), in place of `rms_norm_pre_all_gather`,
+  `rms_norm_post_all_gather`, the tile permute to the flat rows and the row gamma multiply.  Each core takes a run of
+  one branch's row tiles and runs the chain's LLK sequence on every row block; each normalized tile is written straight
+  to its flat page, and a branch's 20 gamma tiles are read once per run of cores and multicast down the run.  Measured
+  on the 4-chip line at 32k (2026-10-14) against the five bitwise defaults of the day: greedy-32 and the 32 top-20
+  logprob rows identical; the read's front 30.1 -> 15.8 ms of kernel time per 2048-row slab (GR read 79.8 -> 65.5
+  ms), a 31,524-token prompt 8,687 -> 8,469 ms.
 - `qsa_scores_rs_ag` (tolerance, off): each 512-row score block's four device partials are masked on every device,
   summed by a `reduce_scatter` over the block's rows, ranked per device on its 128 rows and the block ids gathered, in
   place of broadcasting every device's scores to every device and summing locally.  A third of the score payload
