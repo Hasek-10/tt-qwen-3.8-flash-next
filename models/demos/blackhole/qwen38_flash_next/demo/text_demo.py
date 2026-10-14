@@ -28,7 +28,7 @@ from models.common.utility_functions import run_for_blackhole
 from models.demos.blackhole.qwen38_flash_next.chat import TOKENIZER_SIZE, Qwen38OfficialChatTemplate
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_vllm import Qwen38ForCausalLM
 from models.demos.blackhole.qwen38_flash_next.ttnn.builder import RESIDENT_CONTEXT_HEADROOM
-from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import MESH_SHAPE
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import MESH_SHAPE, fabric_router_config
 from models.demos.utils.llm_demo_utils import create_benchmark_data
 from models.perf.benchmarking_utils import BenchmarkProfiler
 from models.tt_transformers.tt.model_config import determine_device_name
@@ -36,11 +36,13 @@ from models.tt_transformers.tt.model_config import determine_device_name
 MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"  # normalized by the benchmark writer to the model_targets.yaml key
 MAX_SEQ_LEN = 32_768 - RESIDENT_CONTEXT_HEADROOM  # the 32k resident context's limit, vLLM's --max-model-len
 PROMPT_FILE = Path(__file__).parent / "sample_prompts" / "input_data_questions_prefill_128.json"
-# The adapter's mesh parameters (the vLLM launch's tt config); the chain allocates its traces itself.
+# The adapter's mesh parameters (the vLLM launch's tt config) and the model's fabric router config; the chain
+# allocates its traces itself.
 DEVICE_PARAMS = {
     "l1_small_size": 24576,
     "num_command_queues": 2,
     "fabric_config": ttnn.FabricConfig.FABRIC_1D,
+    "fabric_router_config": fabric_router_config(),
     "trace_region_size": 0,
 }
 
