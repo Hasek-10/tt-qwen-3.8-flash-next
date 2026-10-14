@@ -21,6 +21,18 @@ import ttnn
 
 TP_SIZE = 4
 MESH_SHAPE = (1, TP_SIZE)
+# 1x4 p150 line, MEASURED 2026-10-14: hidden / partial all_gathers -28 / -29 %, natural32k -275 ms, outputs bitwise.
+FABRIC_MAX_PACKET_PAYLOAD_BYTES = 8192
+
+
+def fabric_router_config():
+    """The model's fabric router config, passed by every mesh open: ``FABRIC_MAX_PACKET_PAYLOAD_BYTES`` packets."""
+
+    config = ttnn.FabricRouterConfig()
+    config.max_packet_payload_size_bytes = FABRIC_MAX_PACKET_PAYLOAD_BYTES
+    return config
+
+
 POSITION_SCALAR_SHAPE = (1, 1, 1, 1)
 POSITION_INDEX_ROW_SHAPE = (1, 1, 1, ttnn.TILE_SIZE)
 # P & ~3 lane mask.  Kept in a tensor: values >= 2**31 must not take the scalar

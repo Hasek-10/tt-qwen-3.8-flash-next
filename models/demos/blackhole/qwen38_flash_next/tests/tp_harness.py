@@ -34,6 +34,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     MESH_SHAPE,
     Qwen38MeshContract,
     TensorPlacement,
+    fabric_router_config,
     replicate_tensor_2d_mesh_mapper,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.model import Qwen38TTNNRoPE
@@ -45,6 +46,7 @@ DEVICE_PARAMS = {
     "l1_small_size": 24576,
     "num_command_queues": 2,
     "fabric_config": ttnn.FabricConfig.FABRIC_1D,
+    "fabric_router_config": fabric_router_config(),
     "trace_region_size": 0,
 }
 
