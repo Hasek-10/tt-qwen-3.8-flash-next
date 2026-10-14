@@ -1193,6 +1193,16 @@ class Qwen38TTNNGatedResidual:
             raise ValueError(
                 f"GR rows injection must have shape {injection_rows_shape(rows)}, got {_shape(state.injection)}"
             )
+        # The slab's write as one program (prefill glue gr_slab_write): ttnn/fused/gr_write's slab write runs the
+        # multiply's and the add's LLK sequence on every output tile, the coefficient columns patched in its reader, so
+        # the permute, the multiply and the add have no program of their own.
+        slab = is_slab_rows(rows)
+        if slab and self.glue.enabled("gr_slab_write"):
+            from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gr_write as fused_gr_write
+
+            output = fused_gr_write.slab_write(block_rows, state.residual, state.injection)
+            self._validate_rows(output, residual_rows_shape(rows), label="GR rows output")
+            return output
         # [1,1,rows,4] -> [1,4,rows,1]: branch b's coefficient column, broadcast over the local hidden.
         coefficient = ttnn.permute(state.injection, (0, 3, 2, 1), memory_config=ttnn.DRAM_MEMORY_CONFIG)
         if _shape(coefficient) != (1, RESIDUAL_BRANCHES, rows, 1):
