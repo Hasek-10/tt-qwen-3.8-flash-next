@@ -12,6 +12,7 @@ builder attaching after the resident experts, the slab MoE instance sharing the 
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 from pathlib import Path
@@ -576,11 +577,18 @@ def test_every_other_slab_linear_takes_the_policy() -> None:
         assert source.count("resident_weight=") == count, module.__name__
         for name in names:
             assert f'.resident("{name}")' in source, (module.__name__, name)
-        assert (
-            "from models.demos.blackhole.qwen38_flash_next.ttnn.prefill_dense import Qwen38TTNNPrefillDense, prefill_linear"
-            in source
-        )
-        assert "    prefill_linear,\n" not in source.split("decode_matmul import (", 1)[1].split(")", 1)[0]
+        # The policy's names, imported from prefill_dense (however the import statement is wrapped); decode_matmul's
+        # per-config prefill_linear is never imported.
+        imported = {
+            (node.module, alias.name)
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+        }
+        for name in ("Qwen38TTNNPrefillDense", "prefill_linear"):
+            assert (pd.__name__, name) in imported, (module.__name__, name)
+            assert getattr(module, name) is getattr(pd, name), (module.__name__, name)
+        assert (decode_matmul.__name__, "prefill_linear") not in imported, module.__name__
         assert (
             inspect.signature(module.__dict__[_module_class(module)].__init__).parameters["prefill_dense"].default
             is None
