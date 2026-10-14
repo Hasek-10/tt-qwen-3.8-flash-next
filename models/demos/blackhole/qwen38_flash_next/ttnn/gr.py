@@ -49,23 +49,22 @@ import ttnn
 from models.demos.blackhole.qwen38_flash_next.checkpoint import INDEX_SHA256, Qwen38Checkpoint
 from models.demos.blackhole.qwen38_flash_next.config import Qwen38Placement
 from models.demos.blackhole.qwen38_flash_next.tt.gr import Qwen38GatedResidualWeights
+from models.demos.blackhole.qwen38_flash_next.ttnn import prefill_glue
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROW_COUNTS,
     CHUNK_ROWS,
     MESH_SHAPE,
     Qwen38MeshContract,
+    TensorPlacement,
+    is_slab_rows,
     replicate_tensor_2d_mesh_mapper,
     require_lane_count,
     same_buffer,
-    TensorPlacement,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
-from models.demos.blackhole.qwen38_flash_next.ttnn import prefill_glue
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_matmul_configs,
     dram_sharded_row_tiles,
     dram_sharded_weight_memory_config,
-    prefill_matmul_program_config,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.prefill_dense import Qwen38TTNNPrefillDense, prefill_linear
 
@@ -813,19 +812,6 @@ class Qwen38TTNNGatedResidual:
             )
         self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
 
-    def _slab_program_config(self, rows: int, k: int, n: int):
-        """The slab's 2D-multicast matmul config for one of the two linears, built once per (rows, k, n): today's
-        config, or the prefill dense policy's wide grid (QWEN38_PREFILL_DENSE_GRID=wide)."""
-
-        configs = self.__dict__.setdefault("_slab_program_configs", {})
-        key = (rows, k, n)
-        if key not in configs:
-            if self.prefill_dense.policy.grid == "today":
-                configs[key] = prefill_matmul_program_config(self.mesh_device, rows, k, n)
-            else:
-                configs[key] = self.prefill_dense.program_config(rows, k, n)
-        return configs[key]
-
     def read_rows(self, residual_rows, *, flat_views: bool = False) -> tuple[Any, Qwen38TTNNGatedResidualState]:
         """:meth:`read` for the residual rows ``[1,4,rows,640]`` of a chunk -> block rows ``[1,1,rows,640]``.
 
@@ -940,7 +926,6 @@ class Qwen38TTNNGatedResidual:
             partial = prefill_linear(
                 normalized_ws,
                 self.weights.down_inject,
-                self._slab_program_config(rows, FLAT_LOCAL_WIDTH, PARTIAL_WIDTH),
                 compute_kernel_config=self.prefill_dense.compute_config(self.compute_config),
                 dtype=ttnn.float32,
                 resident_weight=self.prefill_dense.resident("down_inject"),
@@ -1063,7 +1048,6 @@ class Qwen38TTNNGatedResidual:
             up_flat = prefill_linear(
                 low_rank,
                 self.weights.up,
-                self._slab_program_config(rows, PARTIAL_WIDTH, FLAT_LOCAL_WIDTH),
                 compute_kernel_config=self.prefill_dense.compute_config(self.compute_config),
                 resident_weight=self.prefill_dense.resident("up"),
             )

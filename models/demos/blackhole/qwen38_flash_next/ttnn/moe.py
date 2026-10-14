@@ -54,7 +54,6 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_matmul_configs,
     dram_sharded_row_tiles,
     dram_sharded_weight_memory_config,
-    prefill_matmul_program_config,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.prefill_dense import Qwen38TTNNPrefillDense, prefill_linear
 from models.tt_transformers.tt.ccl import tt_all_reduce
@@ -1545,31 +1544,16 @@ class Qwen38TTNNMoE:
         """The slab's router logits: one 2D-multicast matmul over every row (bf16 out, as the decode linear), widened
         to fp32 for the softmax exactly as the drain of the L1 shard widens them."""
 
-        # EXACT: the logits pick the ten experts, so the router never takes the prefill dense policy (today's
-        # config, the module's HiFi4 + fp32 config, the per-slab weight copy).
+        # EXACT: the logits pick the ten experts, so the router never takes the prefill dense policy (the module's
+        # HiFi4 + fp32 config, the per-slab weight copy).
         router_bf16 = prefill_linear(
             full_hidden,
             self.weights.router,
-            self._slab_program_config(HIDDEN_SIZE, ROUTED_EXPERTS, exact=True),
             compute_kernel_config=self.compute_config,
         )
         widened = ttnn.typecast(router_bf16, ttnn.float32, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(router_bf16)
         return widened
-
-    def _slab_program_config(self, k: int, n: int, *, exact: bool = False):
-        """The slab's 2D-multicast matmul config for one dense linear, built once per (k, n): today's config for the
-        exact set (``exact=True``: the router) and under the default policy, else the prefill dense policy's wide grid
-        (QWEN38_PREFILL_DENSE_GRID=wide)."""
-
-        configs = self.__dict__.setdefault("_slab_program_configs", {})
-        key = (k, n, exact)
-        if key not in configs:
-            if exact or self.prefill_dense.policy.grid == "today":
-                configs[key] = prefill_matmul_program_config(self.mesh_device, self.rows, k, n)
-            else:
-                configs[key] = self.prefill_dense.program_config(self.rows, k, n)
-        return configs[key]
 
     def _routed_partial_blocks(self, full_hidden, routing: Qwen38TTNNRouting, packed_w0_w1, packed_w2, phase_observer):
         """The slab's routed stream: the 128-row instance's call (``moe_compute`` on 128 tokens, the tilize, the
@@ -1730,14 +1714,12 @@ class Qwen38TTNNMoE:
             gate = prefill_linear(
                 full_hidden,
                 self.weights.shared_gate,
-                self._slab_program_config(HIDDEN_SIZE, local_intermediate),
                 compute_kernel_config=self.prefill_dense.compute_config(self.shared_compute_config),
                 resident_weight=dense.resident("shared_gate"),
             )
             up = prefill_linear(
                 full_hidden,
                 self.weights.shared_up,
-                self._slab_program_config(HIDDEN_SIZE, local_intermediate),
                 compute_kernel_config=self.prefill_dense.compute_config(self.shared_compute_config),
                 resident_weight=dense.resident("shared_up"),
             )
@@ -1749,7 +1731,6 @@ class Qwen38TTNNMoE:
         partial = prefill_linear(
             intermediate,
             self.weights.shared_down,
-            self._slab_program_config(local_intermediate, HIDDEN_SIZE),
             compute_kernel_config=self.prefill_dense.compute_config(self.shared_compute_config),
             resident_weight=dense.resident("shared_down"),
         )
@@ -1760,7 +1741,6 @@ class Qwen38TTNNMoE:
         scalar = prefill_linear(
             full_hidden,
             self.weights.shared_scalar_gate,
-            self._slab_program_config(HIDDEN_SIZE, 1),
             compute_kernel_config=self.prefill_dense.compute_config(self.shared_compute_config),
             resident_weight=dense.resident("shared_scalar_gate"),
         )

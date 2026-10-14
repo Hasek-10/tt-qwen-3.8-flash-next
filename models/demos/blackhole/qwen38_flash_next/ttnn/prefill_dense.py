@@ -3,26 +3,24 @@
 
 """The prefill slab's dense linears behind four switches: weight dtype, math fidelity, grid, fp32 accumulation.
 
-Inside a slab (``--prefill-slab ROWS``) every dense linear of a layer runs as one 2D-multicast matmul over the rows
-on a per-slab interleaved copy of its DRAM-width-sharded decode weight (``decode_matmul.prefill_linear``), in the
-weight's format (``QWEN38_DENSE_WEIGHT_DTYPE``, bf8 by default) with the module's compute config for it (HiFi4 for
-bf16, HiFi2 for bf8, LoFi for bf4; fp32 accumulation).  The switches below, read once when the modules are built,
-move those linears and nothing else.  The dtype, fidelity and accumulation defaults keep the slab's arithmetic; the
-grid's default is ``wide``
-(measured on the 4-chip line: a device column identical to ``today`` at every scored position and the same
-completions, the dense family 92.6 -> 75.8 ms per 2048-row slab), and ``GRID=today`` restores the earlier slab
-bitwise:
+Inside a slab (``--prefill-slab ROWS``) every dense linear of a layer runs as one multicast matmul over the rows on a
+per-slab interleaved copy of its DRAM-width-sharded decode weight (``decode_matmul.prefill_linear``), in the weight's
+format (``QWEN38_DENSE_WEIGHT_DTYPE``, bf8 by default) with the module's compute config for it (HiFi4 for bf16, HiFi2
+for bf8, LoFi for bf4; fp32 accumulation), on ``decode_matmul.prefill_matmul_program_config`` for its shape and weight
+dtype (every grid and K block of that rule is bitwise the same output).  The switches below, read once when the modules
+are built, move those linears and nothing else.  The dtype, fidelity and accumulation defaults keep the slab's
+arithmetic; the grid's default is ``wide`` (measured on the 4-chip line: a device column identical to ``today`` at
+every scored position and the same completions), and ``GRID=today`` restores the separate linears bitwise:
 
     QWEN38_PREFILL_DENSE_DTYPE=bf16|bf8          (bf16)  bf8: a resident DRAM-interleaved bfloat8_b copy of each weight,
                                                           prefill only (no per-slab copy; the decode weights keep their format)
     QWEN38_PREFILL_DENSE_FIDELITY=hifi4|hifi2|lofi (hifi4)  hifi4: the module's own compute config (the fidelity of
                                                           its weight format); hifi2 / lofi: that fidelity instead
-    QWEN38_PREFILL_DENSE_GRID=today|wide         (wide)  wide: more columns for the narrow-N shapes, and the pair-grouped
-                                                          K/V and the shared expert's gate/up as one linear each on
-                                                          resident copies in the weights' format (the same tiles the
-                                                          separate linears read; 58 MB per device as bf8, 110 MB as
-                                                          bf16); today: the grids of
-                                                          ``decode_matmul.prefill_matmul_program_config``, no resident
+    QWEN38_PREFILL_DENSE_GRID=today|wide         (wide)  wide: the pair-grouped K/V and the shared expert's gate/up as
+                                                          one linear each on resident copies in the weights' format
+                                                          (the same tiles the separate linears read; 58 MB per device
+                                                          as bf8, 110 MB as bf16); today: the separate linears, no
+                                                          resident
     QWEN38_PREFILL_DENSE_FP32_ACC=1|0            (1)     fp32 accumulation across the K blocks
 
 The switches act on a build that runs a slab: the builder is told the slab's rows before the target is built
@@ -32,7 +30,7 @@ build without a slab holds no slab linear, so it allocates nothing and admits no
 
 The **exact set** never reads the switches: the MoE router (its logits pick the ten experts), the QSA ``index_q`` and
 ``index_k`` projections (their outputs pick the attended blocks and persist in the compressed index cache).  Their call
-sites ask for today's program config with ``exact=True`` and pass no resident weight, so no switch value can move them.
+sites pass the module's own compute config and no resident weight, so no switch value can move them.
 The decode path is untouched: the DRAM-sharded decode linears, their weights and ``decode_matmul`` are as before.
 
 Arms, expected gains, the quality readouts (the acceptance gate never reaches a slab body: only prompts of 2048 tokens
@@ -48,7 +46,6 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import ttnn
-
 from models.demos.blackhole.qwen38_flash_next.ttnn import decode_matmul
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     MESH_SHAPE,
@@ -183,8 +180,8 @@ class ResidentSpec:
 @dataclass(frozen=True)
 class Qwen38PrefillDensePolicy:
     """The four switches as one value.  ``from_environ`` reads them (unknown values raise); the default instance is
-    the wide grid on today's arithmetic (bf16 weights copied per slab, HiFi4, fp32 accumulation); ``grid="today"``
-    is the earlier slab, bitwise."""
+    the fused siblings on today's arithmetic (bf16 weights copied per slab, HiFi4, fp32 accumulation); ``grid="today"``
+    is the separate linears, bitwise."""
 
     dtype: str = DEFAULTS[DTYPE_ENV]
     fidelity: str = DEFAULTS[FIDELITY_ENV]
@@ -318,62 +315,20 @@ class Qwen38PrefillDensePolicy:
             packer_l1_acc=False,
         )
 
-    def program_config(self, mesh_device, rows: int, k: int, n: int):
-        """Today's 2D-multicast config (grid today) or the wide one."""
 
-        if self.grid == "today":
-            return prefill_matmul_program_config(mesh_device, rows, k, n)
-        return wide_prefill_matmul_program_config(mesh_device, rows, k, n)
+def prefill_linear(activation, weight, *, compute_kernel_config, dtype=None, resident_weight=None):
+    """One slab linear on ``decode_matmul.prefill_matmul_program_config`` for its shape and the dtype of the weight it
+    reads: ``decode_matmul.prefill_linear`` (the per-slab interleaved copy of ``weight``, released after the matmul)
+    unless the policy holds a resident prefill weight for this linear, which the matmul then reads in place."""
 
-
-def wide_prefill_matmul_program_config(mesh_device, rows: int, k: int, n: int):
-    """The 2D-multicast config that runs the most columns for a ``[rows, k] x [k, n]`` slab linear.
-
-    Today's rule (``prefill_matmul_program_config``) picks the widest output subblock first and leaves the narrow-N
-    linears on 10-40 of the 110 cores.  This one ranks the column count the program factory runs
-    (``ceil(N_tiles / per_core_N)``) first, among the configs whose output subblock is at least two tiles wide (a
-    one-tile subblock stalls the matmul), then the wider subblock; a one-tile N falls back to today's rule.  The K
-    block, the row split and every other field are today's, so the per-column arithmetic is the same and only the
-    block order over the cores changes.
-    """
-
-    grid = mesh_device.compute_with_storage_grid_size()
-    m_tiles, k_tiles, n_tiles = rows // ttnn.TILE_SIZE, k // ttnn.TILE_SIZE, math.ceil(n / ttnn.TILE_SIZE)
-    if rows % ttnn.TILE_SIZE or k % ttnn.TILE_SIZE:
-        raise ValueError(f"prefill linear needs whole row and K tiles, got rows={rows} k={k}")
-    best = None
-    for cols in range(1, min(int(grid.x), n_tiles) + 1):
-        per_core_n = math.ceil(n_tiles / cols)
-        running = math.ceil(n_tiles / per_core_n)
-        subblock = decode_matmul._largest_divisor(per_core_n, 4)
-        if subblock < 2:
-            continue
-        key = (running, subblock)
-        if best is None or key > best[0]:
-            best = (key, running, per_core_n, subblock)
-    if best is None:
-        return prefill_matmul_program_config(mesh_device, rows, k, n)
-    _key, running, per_core_n, subblock = best
-    grid_rows = min(int(grid.y), m_tiles)
-    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
-        compute_with_storage_grid_size=(running, grid_rows),
-        in0_block_w=decode_matmul._largest_divisor(k_tiles, 8),
-        out_subblock_h=1,
-        out_subblock_w=subblock,
-        per_core_M=math.ceil(m_tiles / grid_rows),
-        per_core_N=per_core_n,
-        transpose_mcast=False,
-        fused_activation=None,
-        fuse_batch=False,
+    operand = weight if resident_weight is None else resident_weight
+    program_config = prefill_matmul_program_config(
+        operand.device(),
+        int(activation.shape[2]),
+        int(operand.shape[2]),
+        int(operand.shape[3]),
+        weight_dtype=operand.dtype,
     )
-
-
-def prefill_linear(activation, weight, program_config, *, compute_kernel_config, dtype=None, resident_weight=None):
-    """``decode_matmul.prefill_linear`` (the per-slab interleaved copy of ``weight``, released after the matmul) unless
-    the policy holds a resident prefill weight for this linear: then the matmul reads ``resident_weight`` in place and
-    nothing is copied or released.  Without a resident weight the call is the unchanged decode_matmul helper: the
-    per-slab copy, bitwise the earlier slab."""
-
     if resident_weight is None:
         return decode_matmul.prefill_linear(
             activation, weight, program_config, compute_kernel_config=compute_kernel_config, dtype=dtype
@@ -425,9 +380,9 @@ class Qwen38TTNNPrefillDenseWeights:
 
 
 class Qwen38TTNNPrefillDense:
-    """One module's view of the policy: the compute config for its slab linears, the wide program configs (cached
-    per shape), the resident prefill weights (attached by the builder after every other resident allocation) and the
-    fused-sibling linear.  Construction touches no device: ``mesh_device`` is read when a config is first asked for."""
+    """One module's view of the policy: the compute config for its slab linears, the resident prefill weights
+    (attached by the builder after every other resident allocation) and the fused-sibling linear.  Construction touches
+    no device: ``mesh_device`` is read when the fused-sibling linear first runs."""
 
     def __init__(self, policy: Qwen38PrefillDensePolicy, mesh_device) -> None:
         if not isinstance(policy, Qwen38PrefillDensePolicy):
@@ -435,7 +390,6 @@ class Qwen38TTNNPrefillDense:
         self.policy = policy
         self.mesh_device = mesh_device
         self.weights = Qwen38TTNNPrefillDenseWeights()
-        self._program_configs: dict[tuple[int, int, int], Any] = {}
         self._compute_configs: list[tuple[Any, Any]] = []
 
     @classmethod
@@ -461,14 +415,6 @@ class Qwen38TTNNPrefillDense:
         self._compute_configs.append((module_default, derived))
         return derived
 
-    def program_config(self, rows: int, k: int, n: int):
-        """The policy's 2D-multicast config for one shape, built once."""
-
-        key = (rows, k, n)
-        if key not in self._program_configs:
-            self._program_configs[key] = self.policy.program_config(self.mesh_device, rows, k, n)
-        return self._program_configs[key]
-
     def resident(self, name: str):
         """The resident prefill weight ``name`` holds, or None (today's per-slab copy)."""
 
@@ -492,7 +438,9 @@ class Qwen38TTNNPrefillDense:
             activation,
             weight,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            program_config=self.program_config(rows, spec.k, spec.n),
+            program_config=prefill_matmul_program_config(
+                self.mesh_device, rows, spec.k, spec.n, weight_dtype=spec.ttnn_dtype
+            ),
             compute_kernel_config=self.compute_config(compute_kernel_config),
         )
 

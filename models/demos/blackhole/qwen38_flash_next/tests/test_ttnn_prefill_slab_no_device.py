@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import ttnn
 from models.demos.blackhole.qwen38_flash_next.tools import qwen38_prefill_driver as driver_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import contracts as contracts_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import decode_matmul as decode_matmul_module
@@ -377,35 +378,47 @@ def test_prefill_matmul_config_covers_the_rows_and_columns_with_whole_subblocks(
 
     grid = SimpleNamespace(x=11, y=10)
     mesh = SimpleNamespace(compute_with_storage_grid_size=lambda: grid)
-    original = decode_matmul_module.ttnn.MatmulMultiCoreReuseMultiCastProgramConfig
-    decode_matmul_module.ttnn.MatmulMultiCoreReuseMultiCastProgramConfig = _Config
+    names = ("MatmulMultiCoreReuseMultiCastProgramConfig", "MatmulMultiCoreReuseMultiCast1DProgramConfig")
+    originals = {name: getattr(decode_matmul_module.ttnn, name) for name in names}
+    for name in names:
+        setattr(decode_matmul_module.ttnn, name, _Config)
     try:
-        for k, n in (
-            (2560, 4160),
-            (1536, 2560),
-            (2560, 384),
-            (384, 2560),
-            (2560, 512),
-            (2560, 160),
-            (160, 2560),
-            (2560, 1),
-        ):
-            captured.clear()
-            decode_matmul_module.prefill_matmul_program_config(mesh, SLAB, k, n)
-            cols, rows = captured["compute_with_storage_grid_size"]
-            n_tiles, k_tiles = math.ceil(n / 32), k // 32
-            assert 1 <= cols <= min(11, n_tiles) and rows == 10
-            assert captured["per_core_M"] * rows >= SLAB // 32 and captured["per_core_N"] * cols >= n_tiles
-            assert captured["out_subblock_h"] == 1 and captured["per_core_N"] % captured["out_subblock_w"] == 0
-            assert 1 <= captured["out_subblock_w"] <= 4 and k_tiles % captured["in0_block_w"] == 0
-            assert captured["in0_block_w"] <= 8 and captured["transpose_mcast"] is False
+        for rows in (256, SLAB, 4096):
+            for k, n, dtype in (
+                (2560, 4160, ttnn.bfloat8_b),
+                (1536, 2560, ttnn.bfloat16),
+                (2560, 384, ttnn.bfloat16),
+                (384, 2560, ttnn.bfloat16),
+                (2560, 512, ttnn.bfloat16),
+                (2560, 160, ttnn.bfloat4_b),
+                (160, 2560, ttnn.bfloat8_b),
+                (2560, 128, ttnn.bfloat8_b),
+                (2560, 1, ttnn.bfloat8_b),
+            ):
+                captured.clear()
+                decode_matmul_module.prefill_matmul_program_config(mesh, rows, k, n, weight_dtype=dtype)
+                cols, grid_rows = captured["compute_with_storage_grid_size"]
+                m_tiles, n_tiles, k_tiles = rows // 32, math.ceil(n / 32), k // 32
+                per_core_m, per_core_n, block = captured["per_core_M"], captured["per_core_N"], captured["in0_block_w"]
+                if "mcast_in0" in captured:  # 1D: one row block per core across every column, in1 multicast
+                    assert (cols, grid_rows) == (11, 10) and per_core_n == n_tiles and captured["mcast_in0"] is False
+                    assert math.ceil(m_tiles / per_core_m) <= 110
+                else:
+                    assert 1 <= cols <= min(11, n_tiles) and grid_rows == min(10, m_tiles)
+                    assert per_core_m * grid_rows >= m_tiles and per_core_n * cols >= n_tiles
+                    assert captured["transpose_mcast"] is False
+                assert captured["out_subblock_h"] == 1 and per_core_n % captured["out_subblock_w"] == 0
+                assert 1 <= captured["out_subblock_w"] <= 4 and k_tiles % block == 0
+                assert block <= decode_matmul_module.PREFILL_MAX_IN0_BLOCK_W
+                assert (
+                    decode_matmul_module.prefill_circular_buffer_bytes(per_core_m, per_core_n, block, k_tiles, dtype)
+                    <= decode_matmul_module.PREFILL_CB_BUDGET_BYTES
+                )
         with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
             decode_matmul_module.prefill_matmul_program_config(mesh, 2000, 2560, 512)
     finally:
-        decode_matmul_module.ttnn.MatmulMultiCoreReuseMultiCastProgramConfig = original
-
-
-# --------------------------------------------------------------------------- QSA slab constants and inputs
+        for name, original in originals.items():
+            setattr(decode_matmul_module.ttnn, name, original)
 
 
 def test_qsa_slab_constants_pool_every_block_and_carry_no_row_templates() -> None:
@@ -691,7 +704,7 @@ def test_slab_source_pins() -> None:
     assert "weight_interleaved," in linear and "memory_config=ttnn.DRAM_MEMORY_CONFIG" in linear
     for module in (gdn_module, gr_module, moe_module, qsa_module):
         source = inspect.getsource(module)
-        assert "prefill_linear(" in source and "prefill_matmul_program_config(" in source
+        assert "prefill_linear(" in source and "_slab_program_config" not in source
         # Every slab linear goes through the helper: no direct ttnn.linear on a slab branch.
         assert "is_slab_rows" in source
     gdn = inspect.getsource(gdn_module.Qwen38TTNNGDN._causal_conv_rows)

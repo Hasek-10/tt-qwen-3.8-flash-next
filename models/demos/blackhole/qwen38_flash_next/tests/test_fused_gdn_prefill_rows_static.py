@@ -388,17 +388,17 @@ def test_the_other_bodies_keep_their_text():
 
 def test_the_two_dense_linears_are_the_slab_branches_own():
     """The fused body calls the same two helpers the chain's slab branch calls, so the projection and the
-    out-projection (and their program configs) cannot drift between the arms."""
+    out-projection (and their program configs, prefill_linear's for the shape) cannot drift between the arms."""
 
     projection = _squash(_method("_slab_projection"))
-    assert _squash("self._slab_program_config(tile_rows, HIDDEN_SIZE, PROJECTION_WIDTH_PER_DEVICE)") in projection
+    assert _squash("prefill_linear( full_hidden, self.weights.qkvzab,") in projection
     assert _squash('resident_weight=self.prefill_dense.resident("qkvzab")') in projection
     assert _squash("projected = self._slab_projection(full_hidden, rows_state)") in _squash(
         _method("_project_rows_linear")  # the branch moved with the linear half; _project_rows calls that half
     )
 
     tail = _squash(_method("_slab_out_projection"))
-    assert _squash("self._slab_program_config(tile_rows, VALUE_WIDTH_PER_DEVICE, HIDDEN_SIZE)") in tail
+    assert _squash("prefill_linear( gated, self.weights.out,") in tail
     assert _squash('resident_weight=self.prefill_dense.resident("out")') in tail
     assert _squash("output = ttnn.reduce_scatter(") in tail
     assert _squash('_copy_inplace(output, rows_state.output, label="GDN slab output")') in tail

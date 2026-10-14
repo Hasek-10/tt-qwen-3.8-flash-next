@@ -50,7 +50,6 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_matmul_configs,
     dram_sharded_row_tiles,
     dram_sharded_weight_memory_config,
-    prefill_matmul_program_config,
     validate_decode_dram_workers,
     validate_dram_sharded_weight,
     weight_layout_tag,
@@ -2730,7 +2729,6 @@ class Qwen38TTNNGDN:
         projected = prefill_linear(
             full_hidden,
             self.weights.qkvzab,
-            self._slab_program_config(tile_rows, HIDDEN_SIZE, PROJECTION_WIDTH_PER_DEVICE),
             compute_kernel_config=self.prefill_dense.compute_config(self.projection_compute_config),
             resident_weight=self.prefill_dense.resident("qkvzab"),
         )
@@ -2771,19 +2769,6 @@ class Qwen38TTNNGDN:
         _retag_head_shard_after_reshape(selected, reference=window, shard_dim=3)
         _require_shape(selected, (1, 1, _shape(select)[2], QKV_WIDTH_PER_DEVICE), label=label)
         return selected
-
-    def _slab_program_config(self, rows: int, k: int, n: int):
-        """The slab's 2D-multicast matmul config for one linear, built once per (rows, k, n): today's config, or the
-        prefill dense policy's wide grid (QWEN38_PREFILL_DENSE_GRID=wide)."""
-
-        configs = self.__dict__.setdefault("_slab_program_configs", {})
-        key = (rows, k, n)
-        if key not in configs:
-            if self.prefill_dense.policy.grid == "today":
-                configs[key] = prefill_matmul_program_config(self.mesh_device, rows, k, n)
-            else:
-                configs[key] = self.prefill_dense.program_config(rows, k, n)
-        return configs[key]
 
     def _shifted_rows_slab(self, rows_state: Qwen38TTNNGDNRowsState):
         """The slab's FIR taps 0..2 by row shifts: tap t is ``[history rows t..2 | new rows 0..T-4+t]``, built in
@@ -3151,7 +3136,6 @@ class Qwen38TTNNGDN:
         partial = prefill_linear(
             gated,
             self.weights.out,
-            self._slab_program_config(tile_rows, VALUE_WIDTH_PER_DEVICE, HIDDEN_SIZE),
             compute_kernel_config=self.prefill_dense.compute_config(self.projection_compute_config),
             resident_weight=self.prefill_dense.resident("out"),
         )

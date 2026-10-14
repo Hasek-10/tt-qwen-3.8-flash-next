@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The prefill slab's dense-linear switches (``ttnn/prefill_dense``) without a device: the four switches, their
-defaults and refusals; grid today resolving to the modules' own compute config, today's program config, no
-resident weight and ``decode_matmul.prefill_linear``; the default (the wide grid on today's arithmetic: the two
-fused siblings resident in bf16, nothing else); the arm configs (fidelity, fp32 accumulation, the wide grid per
-shape); the resident-weight plans (nothing under grid today with dtype bf16, the bfloat8_b copies only under dtype
+defaults and refusals; grid today resolving to the modules' own compute config, no resident weight and
+``decode_matmul.prefill_linear``; the default (the fused siblings on today's arithmetic: the two siblings resident in
+bf16, nothing else); the arm configs (fidelity, fp32 accumulation); the slab program config per shape (the one rule
+every slab linear takes); the resident-weight plans (nothing under grid today with dtype bf16, the bfloat8_b copies only under dtype
 bf8, the fused siblings only under grid wide) and their bytes; the exact set (router, index projections) carrying no
 policy in the code; the DRAM admission; and the wiring pins (decode_matmul and the weight loaders untouched, the
 builder attaching after the resident experts, the slab MoE instance sharing the layer's object)."""
@@ -33,17 +33,21 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.fused import shared_expert
 MODEL_DIR = Path(__file__).resolve().parents[1]
 SLAB = 2048
 DTYPE, FIDELITY, GRID, FP32 = pd.DTYPE_ENV, pd.FIDELITY_ENV, pd.GRID_ENV, pd.FP32_ACC_ENV
-# The slab's dense shapes (local K x N) and the arms' wide configs: (grid columns, out_subblock_w, per_core_N), DERIVED
-# on the 11 x 10 grid at 2048 rows (the prefill dense design note).
-WIDE = {
-    (2560, 4160): (11, 4, 12),  # GDN in-proj: full already
-    (1536, 2560): (10, 4, 8),  # GDN / QSA out-proj: the 100 columns today's (11, 10) also runs
-    (384, 2560): (10, 4, 8),  # GR up
-    (160, 2560): (10, 4, 8),  # shared down
-    (2560, 3072): (11, 3, 9),  # QSA query-gate: 80 -> 110 cores
-    (2560, 512): (8, 2, 2),  # [k | v]: 2 x 20 -> 80 cores
-    (2560, 384): (6, 2, 2),  # GR down+inject: 30 -> 60 cores
-    (2560, 320): (5, 2, 2),  # [gate | up]: 2 x 20 -> 50 cores
+# The slab's dense linears (local K x N, the weight dtype by default) and the rule's config at 2048 rows on the 11 x 10
+# grid: (form, grid columns, per_core_N, out_subblock_w, in0_block_w), DERIVED.  Every config is bitwise the earlier
+# one (MEASURED one p150, 2026-10-14, three activations, bf16 and fp32 output); us earlier -> rule (MEASURED, same run).
+RULE = {
+    (2560, 4160, ttnn.bfloat8_b): ("2d", 11, 12, 4, 10),  # GDN in-proj: 313.0 -> 288.5
+    (1536, 2560, ttnn.bfloat8_b): ("2d", 10, 8, 4, 12),  # GDN / QSA out-proj: 139.4 -> 122.6
+    (384, 2560, ttnn.bfloat16): ("2d", 10, 8, 4, 12),  # GR up: 70.5 -> 63.2
+    (160, 2560, ttnn.bfloat8_b): ("2d", 10, 8, 4, 5),  # shared down: 49.1 -> 49.0
+    (2560, 3072, ttnn.bfloat8_b): ("2d", 11, 9, 3, 10),  # QSA query-gate: 243.2 -> 224.0
+    (2560, 512, ttnn.bfloat8_b): ("2d", 8, 2, 2, 16),  # [k | v]: 66.9 -> 64.3
+    (2560, 512, ttnn.bfloat16): ("2d", 8, 2, 2, 16),  # router: 40 -> 80 cores, 150.7 -> 79.0
+    (2560, 384, ttnn.bfloat16): ("1d", 11, 12, 4, 16),  # GR down+inject: 60 -> 64 cores, 89.4 -> 87.8
+    (2560, 320, ttnn.bfloat8_b): ("1d", 11, 10, 2, 16),  # [gate | up]: 50 -> 64 cores, 65.4 -> 61.9
+    (2560, 128, ttnn.bfloat8_b): ("1d", 11, 4, 4, 16),  # QSA index: 10 -> 64 cores, 95.2 -> 54.5
+    (2560, 1, ttnn.bfloat8_b): ("1d", 11, 1, 1, 16),  # shared scalar gate: 10 -> 64 cores, 49.2 -> 52.2
 }
 BF8_TILE, BF16_TILE = 1088, 2048
 
@@ -53,9 +57,14 @@ class _Config:
         self.kwargs = kwargs
 
 
+class _Config1D(_Config):
+    pass
+
+
 @pytest.fixture
 def config_class(monkeypatch):
     monkeypatch.setattr(pd.ttnn, "MatmulMultiCoreReuseMultiCastProgramConfig", _Config)
+    monkeypatch.setattr(pd.ttnn, "MatmulMultiCoreReuseMultiCast1DProgramConfig", _Config1D)
     return _Config
 
 
@@ -129,34 +138,24 @@ def test_resolve_reads_the_environment_once_and_rejects_aliases(monkeypatch) -> 
 # --------------------------------------------------------------------------- grid today: the earlier slab, bitwise
 
 
-def test_today_policy_resolves_to_the_modules_objects_and_todays_config(config_class) -> None:
+def test_today_policy_resolves_to_the_modules_objects() -> None:
     mesh = _mesh(arch=None)
     dense = pd.Qwen38TTNNPrefillDense(pd.Qwen38PrefillDensePolicy(grid="today"), mesh)
     module_default = object()
     assert dense.compute_config(module_default) is module_default  # the same object, no config is built
-    for k, n in list(WIDE) + [(2560, 160), (2560, 1), (2560, 512), (2560, 128)]:
-        assert (
-            dense.program_config(SLAB, k, n).kwargs
-            == decode_matmul.prefill_matmul_program_config(mesh, SLAB, k, n).kwargs
-        )
-    assert dense.program_config(SLAB, 2560, 384) is dense.program_config(SLAB, 2560, 384)  # built once
     assert len(dense.weights) == 0 and dense.resident("qg") is None and dense.weights.names == ()
     policy = dense.policy
     assert all(policy.resident_plan(module) == () for module in pd.MODULES) and policy.plan_bytes_per_device() == 0
 
 
-def test_default_policy_is_the_wide_grid_on_todays_arithmetic(config_class) -> None:
-    # The default (grid wide, bf16, HiFi4, fp32 accumulation): the modules' own compute config, the wide program
-    # configs, the two fused siblings resident in bf16 and nothing else.  MEASURED on the 4-chip line (2026-09-25):
+def test_default_policy_is_the_fused_siblings_on_todays_arithmetic() -> None:
+    # The default (grid wide, bf16, HiFi4, fp32 accumulation): the modules' own compute config, the two fused siblings
+    # resident in bf16 and nothing else.  MEASURED on the 4-chip line (2026-09-25):
     # +110,100,480 B of DRAM per device over grid today, the device column identical at every scored position.
     mesh = _mesh(arch=None)
     dense = pd.Qwen38TTNNPrefillDense(pd.Qwen38PrefillDensePolicy(), mesh)
     module_default = object()
     assert dense.policy.grid == "wide" and dense.compute_config(module_default) is module_default
-    wide = pd.Qwen38TTNNPrefillDense(pd.Qwen38PrefillDensePolicy(grid="wide"), mesh)
-    for k, n in list(WIDE) + [(2560, 160), (2560, 1), (2560, 512), (2560, 128)]:
-        assert dense.program_config(SLAB, k, n).kwargs == wide.program_config(SLAB, k, n).kwargs
-    assert dense.program_config(SLAB, 2560, 3072).kwargs["compute_with_storage_grid_size"] == (11, 10)
     policy = dense.policy
     assert {module: tuple(spec.name for spec in policy.resident_plan(module)) for module in pd.MODULES} == {
         "gr": (),
@@ -187,7 +186,7 @@ def test_default_policy_is_the_wide_grid_on_todays_arithmetic(config_class) -> N
 
 
 def test_prefill_linear_default_is_decode_matmuls_helper_and_the_resident_form_copies_nothing(monkeypatch) -> None:
-    # decode_matmul is untouched: its helper keeps today's signature and knows nothing of resident weights (checked
+    # decode_matmul's helper keeps today's signature and knows nothing of resident weights (checked
     # before the helper is patched below).
     assert tuple(inspect.signature(decode_matmul.prefill_linear).parameters) == (
         "activation",
@@ -209,17 +208,23 @@ def test_prefill_linear_default_is_decode_matmuls_helper_and_the_resident_form_c
     monkeypatch.setattr(
         pd.ttnn, "deallocate", lambda *args, **kwargs: pytest.fail("nothing to release on the resident path")
     )
-    assert pd.prefill_linear("act", "w", "cfg", compute_kernel_config="cc") == "copy"
-    assert calls == [("decode", ("act", "w", "cfg"), {"compute_kernel_config": "cc", "dtype": None})]
+    configs = []
+    monkeypatch.setattr(
+        pd, "prefill_matmul_program_config", lambda *args, **kwargs: configs.append((args, kwargs)) or "cfg"
+    )
+    act = SimpleNamespace(shape=(1, 1, SLAB, 2560))
+    weight = SimpleNamespace(shape=(1, 1, 2560, 384), dtype=ttnn.bfloat16, device=lambda: "mesh")
+    resident = SimpleNamespace(shape=(1, 1, 2560, 384), dtype=ttnn.bfloat8_b, device=lambda: "mesh")
+    assert pd.prefill_linear(act, weight, compute_kernel_config="cc") == "copy"
+    assert calls == [("decode", (act, weight, "cfg"), {"compute_kernel_config": "cc", "dtype": None})]
     calls.clear()
     assert (
-        pd.prefill_linear("act", "w", "cfg", compute_kernel_config="cc", dtype="f32", resident_weight="rw")
-        == "resident"
+        pd.prefill_linear(act, weight, compute_kernel_config="cc", dtype="f32", resident_weight=resident) == "resident"
     )
     assert calls == [
         (
             "linear",
-            ("act", "rw"),
+            (act, resident),
             {
                 "memory_config": ttnn.DRAM_MEMORY_CONFIG,
                 "program_config": "cfg",
@@ -227,6 +232,11 @@ def test_prefill_linear_default_is_decode_matmuls_helper_and_the_resident_form_c
                 "dtype": "f32",
             },
         )
+    ]
+    # The config is the rule's for the shape and the dtype of the weight the matmul reads.
+    assert configs == [
+        (("mesh", SLAB, 2560, 384), {"weight_dtype": ttnn.bfloat16}),
+        (("mesh", SLAB, 2560, 384), {"weight_dtype": ttnn.bfloat8_b}),
     ]
 
 
@@ -270,38 +280,30 @@ def test_arm_compute_configs(monkeypatch) -> None:
     assert pd.Qwen38PrefillDensePolicy(dtype="bf8", grid="wide").module_compute_config is True
 
 
-def test_wide_grid_runs_the_most_columns_with_two_tile_subblocks(config_class) -> None:
+def test_slab_rule_runs_the_most_cores_within_the_circular_buffer_budget(config_class) -> None:
     mesh = _mesh()
-    dense = pd.Qwen38TTNNPrefillDense(pd.Qwen38PrefillDensePolicy(grid="wide"), mesh)
-    for (k, n), (cols, subblock, per_core_n) in WIDE.items():
-        config = dense.program_config(SLAB, k, n).kwargs
-        n_tiles, k_tiles = -(-n // 32), k // 32
-        assert config["compute_with_storage_grid_size"] == (cols, 10), (k, n, config)
-        assert (config["out_subblock_w"], config["per_core_N"]) == (subblock, per_core_n), (k, n, config)
-        assert config["out_subblock_h"] == 1 and config["per_core_M"] == 7 and config["transpose_mcast"] is False
-        assert config["in0_block_w"] == next(d for d in range(8, 0, -1) if k_tiles % d == 0)
-        assert -(-n_tiles // per_core_n) == cols  # the grid width is what the program factory runs
-        assert per_core_n % subblock == 0 and subblock >= 2
-        assert config["fused_activation"] is None and config["fuse_batch"] is False
-    # A one-tile N (the scalar gate) has no two-tile subblock: today's config.
-    assert (
-        dense.program_config(SLAB, 2560, 1).kwargs
-        == decode_matmul.prefill_matmul_program_config(mesh, SLAB, 2560, 1).kwargs
-    )
-    # The narrow shapes gain cores against today's rule; the full-width ones keep their 110 / 100 columns.
-    today = {shape: decode_matmul.prefill_matmul_program_config(mesh, SLAB, *shape).kwargs for shape in WIDE}
-    for shape, (cols, _sub, per_core_n) in WIDE.items():
-        n_tiles = -(-shape[1] // 32)
-        running_today = -(-n_tiles // today[shape]["per_core_N"])
-        assert cols >= running_today, shape
-    assert {shape for shape in WIDE if WIDE[shape][0] > -(-(-(-shape[1] // 32)) // today[shape]["per_core_N"])} == {
-        (2560, 3072),
-        (2560, 512),
-        (2560, 384),
-        (2560, 320),
-    }
+    for (k, n, dtype), (form, cols, per_core_n, subblock, in0_block_w) in RULE.items():
+        config = decode_matmul.prefill_matmul_program_config(mesh, SLAB, k, n, weight_dtype=dtype)
+        kwargs = config.kwargs
+        assert isinstance(config, _Config1D) == (form == "1d"), (k, n, kwargs)
+        assert kwargs["compute_with_storage_grid_size"] == (cols, 10), (k, n, kwargs)
+        assert (kwargs["per_core_N"], kwargs["out_subblock_w"], kwargs["in0_block_w"]) == (
+            per_core_n,
+            subblock,
+            in0_block_w,
+        ), (k, n, kwargs)
+        assert kwargs["out_subblock_h"] == 1 and kwargs["per_core_M"] == (1 if form == "1d" else 7)
+        assert kwargs["fused_activation"] is None and kwargs.get("mcast_in0", False) is False
+        assert (
+            decode_matmul.prefill_circular_buffer_bytes(kwargs["per_core_M"], per_core_n, in0_block_w, k // 32, dtype)
+            <= decode_matmul.PREFILL_CB_BUDGET_BYTES
+        )
+    # The K block shrinks to the budget as the rows grow: the 4096-row GDN in-proj of the earlier rule (eight-tile K
+    # blocks) overflowed L1 (MEASURED 1,704,960 B of 1,572,864).
+    gdn = decode_matmul.prefill_matmul_program_config(mesh, 4096, 2560, 4160, weight_dtype=ttnn.bfloat8_b).kwargs
+    assert gdn["per_core_M"] == 13 and gdn["in0_block_w"] == 1
     with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
-        pd.wide_prefill_matmul_program_config(mesh, 2000, 2560, 512)
+        decode_matmul.prefill_matmul_program_config(mesh, 2000, 2560, 512)
 
 
 # --------------------------------------------------------------------------- the resident weights
@@ -414,7 +416,10 @@ def test_fused_linear_is_one_linear_and_the_callers_cut_it_with_literal_bounds(m
     dense.attach(
         pd.Qwen38TTNNPrefillDenseWeights({"kv": ("W", pd.ResidentSpec("kv", 2560, 512, 3, "bf16", pd.KV_COLUMNS))})
     )
-    dense._program_configs[(SLAB, 2560, 512)] = "wide-config"
+    configs = []
+    monkeypatch.setattr(
+        pd, "prefill_matmul_program_config", lambda *args, **kwargs: configs.append((args, kwargs)) or "rule-config"
+    )
     assert dense.fused_linear("hidden", "kv", SLAB, compute_kernel_config="module-config") == "fused"
     assert calls == [
         (
@@ -422,11 +427,12 @@ def test_fused_linear_is_one_linear_and_the_callers_cut_it_with_literal_bounds(m
             ("hidden", "W"),
             {
                 "memory_config": ttnn.DRAM_MEMORY_CONFIG,
-                "program_config": "wide-config",
+                "program_config": "rule-config",
                 "compute_kernel_config": "module-config",
             },
         )
     ]
+    assert configs == [((dense.mesh_device, SLAB, 2560, 512), {"weight_dtype": ttnn.bfloat16})]
     dense.attach(pd.Qwen38TTNNPrefillDenseWeights({"qg": ("Q", pd.ResidentSpec("qg", 2560, 3072, 3, "bf8"))}))
     with pytest.raises(ValueError, match="not a fused sibling"):  # allow-pytest.raises: pure contract test
         dense.fused_linear("hidden", "qg", SLAB, compute_kernel_config="c")
@@ -533,7 +539,7 @@ def test_weight_table_builder_allocates_nothing_without_a_plan() -> None:
 
 def test_exact_set_carries_no_policy() -> None:
     router = inspect.getsource(moe_module.Qwen38TTNNMoE._slab_router_logits)
-    assert "self._slab_program_config(HIDDEN_SIZE, ROUTED_EXPERTS, exact=True)" in router
+    assert "self.weights.router," in router
     assert "compute_kernel_config=self.compute_config," in router
     assert "resident_weight" not in router and "prefill_dense" not in router
     index = inspect.getsource(qsa_module.Qwen38TTNNQSA._index_projection_rows)
@@ -542,20 +548,20 @@ def test_exact_set_carries_no_policy() -> None:
     assert "dense=" not in index and "prefill_dense" not in index
     linear_rows = inspect.getsource(qsa_module.Qwen38TTNNQSA._linear_rows)
     exact_branch = linear_rows.split("if dense is None:", 1)[1].split("return prefill_linear(", 2)[1]
-    assert "exact=True" in exact_branch and "compute_kernel_config=self.projection_compute_config," in exact_branch
+    assert "compute_kernel_config=self.projection_compute_config," in exact_branch
     assert "resident_weight" not in exact_branch
     policy_branch = linear_rows.rsplit("return prefill_linear(", 1)[1]
     assert "resident_weight=self.prefill_dense.resident(dense)" in policy_branch
     assert "compute_kernel_config=self.prefill_dense.compute_config(self.projection_compute_config)" in policy_branch
     assert inspect.signature(qsa_module.Qwen38TTNNQSA._linear_rows).parameters["dense"].default is None
-    for module in (moe_module.Qwen38TTNNMoE, qsa_module.Qwen38TTNNQSA):
-        config = inspect.getsource(module._slab_program_config)
-        assert 'if exact or self.prefill_dense.policy.grid == "today":' in config
-        assert config.index("prefill_matmul_program_config(") < config.index("self.prefill_dense.program_config(")
-        assert inspect.signature(module._slab_program_config).parameters["exact"].default is False
-    for module in (gr_module.Qwen38TTNNGatedResidual, gdn_module.Qwen38TTNNGDN):
-        config = inspect.getsource(module._slab_program_config)
-        assert 'if self.prefill_dense.policy.grid == "today":' in config and "prefill_matmul_program_config(" in config
+    # Every slab linear takes the one program-config rule inside prefill_linear: no module picks its own.
+    for module in (
+        moe_module.Qwen38TTNNMoE,
+        qsa_module.Qwen38TTNNQSA,
+        gr_module.Qwen38TTNNGatedResidual,
+        gdn_module.Qwen38TTNNGDN,
+    ):
+        assert not hasattr(module, "_slab_program_config"), module.__name__
 
 
 def test_every_other_slab_linear_takes_the_policy() -> None:

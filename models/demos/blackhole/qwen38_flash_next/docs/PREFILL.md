@@ -394,14 +394,22 @@ projections, the gated-residual down+inject and up, the shared expert's gate/up/
 V / output projections) and nothing else.  The dtype, fidelity and accumulation defaults keep the slab's arithmetic
 (the decode weights copied per slab in their format, `QWEN38_DENSE_WEIGHT_DTYPE`, with the module's compute config
 for it; fp32 accumulation); the grid's default is `wide`, and
-`QWEN38_PREFILL_DENSE_GRID=today` restores the earlier slab bitwise (the grids of
-`decode_matmul.prefill_matmul_program_config`, no resident copy):
+`QWEN38_PREFILL_DENSE_GRID=today` restores the separate linears bitwise (no resident copy).  Every slab linear, the
+router and the QSA index projections included, runs the program config of one rule,
+`decode_matmul.prefill_matmul_program_config`: the most cores first (a 2D grid of any column count, or the 1D form with
+one row block per core when that runs more), then the widest K block up to 16 tiles whose circular buffers fit the
+budget.  Under the slab's compute configs (fp32 accumulation, `packer_l1_acc` off) each output tile sums its K tiles in
+order and the partials reload exactly, so no grid, form or K block moves a bit (MEASURED on one p150, 2026-10-14: all
+eleven slab shapes bitwise the earlier configs on three activations, bf16 and fp32 output; the router 150.7 -> 79.0
+us, the QSA index 95.2 -> 54.5, the GDN in-proj 313.0 -> 288.5).  `packer_l1_acc` stays off: over more than two K
+blocks it adds the blocks in L1, another fp32 rounding order (the same probe: fp32 outputs differ on seven of nine
+shapes):
 
 | variable | values | default | what it changes |
 |---|---|---|---|
 | `QWEN38_PREFILL_DENSE_DTYPE` | `bf16`, `bf8` | `bf16` | `bf8`: a resident DRAM-interleaved bfloat8_b copy of each weight, read in place by the slab (no per-slab copy); the decode weights stay bf16 |
 | `QWEN38_PREFILL_DENSE_FIDELITY` | `hifi4`, `hifi2`, `lofi` | `hifi4` | `hifi4`: the module's own compute config (the fidelity of its weight format: HiFi4 for bf16, HiFi2 for the bf8 default, LoFi for bf4); `hifi2` / `lofi`: that fidelity for the slab's dense linears instead (`lofi` reads a 5-bit weight mantissa: a quality point to measure, not a free speed knob) |
-| `QWEN38_PREFILL_DENSE_GRID` | `today`, `wide` | `wide` | `wide`: more columns for the narrow-N shapes (the query-gate 80 -> 110 cores, the gated-residual down+inject 30 -> 60), and the pair-grouped K/V and the shared expert's gate/up as one linear each on resident copies in the weights' own format (the same tiles the separate linears read: about 58 MB per device as bf8, 110 MB as bf16); `today`: the earlier grids and per-slab copies |
+| `QWEN38_PREFILL_DENSE_GRID` | `today`, `wide` | `wide` | `wide`: the pair-grouped K/V and the shared expert's gate/up as one linear each on resident copies in the weights' own format (the same tiles the separate linears read: about 58 MB per device as bf8, 110 MB as bf16); `today`: the separate linears and per-slab copies |
 | `QWEN38_PREFILL_DENSE_FP32_ACC` | `1`, `0` | `1` | fp32 accumulation across the K blocks |
 
 The wide grid, measured on the 4-chip line (1x4 p150, a 32k context, `--prefill-slab 2048`, 2026-09-25, with the
@@ -417,7 +425,7 @@ siblings are the separate linears' tiles in the same format), so its numerics cl
 `QWEN38_DENSE_WEIGHT_DTYPE`; the grid alone does not touch the fidelity or the accumulation.
 
 The MoE router and the QSA index projections never read the switches: their outputs pick the routed experts and the
-attended blocks, so they keep today's config, fidelity and per-slab weight copy under every setting.  The resident
+attended blocks, so they keep the module's fidelity and the per-slab weight copy under every setting.  The resident
 copies (about 950 MB per device as bfloat8_b; the fused siblings alone about 58 MB as bf8) are allocated after the decode
 weights and the resident experts and refused, with the numbers, when the DRAM free at that point would not hold
 them plus what the slab process allocates after the build: the context-scaled state (417 MiB at 32k), the 2048-row
