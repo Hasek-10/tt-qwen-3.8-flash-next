@@ -62,6 +62,10 @@ GATE = fp.kernel_source(NAME, "gate_compute.cpp")
 MCAST_WRITER = fp.kernel_source(NAME, "mcast_writer.cpp")
 MCAST_READER = fp.kernel_source(NAME, "mcast_reader.cpp")
 NOC_PROBE = fp.kernel_source(NAME, "noc_probe.cpp")
+SLAB_STATS = fp.kernel_source(NAME, "slab_stats_compute.cpp")
+SLAB_NORM = fp.kernel_source(NAME, "slab_norm_compute.cpp")
+SLAB_WRITER = fp.kernel_source(NAME, "slab_writer.cpp")
+SLAB_NORM_READER = fp.kernel_source(NAME, "slab_norm_reader.cpp")
 _NOC_MAPS: dict[int, dict[tuple[int, int], tuple[int, int]]] = {}
 MERGED_ENV = "QWEN38_FUSED_GR_READ_MERGED"  # default "1": normalize+down and low_rank+gate as one program each (5 programs per read); "0": the split forms (7)
 NONE_CB = 0xFF
@@ -817,6 +821,220 @@ def low_rank_gate(gathered_partials, normalized, up, *, matmul: str = "chain"):
         meta=meta,
     )
     return block, injection
+
+
+# ---------------------------------------------------------------- the prefill slab's read front (glue gr_slab_front)
+# ``stats`` and ``normalize`` over every row tile of a slab, each core a run of consecutive row tiles of one branch:
+# ``slab_stats`` -> the stats all_gather (dim 3, the chain's) -> ``slab_normalize``, which writes each normalized tile
+# straight to its flat page, so the slab's rms_norm_pre / rms_norm_post / tile permute / gamma multiply become two
+# programs.  Every row block runs the decode kernels' LLK sequence (bitwise against the chain).
+
+
+def slab_rows(residual) -> int:
+    """The rows of a slab residual ``[1, 4, rows, 640]`` bf16 (whole row tiles, no padding)."""
+
+    shape, padded = tuple(residual.shape), tuple(residual.padded_shape)
+    if len(shape) != 4 or shape[:2] != (1, BRANCHES) or shape[3] != LOCAL_HIDDEN or shape[2] % TILE or padded != shape:
+        raise ValueError(
+            f"GR slab residual must be [1, {BRANCHES}, whole row tiles, {LOCAL_HIDDEN}], got {shape} padded {padded}"
+        )
+    if residual.layout != ttnn.TILE_LAYOUT or residual.dtype != BF16:
+        raise ValueError("GR slab residual must be TILE bfloat16")
+    return shape[2]
+
+
+def slab_work(mesh, row_tiles: int) -> list[fp.CoreWork]:
+    """The slab programs' split: a quarter of the grid's cores (in ``split_work`` order) per branch, each a run of
+    consecutive row tiles of that branch, so one branch's gamma tiles serve every row block of a core.  ``start`` is
+    the run's first branch-major row block ``b * row_tiles + r``."""
+
+    grid = mesh.compute_with_storage_grid_size()
+    per_branch = min(row_tiles, grid.x * grid.y // BRANCHES)
+    base, extra = divmod(row_tiles, per_branch)
+    work = []
+    for branch in range(BRANCHES):
+        first = branch * row_tiles
+        for i in range(per_branch):
+            count = base + (1 if i < extra else 0)
+            k = len(work)
+            work.append(fp.CoreWork(ttnn.CoreCoord(k // grid.y, k % grid.y), first, count))
+            first += count
+    return work
+
+
+def gamma_runs(noc, work, row_tiles) -> dict[tuple[int, int], tuple[int, int, int, int, int]]:
+    """Per core (logical x, y): its part in ``slab_normalize``'s gamma multicast, (1 sender / 0 receiver, the sender's
+    receivers, their NoC x, first y, last y), from ``noc`` (``noc_map``).  A branch's cores are cut into runs of
+    consecutive NoC y within one NoC column; a run's top core reads the branch's gamma tiles and multicasts them down
+    the run on NOC_0, whose start corner is the core right below it (the route never wraps)."""
+
+    columns: dict[tuple[int, int], list[tuple[int, tuple[int, int]]]] = {}
+    for w in work:
+        x, y = noc[(w.core.x, w.core.y)]
+        columns.setdefault((w.start // row_tiles, x), []).append((y, (w.core.x, w.core.y)))
+    roles = {}
+    for (_, x), cores in columns.items():
+        cores.sort()
+        runs = [[cores[0]]]
+        for y, core in cores[1:]:
+            if y == runs[-1][-1][0] + 1:
+                runs[-1].append((y, core))
+            else:
+                runs.append([(y, core)])
+        for run in runs:
+            (top, sender), receivers = run[0], run[1:]
+            roles[sender] = (1, len(receivers), x, top + 1, top + len(receivers))
+            roles.update({core: (0, 0, 0, 0, 0) for _, core in receivers})
+    return roles
+
+
+def _slab_writer(cores, tensor, cb, runtime):
+    """One CB into ``tensor`` along a stream walk; runtime: per core -> (outer, inner, first, inner_stride,
+    outer_stride, batch)."""
+
+    return fp.writer_kernel(
+        SLAB_WRITER,
+        cores,
+        [cb, *fp.accessor_args(tensor)],
+        [(core, [tensor.buffer_address(), *walk]) for core, walk in runtime],
+    )
+
+
+def slab_stats(residual):
+    """``stats`` over a slab: the per-branch sum of squares of every row -> ``[1, 4, rows, 32]`` bf16, one tile per
+    (branch, row tile) on rms_norm_pre_all_gather's page ``b * row_tiles + r``."""
+
+    rows = slab_rows(residual)
+    mesh = residual.device()
+    out = fp.allocate((1, BRANCHES, rows, TILE), BF16, ttnn.TILE_LAYOUT, mesh)
+    work = slab_work(mesh, rows // TILE)
+    cores = fp.core_rectangle(work, mesh)
+    cbs = [
+        fp.cb_descriptor(0, BF16, TILE_BF16, 2 * HIDDEN_TILES, cores),
+        fp.cb_descriptor(1, FP32, TILE_FP32, 1, cores),
+        fp.cb_descriptor(2, FP32, TILE_FP32, HIDDEN_TILES, cores),
+        fp.cb_descriptor(16, BF16, TILE_BF16, 2, cores),
+    ]
+    reader = _reader(
+        cores,
+        [(residual, 0)],
+        [(CONST_SCALER, 1)],
+        [
+            (w.core, ([_stream(residual, 1, w.count * HIDDEN_TILES, w.start * HIDDEN_TILES, 1, 0, 4)], [_bits(1.0)]))
+            for w in work
+        ],
+    )
+    compute = fp.compute_kernel(SLAB_STATS, cores, [HIDDEN_TILES], [(w.core, [w.count]) for w in work], fp32_dest=True)
+    writer = _slab_writer(cores, out, 16, [(w.core, (1, w.count, w.start, 1, 0, 1)) for w in work])
+    meta = fp.program_meta(  # the residual in (each core its row blocks), the stats tiles out
+        NAME,
+        "slab_stats",
+        rows,
+        reads=(residual,),
+        writes=(out,),
+        flops=2 * rows * FLAT_WIDTH,
+        cores=len(work),
+        outputs=((out, 3),),
+    )
+    return fp.run_program([residual, out], fp.program_descriptor([reader, compute, writer], cbs=cbs), meta=meta)
+
+
+def slab_normalize(residual, gathered_stats, norm_scale, *, scaler_mode: str = "chain"):
+    """``normalize`` over a slab -> the flat ``[1, 1, rows, 2560]`` bf16 rows: branch b's tile j of row tile r lands on
+    flat page 80r + 20b + j (the tile permute's order).  ``norm_scale`` is ``norm_scale_rows``; a branch's 20 gamma
+    tiles are read from DRAM once per run of its cores (``gamma_runs``) and multicast to the rest of the run."""
+
+    rows = slab_rows(residual)
+    _expect(gathered_stats, (1, BRANCHES, rows, TILE * STATS_TILES), BF16, "GR slab gathered stats")
+    _expect(norm_scale, (1, BRANCHES, TILE, LOCAL_HIDDEN), FP32, "GR norm_scale rows")
+    mesh = residual.device()
+    out = fp.allocate((1, 1, rows, FLAT_WIDTH), BF16, ttnn.TILE_LAYOUT, mesh)
+    scaler_bits, scaler_dtype = avg_scaler(scaler_mode)
+    row_tiles = rows // TILE
+    work = slab_work(mesh, row_tiles)
+    cores = fp.core_rectangle(work, mesh)
+    roles = gamma_runs(noc_map(mesh), work, row_tiles)
+    cbs = [
+        fp.cb_descriptor(0, BF16, TILE_BF16, 2 * HIDDEN_TILES, cores),
+        # the reader takes the core's whole stats stream first
+        fp.cb_descriptor(1, BF16, TILE_BF16, max(w.count for w in work) * STATS_TILES, cores),
+        fp.cb_descriptor(2, scaler_dtype, fp.TILE_BYTES[scaler_dtype], 1, cores),
+        fp.cb_descriptor(3, BF16, TILE_BF16, 1, cores),
+        fp.cb_descriptor(4, FP32, TILE_FP32, HIDDEN_TILES, cores),
+        fp.cb_descriptor(5, FP32, TILE_FP32, 1, cores),
+        fp.cb_descriptor(6, FP32, TILE_FP32, 1, cores),
+        fp.cb_descriptor(7, BF16, TILE_BF16, HIDDEN_TILES, cores),
+        fp.cb_descriptor(16, BF16, TILE_BF16, HIDDEN_TILES, cores),
+    ]
+    reader = fp.reader_kernel(
+        SLAB_NORM_READER,
+        cores,
+        [
+            1,
+            0,
+            4,
+            2,
+            3,
+            0,
+            *fp.accessor_args(gathered_stats),
+            *fp.accessor_args(residual),
+            *fp.accessor_args(norm_scale),
+        ],
+        [
+            (
+                w.core,
+                [
+                    gathered_stats.buffer_address(),
+                    w.start * STATS_TILES,
+                    w.count * STATS_TILES,
+                    residual.buffer_address(),
+                    w.start * HIDDEN_TILES,
+                    w.count * HIDDEN_TILES,
+                    norm_scale.buffer_address(),
+                    w.start // row_tiles * HIDDEN_TILES,
+                    *roles[(w.core.x, w.core.y)],
+                    scaler_bits,
+                    _bits(EPS),
+                ],
+            )
+            for w in work
+        ],
+    )
+    compute = fp.compute_kernel(
+        SLAB_NORM,
+        cores,
+        [HIDDEN_TILES, STATS_TILES, 4],
+        [(w.core, [w.count]) for w in work],
+        fp32_dest=True,
+        unpack_to_dest_fp32=(4, 7),
+    )
+    # row block (b, r) -> flat pages 80r + 20b + j: outer over the core's row tiles, inner over the branch's 20 tiles
+    flat_first = [w.start % row_tiles * FLAT_TILES + w.start // row_tiles * HIDDEN_TILES for w in work]
+    writer = _slab_writer(
+        cores,
+        out,
+        16,
+        [(w.core, (w.count, HIDDEN_TILES, first, 1, FLAT_TILES, 4)) for w, first in zip(work, flat_first)],
+    )
+    senders = sum(role[0] for role in roles.values())
+    branch_gamma = fp.tensor_bytes(norm_scale) // BRANCHES
+    meta = fp.program_meta(  # the residual and the gathered stats in, a branch of gamma per run, the flat rows out
+        NAME,
+        "slab_normalize",
+        rows,
+        reads=(residual, gathered_stats),
+        writes=(out,),
+        dram_bytes=senders * branch_gamma,
+        l1_bytes=(len(work) - senders) * branch_gamma,  # the gamma multicast
+        flops=4 * rows * FLAT_WIDTH,
+        cores=len(work),
+        outputs=((out, 3),),
+    )
+    return fp.run_program(
+        [residual, gathered_stats, norm_scale, out],
+        fp.program_descriptor([reader, compute, writer], cbs=cbs, semaphores=[fp.semaphore_descriptor(0, cores)]),
+        meta=meta,
+    )
 
 
 def merged_enabled(environ=None) -> bool:

@@ -9,10 +9,12 @@ import re
 from pathlib import Path
 
 import pytest
+
 import ttnn
 from models.demos.blackhole.qwen38_flash_next.ttnn import fused
-from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gr_read, registry
+from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gr_read
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import program as fp
+from models.demos.blackhole.qwen38_flash_next.ttnn.fused import registry
 
 KERNELS = fp.REPO_ROOT / fp.KERNEL_ROOT / "gr_read" / "kernels"
 GR_SOURCE = Path(__file__).resolve().parents[1] / "ttnn" / "gr.py"
@@ -37,15 +39,19 @@ def test_merged_forms_are_the_default_and_the_switch_selects_the_split_forms():
     assert "gr_read" in registry.DEFAULT_ON
     assert gr_read.merged_enabled({}) is True and gr_read.merged_enabled({gr_read.MERGED_ENV: "1"}) is True
     assert gr_read.merged_enabled({gr_read.MERGED_ENV: "0"}) is False
-    with pytest.raises(ValueError, match=gr_read.MERGED_ENV):
+    with pytest.raises(ValueError, match=gr_read.MERGED_ENV):  # allow-pytest.raises: pure contract test
         gr_read.merged_enabled({gr_read.MERGED_ENV: "yes"})
     assert "merged = merged_enabled() if merged is None else merged" in inspect.getsource(gr_read.gr_read_fused)
 
 
 def test_reader_and_writer_argument_contracts():
     reader = _source("reader.cpp")
-    assert "NUM_STREAMS = get_compile_time_arg_val(0)" in reader and "NUM_CONSTS = get_compile_time_arg_val(5)" in reader
-    assert "ACCESSOR_BASE = 15" in reader and "STREAM_RT_ARGS = 7" in reader  # 12 + the (gated stream, semaphore, count) triple
+    assert (
+        "NUM_STREAMS = get_compile_time_arg_val(0)" in reader and "NUM_CONSTS = get_compile_time_arg_val(5)" in reader
+    )
+    assert (
+        "ACCESSOR_BASE = 15" in reader and "STREAM_RT_ARGS = 7" in reader
+    )  # 12 + the (gated stream, semaphore, count) triple
     assert "broadcast_row0" not in reader  # the gamma rows come repeated from the host (weights.norm_scale_rows)
     assert "prepare_reduce_scaler" in reader and "generate_bcast_col_scalar" in reader and "prepare_zero_tile" in reader
     writer = _source("writer.cpp")
@@ -58,16 +64,29 @@ def test_compute_kernels_pin_the_cb_indices_the_python_side_allocates():
     stats = _source("stats_compute.cpp")
     assert all(f"c_{n} = {v};" in stats for n, v in (("res", 0), ("scaler", 1), ("x2", 2), ("out", 16)))
     norm = _source("norm_compute.cpp")
-    for name, index in (("res", 0), ("stats", 1), ("scaler", 2), ("eps", 3), ("gamma", 4), ("var", 5), ("recip", 6), ("unit", 7)):
+    for name, index in (
+        ("res", 0),
+        ("stats", 1),
+        ("scaler", 2),
+        ("eps", 3),
+        ("gamma", 4),
+        ("var", 5),
+        ("recip", 6),
+        ("unit", 7),
+    ):
         assert f"c_{name} = {index};" in norm
     assert "c_out = get_compile_time_arg_val(3);" in norm
     assert "mul_binary_tile<true>" in norm and "rsqrt_tile<false>" in norm and "mul_tiles_bcast_cols" in norm
     down = _source("down_compute.cpp")
     assert "SrcOrder::Reverse" in down and "matmul_block(c_in0, c_in1, k + kk, kk, 0, 0, 1, 1, 1)" in down
-    assert all(f"get_compile_time_arg_val({i})" in down for i in (2, 3, 4, 5, 6)) and "copy_tile(c_interm, 0, 0)" in down
+    assert (
+        all(f"get_compile_time_arg_val({i})" in down for i in (2, 3, 4, 5, 6)) and "copy_tile(c_interm, 0, 0)" in down
+    )
     lowrank = _source("lowrank_compute.cpp")
     assert "typecast_tile<fp32, bf16>(0)" in lowrank and "silu_tile<false>(0)" in lowrank
-    assert "sigmoid_tile<VectorMode::RC, false, false>(0)" in lowrank and "mul_unary_tile<true>(0, 0x40000000u)" in lowrank
+    assert (
+        "sigmoid_tile<VectorMode::RC, false, false>(0)" in lowrank and "mul_unary_tile<true>(0, 0x40000000u)" in lowrank
+    )
     gate = _source("gate_compute.cpp")
     assert "mul_binary_tile<false>" in gate and "sigmoid_tile<VectorMode::RC, false, false>(b)" in gate
     assert "add_init(c_gated, c_zero, true)" in gate
@@ -79,6 +98,121 @@ def test_compute_kernels_pin_the_cb_indices_the_python_side_allocates():
     assert gr_read.NONE_CB == 0xFF and gr_read.MERGED_ENV == "QWEN38_FUSED_GR_READ_MERGED"
     assert (gr_read.DOWN_SPILL, gr_read.UP_SPILL) == (8, 6) and gr_read.matmul_mode({}) == "chain"
     assert "copy_tile(c_interm, b, b)" in gate and "get_compile_time_arg_val(11)" in gate
+
+
+def _in_order(text: str, statements) -> bool:
+    at = 0
+    for statement in statements:
+        at = text.find(statement, at)
+        if at < 0:
+            return False
+        at += len(statement)
+    return True
+
+
+def test_slab_front_kernels_run_the_decode_kernels_sequence_per_row_block():
+    # the prefill slab's read front (glue gr_slab_front): stats_compute's and norm_compute's op sequences, once per row
+    # block over the core's NB row blocks (runtime arg 0), the gamma tiles waited once and kept
+    stats, slab_stats = _source("stats_compute.cpp"), _source("slab_stats_compute.cpp")
+    sequence = (
+        "reconfig_data_format(c_res, c_res);",
+        "pack_reconfig_data_format(c_x2);",
+        "mul_init(c_res, c_res);",
+        "mul_tiles(c_res, c_res, wt, wt, 0);",
+        "pack_tile(0, c_x2);",
+        "PoolType::AVG,",
+        "ReduceFp32Mode::Fast>",
+        "res.pop_front(Wt);",
+    )
+    assert _in_order(stats, sequence) and _in_order(slab_stats, ("for (uint32_t nb = 0; nb < NB; ++nb) {", *sequence))
+    assert all(f"c_{n} = {v};" in slab_stats for n, v in (("res", 0), ("scaler", 1), ("x2", 2), ("out", 16)))
+    norm, slab_norm = _source("norm_compute.cpp"), _source("slab_norm_compute.cpp")
+    sequence = (
+        "compute_kernel_lib::reduce<PoolType::AVG, ReduceDim::REDUCE_ROW, c_stats, c_scaler, c_var>(",
+        "add_tiles(c_var, c_eps, 0, 0, 0);",
+        "rsqrt_tile<false>(0);",
+        "mul_bcast_cols_init(c_res, c_recip);",
+        "mul_tiles_bcast_cols(c_res, c_recip, wtr, 0, wtr);",
+        "unit.wait_front(Wt);",
+        "gamma.wait_front(Wt);",
+        "mul_binary_tile_init();",
+        "copy_tile(c_unit, i, 0);",
+        "copy_tile(c_gamma, i, 1);",
+        "mul_binary_tile<true>(0, 1, 0);",
+        "unit.pop_front(Wt);",
+        "gamma.pop_front(Wt);",
+    )
+    assert _in_order(norm, sequence) and _in_order(slab_norm, ("for (uint32_t nb = 0; nb < NB; ++nb) {", *sequence))
+    assert "if (nb == 0) {\n            gamma.wait_front(Wt);" in slab_norm
+    for name, index in (
+        ("res", 0),
+        ("stats", 1),
+        ("scaler", 2),
+        ("eps", 3),
+        ("gamma", 4),
+        ("var", 5),
+        ("recip", 6),
+        ("unit", 7),
+        ("out", 16),
+    ):
+        assert f"c_{name} = {index};" in slab_norm
+    for kernel in (slab_stats, slab_norm):
+        assert "const uint32_t NB = get_arg_val<uint32_t>(0);" in kernel
+    writer = _source("slab_writer.cpp")
+    assert "ACCESSOR_BASE = 1" in writer and "first + o * outer_stride + i * inner_stride" in writer
+    reader = _source("slab_norm_reader.cpp")  # the compute's order: stats, first row block, gamma, the other row blocks
+    assert _in_order(
+        reader,
+        (
+            "stats_args, get_arg_val<uint32_t>(0), C_STATS,",
+            "read_run(noc, res_args, res_addr, C_RES, res_first, Wt);",
+            "gamma.reserve_back(Wt);",
+            "gamma.push_back(Wt);",
+            "res_first + Wt, res_count - Wt);",
+        ),
+    )
+    assert ".noc_x_start = x, .noc_y_start = y0, .noc_x_end = x, .noc_y_end = y1" in reader  # NOC_0: no corner swap
+    assert "ready.wait(1);" in reader and "ready.up(noc, x, y, 1);" in reader
+
+
+def _grid_mesh(grid):
+    return type("Mesh", (), {"compute_with_storage_grid_size": lambda self: ttnn.CoreCoord(*grid)})()
+
+
+@pytest.mark.parametrize("grid", [(11, 10), (13, 10)])
+@pytest.mark.parametrize("row_tiles", [8, 16, 32, 64])
+def test_slab_work_gives_each_core_consecutive_row_tiles_of_one_branch(grid, row_tiles):
+    work = gr_read.slab_work(_grid_mesh(grid), row_tiles)
+    assert len(work) == gr_read.BRANCHES * min(row_tiles, grid[0] * grid[1] // gr_read.BRANCHES)
+    assert [(w.core.x, w.core.y) for w in work] == [(i // grid[1], i % grid[1]) for i in range(len(work))]
+    blocks = [block for w in work for block in range(w.start, w.start + w.count)]
+    assert blocks == list(range(gr_read.BRANCHES * row_tiles))  # every row block once, in branch-major order
+    assert all(w.start // row_tiles == (w.start + w.count - 1) // row_tiles for w in work)  # one branch per core
+    assert max(w.count for w in work) - min(w.count for w in work) <= 1
+
+
+@pytest.mark.parametrize("grid", [(11, 10), (13, 10)])
+def test_gamma_runs_multicast_down_one_noc_column_per_branch_run(grid):
+    # a harvested-like map: logical x -> NoC x with a gap after x 6, logical y -> NoC y + 2
+    noc = {(x, y): (x + 1 if x < 7 else x + 3, y + 2) for x in range(grid[0]) for y in range(grid[1])}
+    row_tiles = 64
+    work = gr_read.slab_work(_grid_mesh(grid), row_tiles)
+    roles = gr_read.gamma_runs(noc, work, row_tiles)
+    assert set(roles) == {(w.core.x, w.core.y) for w in work}
+    branch = {(w.core.x, w.core.y): w.start // row_tiles for w in work}
+    fed = {}
+    for core, (sender, receivers, x, y0, y1) in roles.items():
+        if sender:
+            sx, sy = noc[core]
+            assert (x, y0, y1) == (sx, sy + 1, sy + receivers)  # the start corner is right below the sender
+            for y in range(y0, y1 + 1):
+                (receiver,) = [c for c, xy in noc.items() if xy == (x, y)]
+                assert branch[receiver] == branch[core] and roles[receiver][0] == 0
+                fed[receiver] = core
+        else:
+            assert (receivers, x, y0, y1) == (0, 0, 0, 0)
+    assert set(fed) == {core for core, role in roles.items() if role[0] == 0}  # every receiver is fed exactly once
+    assert sum(role[0] for role in roles.values()) <= 4 * (grid[0] + 1)  # about one DRAM read per column and branch
 
 
 def test_geometry_constants():
@@ -99,7 +233,10 @@ def test_scaler_bit_patterns():
 
 def test_model_hook_resolves_at_construction_and_keeps_the_composed_body():
     source = GR_SOURCE.read_text()
-    assert 'fused_kernels.enabled("gr_read")' in source and "self.read = functools.partial(self._read_fused, self)" in source
+    assert (
+        'fused_kernels.enabled("gr_read")' in source
+        and "self.read = functools.partial(self._read_fused, self)" in source
+    )
     assert 'if flat_views and getattr(self, "_read_fused", None) is not None:' in source
     body = re.search(r"    def read\(self, residual\).*?\n    def write\(", source, re.S).group(0)
     assert body.count("ttnn.linear(") == 2 and "ttnn.experimental.all_gather_async(" in source
@@ -117,7 +254,9 @@ def test_multicast_writer_starts_from_the_far_corner_on_noc_1():
     arch) and NOC_1 routes a multicast from the bottom-right corner; the producers' multicast hung at the write
     barrier until the corners were swapped for it (the DRAM-sharded matmul factory swaps them the same way)."""
 
-    source = _source("mcast_phase.h")  # the phase body; mcast_writer.cpp runs it once, gr_fold's mcast_writer2.cpp twice
+    source = _source(
+        "mcast_phase.h"
+    )  # the phase body; mcast_writer.cpp runs it once, gr_fold's mcast_writer2.cpp twice
     writer = _source("mcast_writer.cpp")
     assert '#include "mcast_phase.h"' in writer
     assert "mcast_phase<SRC_CB, DST_CB, NUM_TILES, WRITE_TILES, EXTRA_CB, SEM_ID>(tiles_args, extra_args, 0);" in writer
@@ -130,5 +269,5 @@ def test_program_layer_orders_multicast_corners_per_noc():
     assert (fp.READER_NOC, fp.WRITER_NOC) == (0, 1)
     assert fp.multicast_corners(1, 2, 6, 3, noc=fp.READER_NOC) == (1, 2, 6, 3)
     assert fp.multicast_corners(1, 2, 6, 3, noc=fp.WRITER_NOC) == (6, 3, 1, 2)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
         fp.multicast_corners(6, 2, 1, 3, noc=fp.WRITER_NOC)
