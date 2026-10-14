@@ -353,6 +353,14 @@ refuses to start.
   on the 4-chip line at 32k (2026-10-14) against the five bitwise defaults of the day: greedy-32 and the 32 top-20
   logprob rows identical; the read's front 30.1 -> 15.8 ms of kernel time per 2048-row slab (GR read 79.8 -> 65.5
   ms), a 31,524-token prompt 8,687 -> 8,469 ms.
+- `gr_slab_write` (bitwise, off): the gated-residual write as one fused program (`ttnn/fused/gr_write`'s
+  `slab_write`), in place of the coefficient permute, the multiply and the residual add.  Each core takes consecutive
+  (row tile, column tile) units and reads a unit's block tile once for its four branch tiles and a row tile's
+  injection tile once per branch, with branch b's column patched into the broadcast column; every branch tile runs the
+  multiply's SFPU and the add's FPU sequence in the 16-bit dest.  Measured on one chip at 2048 rows (2026-10-14): the
+  chain's output bit for bit on three activation seeds (also at 512 and 256 rows), 149.0 -> 77.9 us of device kernel
+  time per write (96 writes per slab).  The in-model bars (greedy-32 and lp32 identical, GR write kernel time, the
+  natural32k prompt) are not measured yet.
 - `qsa_scores_rs_ag` (tolerance, off): each 512-row score block's four device partials are masked on every device,
   summed by a `reduce_scatter` over the block's rows, ranked per device on its 128 rows and the block ids gathered, in
   place of broadcasting every device's scores to every device and summing locally.  A third of the score payload

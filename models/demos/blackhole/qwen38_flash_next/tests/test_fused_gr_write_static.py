@@ -4,7 +4,8 @@
 """The fused GR write without a device: its registry entry, the kernel argument contracts against the Python side,
 the exactness pins in the compute kernel (the chain's two binary_ng SFPU calls in the chain's operand order), the
 reader's column patch and the writer's page map against a torch model of the tile layout, the composed chain's op
-order against the model's ``write`` / ``write_rows``, and the model hook."""
+order against the model's ``write`` / ``write_rows``, the model hook, and the prefill slab's write (glue
+gr_slab_write): the same two programs per output tile, the units' core split and page walks."""
 
 from __future__ import annotations
 
@@ -18,11 +19,12 @@ import pytest
 import torch
 
 import ttnn
-from models.demos.blackhole.qwen38_flash_next.ttnn import fused
+from models.demos.blackhole.qwen38_flash_next.ttnn import fused, prefill_glue
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gr_write as gw
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import program as fp
 
 SOURCES = {name: (fp.REPO_ROOT / path).read_text() for name, path in gw.KERNELS.items()}
+SLAB_SOURCES = {name: (fp.REPO_ROOT / path).read_text() for name, path in gw.SLAB_KERNELS.items()}
 GR_SOURCE = Path(__file__).resolve().parents[1] / "ttnn" / "gr.py"
 
 
@@ -130,9 +132,9 @@ def test_split_work_cores_knob():
     twenty = fp.split_work(gw.UNITS, _grid(13, 10), cores=20)
     assert len(twenty) == 20 and {w.count for w in twenty} == {4} and [w.start for w in twenty] == list(range(0, 80, 4))
     assert len(fp.split_work(gw.UNITS, _grid(8, 8))) == 64
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
         fp.split_work(gw.UNITS, _grid(13, 10), cores=81)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
         fp.split_work(gw.UNITS, _grid(13, 10), cores=0)
     assert gw.cores_of(_grid(13, 10), {}) == 80 and gw.cores_of(_grid(13, 10), {gw.CORES_ENV: "20"}) == 20
     rectangle = fp.core_rectangle(fp.split_work(gw.UNITS, _grid(13, 10)), _grid(13, 10)).ranges()
@@ -202,9 +204,99 @@ def test_rows_of_rejects_other_shapes():
         return SimpleNamespace(shape=shape, padded_shape=padded, dtype=dtype, layout=layout)
 
     assert gw.rows_of(tensor((1, 1, 5, 640)), tensor((1, 4, 5, 640)), tensor((1, 1, 5, 4))) == 5
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
         gw.rows_of(tensor((1, 1, 5, 640)), tensor((1, 4, 64, 640), padded_rows=64), tensor((1, 1, 64, 4)))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
         gw.rows_of(tensor((1, 1, 4, 640)), tensor((1, 4, 5, 640)), tensor((1, 1, 5, 4)))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
         gw.rows_of(tensor((1, 1, 5, 640), dtype=ttnn.float32), tensor((1, 4, 5, 640)), tensor((1, 1, 5, 4)))
+
+
+# --------------------------------------------------------------------------- the prefill slab's write (gr_slab_write)
+
+
+def _in_order(text: str, statements) -> bool:
+    at = 0
+    for statement in statements:
+        at = text.find(statement, at)
+        if at < 0:
+            return False
+        at += len(statement)
+    return True
+
+
+def test_slab_write_is_a_bitwise_glue_form_off_by_default():
+    assert prefill_glue.FORMS["gr_slab_write"] == (prefill_glue.BITWISE, "gr.write_rows")
+    assert "gr_slab_write" not in prefill_glue.DEFAULT_ON
+
+
+def test_slab_compute_runs_the_chains_two_programs_on_every_branch_tile():
+    compute = SLAB_SOURCES["compute"]
+    assert [int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d)\)", compute)] == [0, 1]
+    assert len(gw.SLAB_COMPUTE_ARGS) == 2
+    assert "constexpr bool PRODUCT_FP32 = false;" in compute.split("#else")[1]  # the 16-bit dest's own RNE
+    # per unit: the block tile once, branch b's coefficient column broadcast, the SFPU product, pack bf16; then the
+    # FPU add of the residual and the update, pack; the chain's operand order (compute.cpp)
+    assert _in_order(
+        compute,
+        (
+            "compute_kernel_hw_startup(cb_block, cb_coef, cb_out);",
+            "cb_wait_front(cb_coef, branches);",
+            "mul_binary_tile_init();",
+            "copy_tile(cb_block, 0, dst_block);",
+            "unary_bcast_init<BroadcastType::COL>(cb_coef);",
+            "unary_bcast<BroadcastType::COL>(cb_coef, b, dst_upd + b);",
+            "mul_binary_tile<PRODUCT_FP32>(dst_block, dst_upd + b, dst_upd + b);",
+            "pack_tile(dst_upd + b, cb_upd);",
+            "binary_tiles_init<true, EltwiseBinaryType::ELWADD>(cb_res, cb_upd);",
+            "add_tiles(cb_res, cb_upd, b, b, b);",
+            "pack_tile(b, cb_out);",
+        ),
+    )
+    assert "if (u == first || u % hidden_tiles == 0) {" in compute  # a row tile's coefficients, kept for its units
+    for wrong in ("mul_tiles", "add_binary_tile", "fp32_dest=True"):
+        assert wrong not in compute, wrong
+    source = re.sub(r"\s+", "", inspect.getsource(gw.slab_write))
+    assert "fp32_dest=False" in source and "fp.core_rectangle(work," in source  # 16-bit dest, one kernel group
+
+
+def test_slab_reader_and_writer_args_match_the_python_side():
+    reader = SLAB_SOURCES["reader"]
+    assert [int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d)\)", reader)] == list(
+        range(len(gw.SLAB_READER_ARGS))
+    )
+    names = set(re.findall(r'get_named_compile_time_arg_val\("([a-z_0-9]+)"\)', reader + SLAB_SOURCES["compute"]))
+    assert names <= set(gw.NAMED), names - set(gw.NAMED)
+    assert "TensorAccessorArgs<0>()" in reader and reader.count("next_compile_time_args_offset()") == 2
+    # the column patch is reader.cpp's (test_reader_column_patch_matches_the_tile_layout)
+    assert (
+        "const uint32_t row0 = (r >> 4) * 512 + (r & 15) * 16;" in reader and "tile[row0] = tile[row0 + b];" in reader
+    )
+    assert "{.page_id = u / hidden_tiles}" in reader and "{.page_id = u}" in reader
+    assert "{.page_id = b * slab_units + u}" in reader
+    assert gw.SLAB_WRITER == fp.kernel_source("gr_read", "slab_writer.cpp")  # the slab read front's writer
+    source = re.sub(r"\s+", "", inspect.getsource(gw.slab_write))
+    assert "[output.buffer_address(),w.count,BRANCHES,w.start,slab_units,1,BRANCHES]" in source
+
+
+@pytest.mark.parametrize("grid", [(11, 10), (13, 10)])
+@pytest.mark.parametrize("row_tiles", [8, 16, 64])
+def test_slab_units_split_and_page_walks_cover_every_tile_once(grid, row_tiles):
+    slab_units = row_tiles * gw.HIDDEN_TILES
+    work = fp.split_work(slab_units, _grid(*grid))
+    assert [u for w in work for u in range(w.start, w.start + w.count)] == list(range(slab_units))
+    assert max(w.count for w in work) - min(w.count for w in work) <= 1
+    reads, writes, coefficients = [], [], []
+    for w in work:
+        for u in range(w.start, w.start + w.count):  # slab_reader.cpp's walk
+            if u == w.start or u % gw.HIDDEN_TILES == 0:
+                coefficients.append(u // gw.HIDDEN_TILES)
+            reads.extend(b * slab_units + u for b in range(gw.BRANCHES))
+        # slab_writer.cpp: page first + o * outer_stride + i * inner_stride, outer = units, inner = branches
+        writes.extend(w.start + o + i * slab_units for o in range(w.count) for i in range(gw.BRANCHES))
+    assert reads == writes and sorted(reads) == list(range(gw.BRANCHES * slab_units))
+    # residual [1, 4, rows, 640] TILE: branch b's row tile r, column tile j is page b * slab_units + 20 r + j
+    assert writes[: gw.BRANCHES] == [b * slab_units for b in range(gw.BRANCHES)]
+    runs = sum((w.start + w.count - 1) // gw.HIDDEN_TILES - w.start // gw.HIDDEN_TILES + 1 for w in work)
+    assert len(coefficients) == runs and set(coefficients) == set(range(row_tiles))
+    assert "row_runs * BRANCHES * tile" in inspect.getsource(gw.slab_write)  # the meta's injection bytes
