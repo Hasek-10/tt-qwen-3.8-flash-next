@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
-"""The prefill slab's glue forms (``QWEN38_PREFILL_GLUE``) without a device: the policy's resolution (the bitwise
-default set, ``today``, an exact list), the rule that every form is read under a slab condition only (so the decode
-path and the 32/128-row bodies never see one), the previous forms' chains kept in place behind ``today``, the hoisted
-QSA block masks against the per-position emulation with their admission (the byte cap, the free DRAM) and fallback,
-and the flat q/k rows state as a slab option.
+"""The prefill slab's glue forms (``QWEN38_PREFILL_GLUE``) without a device: the policy's resolution (the default
+set: the bitwise forms and the tolerance forms that met the prefill quality bar; ``today``; an exact list), the rule
+that every form is read under a slab condition only (so the decode path and the 32/128-row bodies never see one), the
+previous forms' chains kept in place behind ``today``, the hoisted QSA block masks against the per-position emulation
+with their admission (the byte cap, the free DRAM) and fallback, and the flat q/k rows state as a slab option.
 """
 
 from __future__ import annotations
@@ -49,14 +49,18 @@ def _policy(*names: str) -> prefill_glue.PrefillGluePolicy:
 # --------------------------------------------------------------------------- the policy
 
 
-def test_default_policy_is_the_bitwise_set_today_is_none_and_a_list_is_exact(monkeypatch) -> None:
-    # Unset or empty: the forms measured bitwise the previous slab body (2026-09-25, the GR read forms 2026-10-14) run.
+def test_default_policy_is_the_measured_set_today_is_none_and_a_list_is_exact(monkeypatch) -> None:
+    # Unset or empty: the forms measured bitwise the previous slab body (2026-09-25, the GR read forms 2026-10-14) and
+    # the tolerance form that met the prefill quality bar (gr_partial_rs_ag, 2026-10-14) run.
     default = prefill_glue.PrefillGluePolicy.from_environ({})
-    expected = {"gr_gather_generic", "qsa_mask_hoist", "gr_tile_walks", "gr_gamma_rows", "gr_gate_act"}
-    assert default.names == prefill_glue.DEFAULT_ON == expected
+    previous = {"gr_gather_generic", "qsa_mask_hoist", "gr_tile_walks", "gr_gamma_rows", "gr_gate_act"}
+    assert default.names == prefill_glue.DEFAULT_ON == previous | {"gr_partial_rs_ag"}
     assert prefill_glue.PrefillGluePolicy.from_environ({ENV: " "}).names == prefill_glue.DEFAULT_ON
-    assert all(prefill_glue.FORMS[name][0] == prefill_glue.BITWISE for name in prefill_glue.DEFAULT_ON)
+    tolerance_on = {name for name in prefill_glue.DEFAULT_ON if prefill_glue.FORMS[name][0] != prefill_glue.BITWISE}
+    assert tolerance_on == prefill_glue.MET_QUALITY_BAR == {"gr_partial_rs_ag"}
     assert {cls for cls, _ in prefill_glue.FORMS.values()} == {prefill_glue.BITWISE, prefill_glue.TOLERANCE}
+    # The previous defaults as a list (the measurement's control arm) leave the tolerance form off.
+    assert not _policy(*previous).enabled("gr_partial_rs_ag")
     # ``today``: the previous slab body, no form.
     today = _policy(prefill_glue.TODAY)
     assert today.names == frozenset() and all(not today.enabled(name) for name in prefill_glue.FORMS)
@@ -74,7 +78,8 @@ def test_default_policy_is_the_bitwise_set_today_is_none_and_a_list_is_exact(mon
         _policy("gr_gather_generic", "gr_gather_tuned")
     with pytest.raises(ValueError, match="stands alone"):  # allow-pytest.raises: pure contract test
         _policy(prefill_glue.TODAY, "qsa_mask_hoist")
-    # The default set is checked at import: registered, bitwise, no exclusive pair.
+    # The default set is checked at import: registered, bitwise or a tolerance form MET_QUALITY_BAR names, no
+    # exclusive pair.
     prefill_glue._check_default_on()
     for bad, match in (
         ({"gr_gather_generic", "qsa_scores_rs_ag"}, "must be bitwise"),
@@ -84,6 +89,12 @@ def test_default_policy_is_the_bitwise_set_today_is_none_and_a_list_is_exact(mon
         monkeypatch.setattr(prefill_glue, "DEFAULT_ON", frozenset(bad))
         with pytest.raises(ValueError, match=match):  # allow-pytest.raises: pure contract test
             prefill_glue._check_default_on()
+    # The measured tolerance default raises too once it is not marked.
+    monkeypatch.setattr(prefill_glue, "DEFAULT_ON", default.names)
+    monkeypatch.setattr(prefill_glue, "MET_QUALITY_BAR", frozenset())
+    unmarked = r"must be bitwise or have met the prefill quality bar \(MET_QUALITY_BAR\); \['gr_partial_rs_ag'\]"
+    with pytest.raises(ValueError, match=unmarked):  # allow-pytest.raises: pure contract test
+        prefill_glue._check_default_on()
 
 
 def test_process_policy_is_resolved_once(monkeypatch) -> None:
