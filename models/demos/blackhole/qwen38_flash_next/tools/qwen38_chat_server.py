@@ -95,6 +95,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     mtp_verify_forms,
     open_partition_b_mesh,
     resolve_route,
+    tail_slab_rows_admitted,
     template_decoder,
 )
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_lane_scheduler import (
@@ -2516,6 +2517,15 @@ def _parser() -> argparse.ArgumentParser:
         "of the 128-row chunks; implies --long-chunks; tolerance-class against the chunk bodies (docs/PREFILL.md)",
     )
     parser.add_argument(
+        "--prefill-tail-slabs",
+        type=lambda value: tuple(int(rows) for rows in value.split(",")),
+        default=(),
+        metavar="ROWS[,ROWS]",
+        help="with --prefill-slab, without --mtp: also capture slabs of these smaller row counts (multiples of 512) "
+        "for the prompt's remainder after the full slabs, each taken as often as it fits, largest first, and "
+        "replayed ahead of the full slabs; the rest runs as 128- and 32-row chunks",
+    )
+    parser.add_argument(
         "--allocated-context",
         type=int,
         choices=RESIDENT_QSA_CACHE_CAPACITIES,
@@ -2656,6 +2666,13 @@ def main() -> int:
     args = _parser().parse_args()
     if args.prefill_slab is not None and not is_slab_rows(args.prefill_slab):
         raise SystemExit(f"--prefill-slab takes a multiple of 128 in 256..4096, got {args.prefill_slab}")
+    if args.prefill_tail_slabs and (
+        args.mtp is not None or not tail_slab_rows_admitted(args.prefill_tail_slabs, slab_rows=args.prefill_slab)
+    ):
+        raise SystemExit(
+            "--prefill-tail-slabs takes distinct multiples of 512 below --prefill-slab, without --mtp, got "
+            f"{args.prefill_tail_slabs} (--prefill-slab {args.prefill_slab}, --mtp {args.mtp})"
+        )
     if args.prefill_slab is not None:
         # the slab MoE switch (QWEN38_MOE_SLAB_ONE_CALL) is admitted here, before any device is opened: a refused
         # value is a start-up error, not a poisoned model 79 s into the warm pass
@@ -3074,6 +3091,7 @@ def main() -> int:
             mtp_alternates=mtp_drafts_admitted[1:],
             mtp_ple_early=mtp_ple_early,
             warm_hook=warm_hook,
+            tail_slab_rows=args.prefill_tail_slabs,
         )
         if chain.allocated_context != resident_context.allocated_context:
             raise Qwen38ChatChainError(
@@ -3127,8 +3145,12 @@ def main() -> int:
             "tail_traces": len(chain.tail_trace_ids),
             "chunk_traces": len(
                 [t for t in (chain.chunk_trace_id, chain.long_chunk_trace_id, chain.slab_trace_id) if t is not None]
-            ),
+            )
+            + len(chain.tail_slabs),
             "prefill_slab_rows": args.prefill_slab,
+            "prefill_tail_slab_rows": list(args.prefill_tail_slabs),
+            "tail_slab_capture_ms": chain.tail_slab_capture_ms,
+            "tail_slab_trace_bytes_per_bank": chain.tail_slab_trace_bytes_per_bank,
             "prefill_long_chunks": chain.long_chunk_trace_id is not None,
             "chunk_capture_ms": chain.chunk_capture_ms,
             "long_chunk_capture_ms": chain.long_chunk_capture_ms,
