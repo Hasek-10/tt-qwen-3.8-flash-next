@@ -87,6 +87,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     MTP_GDN_ANCHORS,
     PREFILL_MODES,
     RESIDENT_POST_BUILD_BYTES_PER_BANK_UPPER_BOUND,
+    SERVED_SLAB_ROWS_RULE,
     Qwen38ChatChainError,
     Qwen38ChatSession,
     construct_chain,
@@ -2454,18 +2455,14 @@ def stall_budget_argument(text: str) -> float | None:
 
 
 def slab_rows_argument(text: str) -> int:
-    """``--prefill-slab``: a power of two in 256..4096 (the slab's padded KV update writes whole slabs into the
-    power-of-two KV cache)."""
+    """``--prefill-slab``: ``SERVED_SLAB_ROWS_RULE``."""
 
     try:
         rows = int(text)
     except ValueError as error:
         raise argparse.ArgumentTypeError(f"a row count, got {text!r}") from error
     if not is_served_slab_rows(rows):
-        raise argparse.ArgumentTypeError(
-            f"a power of two in 256..4096 (the slab's padded KV update writes whole slabs into the power-of-two KV "
-            f"cache), got {rows}"
-        )
+        raise argparse.ArgumentTypeError(f"{SERVED_SLAB_ROWS_RULE}, got {rows!r}")
     return rows
 
 
