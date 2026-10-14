@@ -86,6 +86,18 @@ reproduce the CPU record 96/96 and the eleven divergence indices are reported ag
 acceptance prompts are shorter than one slab, so the slab body itself is exercised by prompts of 2048 tokens and more
 (the agreement corpus's long items, a long system prompt).
 
+### Tail slabs (`--prefill-tail-slabs`)
+
+`--prefill-tail-slabs 1024,512,256` (with `--prefill-slab 2048`, without `--mtp`) captures smaller slab forms for the
+remainder after the full slabs: each form is taken as often as it fits, largest first, and replayed ahead of the full
+slabs, smallest first (the first slab's input preparation is the exposed one); the rest still runs as 128- and 32-row
+chunks and the padded tail.  A form is a power of two (the padded KV update needs the cache length to be a multiple of
+the slab rows) and runs the slab body itself, so it is tolerance-class against the 128-row chunks it replaces.  A
+128-row chunk costs about 150 ms against about 0.3 ms per row inside a slab.  Measured 2026-10-14 on the 4-chip p150
+line (32k context, median of 3 after 1 warm, the base first in the same hold): 31,524 tokens 10,049 -> 9,432 ms
+(15 slabs + 801 rows: 512 + 256 + 33 rows), 3,951 tokens 3,059 -> 1,651 ms, 4,113 tokens unchanged (14 rows); greedy-32
+identical, top-20 KL mean 0.008 over 32 positions; json 96/96; 56 MB per DRAM bank and about 10 s of start-up.
+
 ## What it costs and what it saves
 
 Per device, per 2048-row slab (measured on 4x p150, 2026-09-09): a dense linear at 2048 rows runs 10-12x faster than
