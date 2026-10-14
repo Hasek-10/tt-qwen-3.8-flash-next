@@ -8,7 +8,8 @@ a collective's configuration, a per-slab hoist, a payload cut.  Every form is re
 ``is_slab_rows``), so the decode path and the 32/128-row chunk bodies never see one.  The bitwise forms that measured
 identical to the previous slab body run by default (``DEFAULT_ON``: the generic gather of the gated-residual partials
 and the per-slab QSA block-mask hoist; 2026-09-25 on the 4-chip line, a 32k context: pins 12/12, the oracle column
-identical at every scored position, 60.3 ms less per 2048-row slab).  ``QWEN38_PREFILL_GLUE=today`` restores the
+identical at every scored position, 60.3 ms less per 2048-row slab; the gated-residual read's tile walks, row gamma
+and gate activation, 2026-10-14, 65.2 ms less).  ``QWEN38_PREFILL_GLUE=today`` restores the
 previous slab body, and ``QWEN38_PREFILL_GLUE=<name>[,<name>...]`` runs exactly the named forms (the measurement's
 arms: a list that wants a default form names it).  A name that is not registered raises, as does an exclusive pair or
 ``today`` beside a name.  The model resolves the policy once at construction (``policy()``) and keeps it through
@@ -49,6 +50,18 @@ FORMS: dict[str, tuple[str, str]] = {
     "qsa_scores_rs_ag": (TOLERANCE, "qsa._sparse_indices_slab"),
     # The gated-residual partials summed by a reduce-scatter + all-gather in place of the gather + device-order reduce.
     "gr_partial_rs_ag": (TOLERANCE, "gr.read_rows"),
+    # The gated-residual read's branch-major <-> flat walks as tile moves: the RMS unit to the flat rows by one tile
+    # permute (in place of four slices + a concat), and the gated flat rows summed over the branches through a
+    # [row tiles, 4, 32, 640] view by the same fast_reduce_nc (in place of four slices + a concat).  Whole tiles move
+    # unchanged and the reduce sums the same four tiles in the same order (a default).
+    "gr_tile_walks": (BITWISE, "gr.read_rows"),
+    # The gated-residual read's gamma multiply against the resident 32-row gamma broadcast over the row tiles, in
+    # place of the 1-row gamma's row broadcast (whose reader fills each fp32 gamma tile's rows on the RISC); the same
+    # tile operands reach the same compute (a default).
+    "gr_gamma_rows": (BITWISE, "gr.read_rows"),
+    # The gated-residual read's sigmoid as the gate multiply's input activation (packed to bf16 before the multiply,
+    # as the separate sigmoid; the injection's form) (a default).
+    "gr_gate_act": (BITWISE, "gr.read_rows"),
     # The GDN chunk kernel's flat q/k form: the raw conv q/k rows go to the kernel, which maps value heads to key
     # heads at read time and l2-normalizes in fp32 with the scale folded in.
     "gdn_qk_flat": (TOLERANCE, "gdn.allocate_rows_state"),
@@ -57,8 +70,12 @@ EXCLUSIVE: tuple[frozenset[str], ...] = (frozenset({"gr_gather_generic", "gr_gat
 # The forms that run when QWEN38_PREFILL_GLUE is unset: bitwise the previous slab body on every readout taken
 # (2026-09-25, the 4-chip line at 32k: acceptance pins 12/12, the corpus long windows' top-128 columns identical to the
 # previous body's at all 160 positions), 1584.6 -> 1524.3 ms of kernel time per 2048-row slab (the gather -34.0, the
-# hoist -26.5, additive), 1283 -> 1334 prompt tokens per second, TTFT at 32k 27.57 -> 26.64 s.
-DEFAULT_ON: frozenset[str] = frozenset({"gr_gather_generic", "qsa_mask_hoist"})
+# hoist -26.5, additive), 1283 -> 1334 prompt tokens per second, TTFT at 32k 27.57 -> 26.64 s.  The three GR read
+# forms (2026-10-14, the 4-chip line at 32k): greedy-32 and the 32 top-20 logprob rows identical to the previous body,
+# GR read + write 166.8 -> 101.6 ms of kernel time per 2048-row slab, 3138 -> 3477 prompt tokens per second.
+DEFAULT_ON: frozenset[str] = frozenset(
+    {"gr_gather_generic", "qsa_mask_hoist", "gr_tile_walks", "gr_gamma_rows", "gr_gate_act"}
+)
 
 
 def _check_default_on() -> None:
