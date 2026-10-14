@@ -46,6 +46,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     CHUNK_PREFILL_MIN_ROWS,
     RESIDUE_CLASSES,
     SEED_TOKEN_ID,
+    SERVED_SLAB_ROWS_RULE,
     WARM_CHUNK_TOKEN_IDS,
     Qwen38ChatChainError,
 )
@@ -1105,8 +1106,8 @@ def test_construction_opens_the_chain_in_the_prefill_form_the_knobs_name(
     assert ("128-row chunks, then 32-row chunks" in form[0]) is expected_long_chunks
 
 
-def test_prefill_form_admits_every_slab_row_count_of_the_contract() -> None:
-    for rows in range(256, 4096 + 1, 128):
+def test_prefill_form_admits_every_served_slab_row_count() -> None:
+    for rows in (256, 512, 1024, 2048, 4096):
         assert vllm_module.prefill_form({"QWEN38_PREFILL_SLAB": str(rows)}) == (True, rows)
     assert vllm_module.describe_prefill_form(True, 2048) == "2048-row slabs, then 128-row chunks, then 32-row chunks"
     assert vllm_module.describe_prefill_form(True, None) == "128-row chunks, then 32-row chunks"
@@ -1120,16 +1121,25 @@ def test_construction_refuses_a_slab_row_count_outside_the_contract(
     construction, monkeypatch, value: str, expect_error
 ) -> None:
     monkeypatch.setenv("QWEN38_PREFILL_SLAB", value)
-    with expect_error(ValueError, "QWEN38_PREFILL_SLAB must be the slab's rows, a multiple of 128 in 256..4096"):
+    with expect_error(ValueError, "QWEN38_PREFILL_SLAB must be the slab's rows, " + re.escape(SERVED_SLAB_ROWS_RULE)):
         _initialize(construction)
     assert construction.calls == []  # refused before any library call
     with expect_error(ValueError, "or 0 / off for no slab, got " + re.escape(repr(value))):
         vllm_module.prefill_form({"QWEN38_PREFILL_SLAB": value})
 
 
-def test_construction_names_the_slab_knob_when_the_dram_admission_refuses_the_slab(
-    construction, monkeypatch
-) -> None:
+@pytest.mark.parametrize("rows", (384, 1536, 3072))
+def test_construction_refuses_a_slab_that_is_not_a_power_of_two(construction, monkeypatch, rows, expect_error) -> None:
+    """A multiple of 128 that is not a power of two (1536 died in the first slab's KV update) is refused before any
+    library call, with the rule every slab entry point names."""
+
+    monkeypatch.setenv("QWEN38_PREFILL_SLAB", str(rows))
+    with expect_error(ValueError, re.escape(f"{SERVED_SLAB_ROWS_RULE}, or 0 / off for no slab, got '{rows}'")):
+        _initialize(construction)
+    assert construction.calls == []
+
+
+def test_construction_names_the_slab_knob_when_the_dram_admission_refuses_the_slab(construction, monkeypatch) -> None:
     refusal = ValueError(
         "QWEN38_PREFILL_DENSE_DTYPE=bf8 / GRID=wide refused: the resident prefill weights need 1177 MiB per device "
         "plus 380 MiB of context state, the 2048-row slab's 1900 MiB working set and a 256 MiB margin = 3713 MiB, "

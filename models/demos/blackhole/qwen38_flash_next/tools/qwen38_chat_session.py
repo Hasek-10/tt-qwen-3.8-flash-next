@@ -263,9 +263,14 @@ MTP_SLAB_TOKEN_TILE_BYTES = 32 * 32 * 4
 MTP_SLAB_OFFSET_PAGE_BYTES = 32
 
 
+# Every slab entry point (--prefill-slab, QWEN38_PREFILL_SLAB, the chain's open) refuses with this rule.
+SERVED_SLAB_ROWS_RULE = (
+    "a power of two in 256..4096 (the slab's padded KV update writes whole slabs into the power-of-two KV cache)"
+)
+
+
 def is_served_slab_rows(rows) -> bool:
-    """A slab row count the session serves: a power of two in 256 .. 4096 (the slab's padded KV update writes whole
-    slab-row chunks into the power-of-two KV cache)."""
+    """A slab row count the session serves: ``SERVED_SLAB_ROWS_RULE``."""
 
     return is_slab_rows(rows) and rows & (rows - 1) == 0
 
@@ -2814,8 +2819,10 @@ class Qwen38TracedChain:
             raise ValueError(f"mtp drafts must be one of {MTP_DRAFTS} or None, got {mtp!r}")
         if mtp_gdn_anchor not in MTP_GDN_ANCHORS:
             raise ValueError(f"mtp_gdn_anchor must be one of {MTP_GDN_ANCHORS}, got {mtp_gdn_anchor!r}")
-        if slab_rows is not None and (not is_slab_rows(slab_rows) or not long_chunks):
-            raise ValueError(f"a prefill slab needs a slab row count and the long chunks, got {slab_rows!r}")
+        if slab_rows is not None and not is_served_slab_rows(slab_rows):
+            raise ValueError(f"slab_rows must be {SERVED_SLAB_ROWS_RULE}, got {slab_rows!r}")
+        if slab_rows is not None and not long_chunks:
+            raise ValueError(f"a prefill slab needs the long chunks, got slab_rows {slab_rows!r} without them")
         tail_slab_rows = tuple(tail_slab_rows)
         if tail_slab_rows and not tail_slab_rows_admitted(tail_slab_rows, slab_rows=slab_rows):
             raise ValueError(
