@@ -733,11 +733,16 @@ def test_slab_source_pins() -> None:
     # hoist (qsa_mask_hoist, a default) and the per-layer derivation (``today``, and the fallback when the hoist is
     # not admitted) run one function; the per-layer branch of _sparse_indices_slab still derives it per block after
     # the all-reduce.
-    assert "slab_block_mask(chunk.complete_blocks_col, constants.arange_blocks_row, start, mask_value)" in slab_select
+    assert "chunk.complete_blocks_col, constants.arange_blocks_row, start, mask_value, block_rows" in slab_select
     block_mask = inspect.getsource(qsa_module.slab_block_mask)
     assert "ttnn.ge(arange_blocks_row, complete_col" in block_mask and "ttnn.multiply(invalid, value" in block_mask
     assert slab_select.index("ttnn.all_reduce(") < slab_select.rindex("slab_block_mask(")
     assert qsa_module.SLAB_SCORE_BLOCK_ROWS == 512
+    # 512-row score blocks; a slab of 512 rows or fewer is one block (no single-part concat, no full-extent slice).
+    assert qsa_module.slab_score_blocks(2048) == ((0, 512), (512, 512), (1024, 512), (1536, 512))
+    assert qsa_module.slab_score_blocks(512) == ((0, 512),) and qsa_module.slab_score_blocks(256) == ((0, 256),)
+    assert "if len(block_ids_parts) == 1:" in slab_select
+    assert "complete_blocks_col\n        if whole\n" in block_mask
     forward = inspect.getsource(qsa_module.Qwen38TTNNQSA.forward_chunk_generic)
     assert (
         "if is_slab_rows(rows):" in forward

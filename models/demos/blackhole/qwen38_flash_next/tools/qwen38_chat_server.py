@@ -2521,7 +2521,7 @@ def _parser() -> argparse.ArgumentParser:
         type=lambda value: tuple(int(rows) for rows in value.split(",")),
         default=(),
         metavar="ROWS[,ROWS]",
-        help="with --prefill-slab, without --mtp: also capture slabs of these smaller row counts (multiples of 512) "
+        help="with --prefill-slab, without --mtp: also capture slabs of these smaller row counts (powers of two >= 256) "
         "for the prompt's remainder after the full slabs, each taken as often as it fits, largest first, and "
         "replayed ahead of the full slabs; the rest runs as 128- and 32-row chunks",
     )
@@ -2670,7 +2670,7 @@ def main() -> int:
         args.mtp is not None or not tail_slab_rows_admitted(args.prefill_tail_slabs, slab_rows=args.prefill_slab)
     ):
         raise SystemExit(
-            "--prefill-tail-slabs takes distinct multiples of 512 below --prefill-slab, without --mtp, got "
+            "--prefill-tail-slabs takes distinct powers of two from 256 below --prefill-slab, without --mtp, got "
             f"{args.prefill_tail_slabs} (--prefill-slab {args.prefill_slab}, --mtp {args.mtp})"
         )
     if args.prefill_slab is not None:
