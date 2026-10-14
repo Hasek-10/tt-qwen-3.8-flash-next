@@ -350,13 +350,25 @@ refuses to start.
   place of broadcasting every device's scores to every device and summing locally.  A third of the score payload
   crosses the line; the four terms are summed in the collective's hop order, so a near-tie between two blocks can
   rank the other way and change that layer's attention set for that row.
-- `gr_partial_rs_ag` (tolerance, off): the gated-residual partials are summed by `reduce_scatter` + `all_gather`
-  instead of the gather + device-order reduce; the four fp32 terms are summed in hop order.  It supersedes the gather
-  forms when both are named.
+- `gr_partial_rs_ag` (tolerance, default: it met the quality bar below): the gated-residual partials are summed by
+  `reduce_scatter` + `all_gather` instead of the gather + device-order reduce; the four fp32 terms are summed in hop
+  order.  It supersedes the gather forms when both are named (the default set names the generic gather too, which
+  the slab then does not read).
 - `gdn_qk_flat` (tolerance, off): the GDN chunk kernel takes the raw convolution q/k rows in its flat form and maps
   value heads to key heads and l2-normalizes them itself, in fp32 with the scale folded in, in place of the model's
   0/1 expand, bf16 `rms_norm` and bf16 scale (about 66 ms per slab of the model's and the kernel adapter's glue).  The
   normalized values differ by bf16 rounding and the recurrent state carries the difference into the decode.
+
+A tolerance form runs by default only once it has met the prefill quality bar: `MET_QUALITY_BAR` in
+`ttnn/prefill_glue.py` names it, and a tolerance form in `DEFAULT_ON` that it does not name refuses to import.  The
+bar, against the defaults of the day in the same tree and hold, `--prefill-slab 2048`: the reference corpus's long part
+(Q38-REF-v1: two items, five 32-position windows, 160 positions, 96 of them after at least one slab) teacher-forced
+through the slab path at start-up (`--agreement-reference`, `--agreement-parts long`); the acceptance pins stay 12/12;
+the mean truncated KL against the CPU oracle (oracle-bf4) rises by 0.002 at most; top-1 agreement with it drops by
+0.5 percentage points at most (one new miss in 160 is 0.625).  `gr_partial_rs_ag` met it on 2026-10-14 (1x4 p150
+line, 32k context, against the five bitwise defaults): pins 12/12, KL 0.0202 -> 0.0098, top-1 0.9875 -> 0.9875;
+14.9 ms less kernel time per 2048-row slab, a 31,524-token prompt 8,968 -> 8,720 ms.  `qsa_scores_rs_ag` missed it in
+the same hold (top-1 0.9875 -> 0.9812: one new miss) and stays off.
 
 `gdn_prefill_rows` (bitwise, on by default; `QWEN38_FUSED_OFF=gdn_prefill_rows` restores the chain and
 `QWEN38_FUSED=gdn_prefill_rows` names it explicitly; a fused kernel, not a glue form) replaces the slab's whole GDN glue --
