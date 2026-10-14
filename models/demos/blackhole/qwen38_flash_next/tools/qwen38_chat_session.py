@@ -101,7 +101,6 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_prefill_driver import
     alignment_steps,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn import gdn as gdn_module
-from models.demos.blackhole.qwen38_flash_next.ttnn import moe as moe_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_v2
 from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import ZERO_EMBEDDING_TOKEN
 from models.demos.blackhole.qwen38_flash_next.config import LAYER_PATTERN
@@ -260,16 +259,13 @@ MTP_SLAB_OFFSET_PAGE_BYTES = 32
 
 
 def tail_slab_rows_admitted(tail_slab_rows: Sequence[int], *, slab_rows: int | None) -> bool:
-    """Tail slab forms (``--prefill-tail-slabs``): distinct slab row counts below ``slab_rows``, each a whole number of
-    the slab body's 512-row blocks (the one-call MoE reduce and the QSA block scoring run in such blocks)."""
+    """Tail slab forms (``--prefill-tail-slabs``): distinct slab row counts below ``slab_rows``, each a power of two
+    (the slab's padded KV update writes whole slab-row chunks into the power-of-two KV cache)."""
 
     return (
         slab_rows is not None
         and len(set(tail_slab_rows)) == len(tail_slab_rows)
-        and all(
-            is_slab_rows(rows) and rows < slab_rows and rows % moe_module.SLAB_REDUCE_BLOCK_ROWS == 0
-            for rows in tail_slab_rows
-        )
+        and all(is_slab_rows(rows) and rows < slab_rows and rows & (rows - 1) == 0 for rows in tail_slab_rows)
     )
 
 
@@ -2733,7 +2729,7 @@ class Qwen38TracedChain:
         tail_slab_rows = tuple(tail_slab_rows)
         if tail_slab_rows and not tail_slab_rows_admitted(tail_slab_rows, slab_rows=slab_rows):
             raise ValueError(
-                f"tail slabs must be distinct multiples of {moe_module.SLAB_REDUCE_BLOCK_ROWS} below the slab rows "
+                f"tail slabs must be distinct powers of two in 256 .. the slab rows "
                 f"{slab_rows!r}, got {tail_slab_rows!r}"
             )
         if tail_slab_rows and mtp is not None:

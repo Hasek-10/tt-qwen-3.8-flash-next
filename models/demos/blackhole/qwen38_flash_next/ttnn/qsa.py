@@ -1174,10 +1174,17 @@ def _mib(value: int) -> str:
     return f"{value / 2**20:.1f} MiB"
 
 
-def hoisted_mask_bytes(rows: int, blocks: int) -> int:
-    """The bytes of a slab's hoisted block masks: one BF16 ``[512, blocks]`` mask per 512-row score block."""
+def slab_score_blocks(rows: int) -> tuple[tuple[int, int], ...]:
+    """A slab's score blocks as (first row, rows): ``SLAB_SCORE_BLOCK_ROWS`` rows each, a slab of fewer rows one
+    block of its own rows."""
 
-    return (rows // SLAB_SCORE_BLOCK_ROWS) * SLAB_SCORE_BLOCK_ROWS * blocks * 2
+    return tuple((start, min(SLAB_SCORE_BLOCK_ROWS, rows - start)) for start in range(0, rows, SLAB_SCORE_BLOCK_ROWS))
+
+
+def hoisted_mask_bytes(rows: int, blocks: int) -> int:
+    """The bytes of a slab's hoisted block masks: one BF16 ``[block rows, blocks]`` mask per score block."""
+
+    return rows * blocks * 2
 
 
 @dataclass(frozen=True)
@@ -1497,22 +1504,28 @@ def _derive_slab_tile_inputs(position_scalar, chunk: Qwen38TTNNQSAChunkConstants
     return compressed_tile_i32, complete_blocks_col, q_positions_row
 
 
-def slab_block_mask(complete_blocks_col, arange_blocks_row, start: int, value: float):
-    """The causal block mask of the SLAB_SCORE_BLOCK_ROWS-row score block at ``start``: block b of row j is hidden
+def slab_block_mask(
+    complete_blocks_col, arange_blocks_row, start: int, value: float, rows: int = SLAB_SCORE_BLOCK_ROWS
+):
+    """The causal block mask of the ``rows``-row score block at ``start``: block b of row j is hidden
     when b >= complete(j), the comparison broadcasting the block index row against the block's complete-block column
     (bitwise the chunk forms' row templates, measured 2026-09-09); ``value`` is what a hidden block's score gains.
     The per-layer derivation and the per-slab hoist run this one function, so the hoisted masks are bitwise the
     per-layer ones."""
 
     dram = ttnn.DRAM_MEMORY_CONFIG
-    complete_col = ttnn.slice(
-        complete_blocks_col, (0, 0, start, 0), (1, 1, start + SLAB_SCORE_BLOCK_ROWS, 1), memory_config=dram
+    # A slab of one score block reads the whole column: ``ttnn.slice`` over the full extent returns its input, kept.
+    whole = start == 0 and rows == _shape(complete_blocks_col)[2]
+    complete_col = (
+        complete_blocks_col
+        if whole
+        else ttnn.slice(complete_blocks_col, (0, 0, start, 0), (1, 1, start + rows, 1), memory_config=dram)
     )
     invalid_bits = ttnn.ge(arange_blocks_row, complete_col, dtype=ttnn.uint32, memory_config=dram)
     invalid = ttnn.typecast(invalid_bits, ttnn.bfloat16, memory_config=dram)
     mask_tiled = ttnn.multiply(invalid, value, memory_config=dram)
     mask = ttnn.to_layout(mask_tiled, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
-    _deallocate(complete_col, invalid_bits, invalid, mask_tiled)
+    _deallocate(*(() if whole else (complete_col,)), invalid_bits, invalid, mask_tiled)
     return mask
 
 
@@ -1588,8 +1601,8 @@ def derive_qsa_chunk_inputs(
                 )
             value = slab_scores_mask_value(glue)
             block_masks = tuple(
-                slab_block_mask(complete_blocks_col, chunk.arange_blocks_row, start, value)
-                for start in range(0, template_rows, SLAB_SCORE_BLOCK_ROWS)
+                slab_block_mask(complete_blocks_col, chunk.arange_blocks_row, start, value, block_rows)
+                for start, block_rows in slab_score_blocks(template_rows)
             )
     elif template_rows == LONG_CHUNK_ROWS:
         # P % 128 == 0: the chunk's 32 compressed rows are the cache's tile P / 128, one paged_fill_cache page.
@@ -1688,8 +1701,8 @@ def derive_qsa_chunk_inputs(
             )
         ),
         *(
-            (f"block_masks[{i}]", mask, (1, 1, SLAB_SCORE_BLOCK_ROWS, blocks), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
-            for i, mask in enumerate(block_masks)
+            (f"block_masks[{i}]", mask, (1, 1, block_rows, blocks), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
+            for i, (mask, (_, block_rows)) in enumerate(zip(block_masks, slab_score_blocks(template_rows)))
         ),
         ("row_keep_bits", row_keep_bits, (1, 1, template_rows, SPARSE_INDEX_CAPACITY), u32, ttnn.ROW_MAJOR_LAYOUT),
         ("row_fill", row_fill, (1, 1, template_rows, SPARSE_INDEX_CAPACITY), u32, ttnn.ROW_MAJOR_LAYOUT),
@@ -5404,7 +5417,7 @@ class Qwen38TTNNQSA:
             raise ValueError("the slab's QSA chunk inputs carry the complete-block column, the chunks' the block mask")
         if slab != (chunk.q_positions_row is not None):
             raise ValueError("the slab's QSA chunk inputs carry the query positions row; the chunks' do not")
-        if chunk.block_masks and (not slab or len(chunk.block_masks) != rows // SLAB_SCORE_BLOCK_ROWS):
+        if chunk.block_masks and (not slab or len(chunk.block_masks) != len(slab_score_blocks(rows))):
             raise ValueError(
                 f"hoisted QSA block masks are a slab form, one per {SLAB_SCORE_BLOCK_ROWS}-row score block; "
                 f"got {len(chunk.block_masks)} for {rows} rows"
@@ -5412,8 +5425,8 @@ class Qwen38TTNNQSA:
         expected = (
             ("kv_block_start", chunk.kv_block_start, (1, 1, 1, 1), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
             *(
-                (f"block_masks[{i}]", mask, (1, 1, SLAB_SCORE_BLOCK_ROWS, blocks), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
-                for i, mask in enumerate(chunk.block_masks)
+                (f"block_masks[{i}]", mask, (1, 1, block_rows, blocks), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
+                for i, (mask, (_, block_rows)) in enumerate(zip(chunk.block_masks, slab_score_blocks(rows)))
             ),
             *(
                 (
@@ -5780,9 +5793,9 @@ class Qwen38TTNNQSA:
         block_ids_parts = []
         scores_rs_ag = self.glue.enabled("qsa_scores_rs_ag")
         mask_value = slab_scores_mask_value(self.glue)
-        for start in range(0, rows, SLAB_SCORE_BLOCK_ROWS):
+        for block_index, (start, block_rows) in enumerate(slab_score_blocks(rows)):
             score_tiles = []
-            for tile_start in range(start, start + SLAB_SCORE_BLOCK_ROWS, CHUNK_ROWS):
+            for tile_start in range(start, start + block_rows, CHUNK_ROWS):
                 query_tile = ttnn.slice(
                     index_query,
                     (0, 0, tile_start, 0),
@@ -5807,7 +5820,7 @@ class Qwen38TTNNQSA:
             self.mesh_contract.mark_local_partial(
                 score_rows,
                 replicated_reference=state.compressed_index_cache,
-                expected_shape=(1, 1, SLAB_SCORE_BLOCK_ROWS, blocks),
+                expected_shape=(1, 1, block_rows, blocks),
             )
             # The mask: block b of row j is hidden when b >= complete(j) (slab_block_mask), the layer's own or
             # the hoisted one (bitwise: the same function on the same operands, once per slab).  The per-layer form
@@ -5819,9 +5832,11 @@ class Qwen38TTNNQSA:
                 # composite's fp32 device-order local sum.  Masked before the sum on every device (a hidden block
                 # is exactly -2^100 per device, -2^102 after: SLAB_SCORES_RS_MASK_VALUE); visible blocks gain 0.0.
                 mask = (
-                    chunk.block_masks[start // SLAB_SCORE_BLOCK_ROWS]
+                    chunk.block_masks[block_index]
                     if hoisted
-                    else slab_block_mask(chunk.complete_blocks_col, constants.arange_blocks_row, start, mask_value)
+                    else slab_block_mask(
+                        chunk.complete_blocks_col, constants.arange_blocks_row, start, mask_value, block_rows
+                    )
                 )
                 masked_local = ttnn.add(score_rows, mask, memory_config=dram, fast_and_approximate_mode=False)
                 _deallocate(score_rows, *(() if hoisted else (mask,)))
@@ -5833,7 +5848,7 @@ class Qwen38TTNNQSA:
                 _deallocate(masked_tiled)
                 masked = ttnn.to_layout(summed_rows, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
                 _deallocate(summed_rows)
-                _require_shape(masked, (1, 1, SLAB_SCORE_BLOCK_ROWS // TP_SIZE, blocks), "masked QSA slab score rows")
+                _require_shape(masked, (1, 1, block_rows // TP_SIZE, blocks), "masked QSA slab score rows")
                 local_ids = ttnn.experimental.topk_large_indices(masked, k=BLOCK_TOPK)
                 _deallocate(masked)
                 block_ids_parts.append(ttnn.all_gather(local_ids, dim=2, cluster_axis=TP_AXIS, memory_config=dram))
@@ -5844,17 +5859,23 @@ class Qwen38TTNNQSA:
             )
             _deallocate(score_rows)
             mask = (
-                chunk.block_masks[start // SLAB_SCORE_BLOCK_ROWS]
+                chunk.block_masks[block_index]
                 if hoisted
-                else slab_block_mask(chunk.complete_blocks_col, constants.arange_blocks_row, start, mask_value)
+                else slab_block_mask(
+                    chunk.complete_blocks_col, constants.arange_blocks_row, start, mask_value, block_rows
+                )
             )
             masked = ttnn.add(scores, mask, memory_config=dram, fast_and_approximate_mode=False)
             _deallocate(scores, *(() if hoisted else (mask,)))
-            _require_shape(masked, (1, 1, SLAB_SCORE_BLOCK_ROWS, blocks), "masked QSA slab block scores")
+            _require_shape(masked, (1, 1, block_rows, blocks), "masked QSA slab block scores")
             block_ids_parts.append(ttnn.experimental.topk_large_indices(masked, k=BLOCK_TOPK))
             _deallocate(masked)
-        block_ids = ttnn.concat(block_ids_parts, dim=2, memory_config=dram)
-        _deallocate(*block_ids_parts)
+        # One score block (a slab of 512 rows or fewer): ``ttnn.concat`` of one tensor returns its input, kept as is.
+        if len(block_ids_parts) == 1:
+            block_ids = block_ids_parts[0]
+        else:
+            block_ids = ttnn.concat(block_ids_parts, dim=2, memory_config=dram)
+            _deallocate(*block_ids_parts)
         _require_shape(block_ids, (1, 1, rows, BLOCK_TOPK), "top-k QSA slab block IDs")
         if block_ids.dtype != ttnn.uint32 or block_ids.layout != ttnn.ROW_MAJOR_LAYOUT:
             raise RuntimeError(
