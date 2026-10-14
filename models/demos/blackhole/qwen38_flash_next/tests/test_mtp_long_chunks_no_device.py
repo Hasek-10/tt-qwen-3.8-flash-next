@@ -509,7 +509,7 @@ def test_chain_open_admits_long_chunks_and_a_slab_with_mtp() -> None:
         "                slab_rows=slab_rows,  # the twin's slab form under --prefill-slab: the default chain's\n"
     ) in opened
     assert "slab_extension.write_slab_tokens(model, [*warm_slab_tokens[1:], warm_slab_tokens[0]])" in opened
-    assert "model.forward_prefill_chunk_generic(slab_state, state, mtp=slab_extension)" in opened
+    assert "model.forward_prefill_chunk_generic(warm_slab_state, state, mtp=slab_extension)" in opened
     assert (
         'guard=lambda label: resident_decode.forbid_trace_body_host_io_and_sync(phase=f"chat slab {label}"),\n'
         "                cq_id=0,\n"
@@ -561,11 +561,11 @@ def test_chain_open_allocates_warms_captures_and_marks_the_128_row_twin_in_order
         position = opened.index(fragment, position + 1)
     # the slab warm pass and capture with the twin's slab form (2026-09-26), before the long-chunk warm
     slab_order = (
-        'marker("before-chat-slab-warm-pass")',
+        'marker(f"before-chat-{form}-warm-pass")',
         "slab_extension = None if chain_mtp is None else chain_mtp.long_chunk_extension",
         "slab_extension.write_slab_tokens(model, [*warm_slab_tokens[1:], warm_slab_tokens[0]])",
-        "model.forward_prefill_chunk_generic(slab_state, state, mtp=slab_extension)",
-        'marker("after-chat-slab-warm-pass")',
+        "model.forward_prefill_chunk_generic(warm_slab_state, state, mtp=slab_extension)",
+        'marker(f"after-chat-{form}-warm-pass")',
         'marker("before-chat-long-chunk-warm-pass")',
     )
     position = -1
@@ -573,7 +573,7 @@ def test_chain_open_allocates_warms_captures_and_marks_the_128_row_twin_in_order
         position = opened.index(fragment, position + 1)
     assert opened.index(
         "model, verify, long_chunk_state, base=chain_mtp.chunk_extension, slab_rows=slab_rows"
-    ) < opened.index('marker("before-chat-slab-warm-pass")')
+    ) < opened.index('marker(f"before-chat-{form}-warm-pass")')
     # the growth gate no longer books the 128-row trace as MTP traces
     assert '"mtp_traces": dram_after_mtp - dram_after_chunk,' not in opened
     assert '"mtp_fused_traces": dram_after_fused - dram_after_chunk,' not in opened
