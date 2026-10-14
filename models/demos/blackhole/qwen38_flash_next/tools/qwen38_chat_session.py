@@ -117,10 +117,12 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.builder import (
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROWS,
+    FABRIC_MAX_PACKET_PAYLOAD_BYTES,
     LONG_CHUNK_ROWS,
     MESH_SHAPE,
     TP_SIZE,
     Qwen38MeshContract,
+    fabric_router_config,
     is_slab_rows,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import ZERO_EMBEDDING_TOKEN
@@ -2087,9 +2089,10 @@ def resolve_route(hardware_profile: ResidentHardwareProfile) -> tuple[ResidentHa
 def open_partition_b_mesh(
     marker: Marker, hardware_profile: ResidentHardwareProfile, *, command_queues: int = 1
 ) -> tuple[Any, dict]:
-    """The runner's mesh open for one lane: the profile's route derivation, FABRIC_1D, one 1D four-device mesh as
-    the logical 1x4.  ``command_queues`` (1 by default: the open call as it always was) opens a second queue for the
-    MTP pass's early rows read (``QWEN38_MTP_PLE_EARLY``); nothing but buffer reads may ever run on it.
+    """The runner's mesh open for one lane: the profile's route derivation, FABRIC_1D with the model's router config
+    (``contracts.fabric_router_config``), one 1D four-device mesh as the logical 1x4.  ``command_queues`` (1 by
+    default: the open call as it always was) opens a second queue for the MTP pass's early rows read
+    (``QWEN38_MTP_PLE_EARLY``); nothing but buffer reads may ever run on it.
 
     Same calls and checks as ``run()`` of the timing runner on a larger
     host (its partition-B values are the profile's defaults, hence the
@@ -2124,6 +2127,7 @@ def open_partition_b_mesh(
         ttnn.FabricReliabilityMode.STRICT_INIT,
         None,
         ttnn.FabricTensixConfig.DISABLED,
+        router_config=fabric_router_config(),
     )
     mesh = None
     try:
@@ -2158,6 +2162,7 @@ def open_partition_b_mesh(
         "ring_walk_agrees": derivation.get("ring_walk_agrees"),
         "cluster_descriptor": derivation["cluster_descriptor"],
         "fabric_config": "FABRIC_1D",
+        "fabric_max_packet_payload_bytes": FABRIC_MAX_PACKET_PAYLOAD_BYTES,
         "collective_topology": "Linear",
         "live_mapping": live_mapping,
         "preopen_runner_lock_proof": lock_proof,
