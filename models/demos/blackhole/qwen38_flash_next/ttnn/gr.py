@@ -490,6 +490,14 @@ class Qwen38TTNNGatedResidual:
         # The gamma multiply runs on the flat row (see _normalize); this view
         # shares the resident weight's buffer.
         self.norm_scale_flat = ttnn.experimental.view(weights.norm_scale, FLAT_LOCAL_SHAPE)
+        # The resident 32-row gamma read as one flat tile row [1, 1, 32, 2560] (the same pages): the slab's gamma
+        # multiply broadcasts it over the row tiles (prefill glue gr_gamma_rows).
+        norm_scale_rows = getattr(weights, "norm_scale_rows", None)
+        self.norm_scale_rows_flat = (
+            None
+            if norm_scale_rows is None
+            else ttnn.experimental.view(norm_scale_rows, (1, 1, CHUNK_ROWS, FLAT_LOCAL_WIDTH))
+        )
         # The read resolves through the fused registry at construction (ttnn/fused/gr_read when it is on: in
         # registry.DEFAULT_ON or QWEN38_FUSED=gr_read; QWEN38_FUSED_OFF keeps the chain) and stays so through trace capture; the class body of
         # read() is the composed chain the fused kernel is gated against.
@@ -828,6 +836,11 @@ class Qwen38TTNNGatedResidual:
             return self._read_fused(self, residual_rows)
         flat_rows_shape = (1, 1, rows, FLAT_LOCAL_WIDTH)
         tile_rows = max(rows, CHUNK_ROWS)
+        slab = is_slab_rows(rows)
+        # The slab's branch-major <-> flat walks as tile moves (prefill glue gr_tile_walks): a slab is whole row tiles,
+        # and the flat rows' tile pages are the branch-major ones reordered (row tile r, branch b, tile j -> page
+        # 80r + 20b + j against 1280b + 20r + j), so one tile permute or a strided view replaces the slices + concats.
+        walks = slab and self.glue.enabled("gr_tile_walks")
         flat_rows_padded = (1, 1, tile_rows, FLAT_LOCAL_WIDTH)
         dram = ttnn.DRAM_MEMORY_CONFIG
         stats = ttnn.rms_norm_pre_all_gather(
@@ -857,6 +870,16 @@ class Qwen38TTNNGatedResidual:
             if rows > CHUNK_ROWS:
                 raise ValueError(f"GR rows flat views are the option of at most {CHUNK_ROWS} rows, got {rows} rows")
             unit_flat = ttnn.experimental.view(unit, flat_rows_shape)  # the view owns unit's buffer
+        elif walks:
+            # [1, 4, rows, 640] read as [4, row tiles, 32, 640] (the same pages) and permuted to [row tiles, 4, 32, 640]:
+            # the flat rows' page order; whole tiles move unchanged.
+            unit_tiles = ttnn.experimental.view(
+                unit, (RESIDUAL_BRANCHES, rows // CHUNK_ROWS, CHUNK_ROWS, LOCAL_HIDDEN_SIZE)
+            )
+            unit_flat = ttnn.experimental.view(
+                ttnn.permute(unit_tiles, (1, 0, 2, 3), memory_config=dram), flat_rows_shape
+            )  # the view owns the permuted pages
+            _deallocate(unit_tiles)  # unit's buffer
         elif rows > CHUNK_ROWS:
             branches = [
                 ttnn.slice(unit, (0, b, 0, 0), (1, b + 1, rows, LOCAL_HIDDEN_SIZE), memory_config=dram)
@@ -880,12 +903,26 @@ class Qwen38TTNNGatedResidual:
             )
         # One tile is normalized straight into the down+inject activation shard; the long chunk normalizes
         # interleaved (the same elementwise multiply) and moves each row tile into the shard for its call.
-        normalized_ws = ttnn.multiply(
-            unit_flat,
-            self.norm_scale_flat,
-            dtype=ttnn.bfloat16,
-            memory_config=self.down_inject_act_memory_config if rows <= CHUNK_ROWS else dram,
-        )
+        if slab and self.norm_scale_rows_flat is not None and self.glue.enabled("gr_gamma_rows"):
+            # The slab multiplies by the resident 32-row gamma broadcast over the row tiles ([1, row tiles, 32, 2560]
+            # x [1, 1, 32, 2560]): the same tile operands as the 1-row gamma's row broadcast, whose reader instead
+            # fills the 32 rows of an fp32 gamma tile on the RISC for every output tile.
+            normalized_ws = ttnn.experimental.view(
+                ttnn.multiply(
+                    ttnn.experimental.view(unit_flat, (1, rows // CHUNK_ROWS, CHUNK_ROWS, FLAT_LOCAL_WIDTH)),
+                    self.norm_scale_rows_flat,
+                    dtype=ttnn.bfloat16,
+                    memory_config=dram,
+                ),
+                flat_rows_shape,
+            )
+        else:
+            normalized_ws = ttnn.multiply(
+                unit_flat,
+                self.norm_scale_flat,
+                dtype=ttnn.bfloat16,
+                memory_config=self.down_inject_act_memory_config if rows <= CHUNK_ROWS else dram,
+            )
         _deallocate(unit_flat)
         self.mesh_contract.validate_tensor(normalized_ws, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
         if _shape(normalized_ws) != flat_rows_shape or (
@@ -898,7 +935,6 @@ class Qwen38TTNNGatedResidual:
         if self.collective_topology != ttnn.Topology.Linear or self.tt_ccl is None:
             raise RuntimeError("GR rows partial reduction requires the TP4 Linear topology and the TT-CCL manager")
 
-        slab = is_slab_rows(rows)
         normalized_tiles = (
             [normalized_ws]
             if rows <= CHUNK_ROWS
@@ -1060,13 +1096,31 @@ class Qwen38TTNNGatedResidual:
         self.mesh_contract.validate_tensor(up_flat, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
         if _shape(up_flat) != flat_rows_shape:
             raise RuntimeError(f"GR rows up projection has unexpected shape {_shape(up_flat)}")
-        gate_flat = ttnn.sigmoid(up_flat, memory_config=dram)
-        _deallocate(up_flat)
-        gated_flat = ttnn.multiply(normalized_ws, gate_flat, memory_config=dram)
-        _deallocate(gate_flat, normalized_ws)
+        if slab and self.glue.enabled("gr_gate_act"):
+            # The sigmoid as the gate multiply's input activation, packed to bf16 before the multiply: the separate
+            # sigmoid's two rounding points (vector mode RC, accurate mode; the injection's 2 sigmoid form), one
+            # [rows, 2560] DRAM round trip fewer.
+            gated_flat = ttnn.multiply(
+                normalized_ws,
+                up_flat,
+                input_tensor_b_activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.SIGMOID, 4.0, 0.0)],
+                memory_config=dram,
+            )
+            _deallocate(up_flat, normalized_ws)
+        else:
+            gate_flat = ttnn.sigmoid(up_flat, memory_config=dram)
+            _deallocate(up_flat)
+            gated_flat = ttnn.multiply(normalized_ws, gate_flat, memory_config=dram)
+            _deallocate(gate_flat, normalized_ws)
         # Flat rows -> branch-major, then the branch mean (the 1/4 is in norm_scale).  At 128 rows the four
         # branch columns are sliced out and stacked on dim 1 (the fold's inverse, no token-major intermediate).
-        if flat_views:
+        if walks:
+            # The flat rows read as [row tiles, 4, 32, 640] (the same pages): the reduce sums each (row tile, column
+            # tile)'s four branch tiles in branch order, as on the stacked branch-major rows.
+            gated = ttnn.experimental.view(
+                gated_flat, (rows // CHUNK_ROWS, RESIDUAL_BRANCHES, CHUNK_ROWS, LOCAL_HIDDEN_SIZE)
+            )  # owns gated_flat's buffer
+        elif flat_views:
             gated = ttnn.experimental.view(gated_flat, residual_rows_shape(rows))  # owns gated_flat's buffer
         elif rows > CHUNK_ROWS:
             branches = [
@@ -1087,11 +1141,14 @@ class Qwen38TTNNGatedResidual:
                 _deallocate(gated_flat)
             gated = ttnn.permute(gated_tokens, (0, 2, 1, 3), memory_config=dram)
             _deallocate(gated_tokens)
-        self._validate_rows(gated, residual_rows_shape(rows), label="GR rows gated unit")
+        if not walks:
+            self._validate_rows(gated, residual_rows_shape(rows), label="GR rows gated unit")
         block_rows = ttnn.experimental.fast_reduce_nc(
             gated, dims=[1], output=None, compute_kernel_config=self.compute_config, memory_config=dram
         )
         _deallocate(gated)
+        if walks:
+            block_rows = ttnn.experimental.view(block_rows, block_rows_shape(rows))  # [row tiles, 1, 32, 640] as rows
         if rows < CHUNK_ROWS and _shape(block_rows) == (1, 1, CHUNK_ROWS, LOCAL_HIDDEN_SIZE):
             block_rows = ttnn.reshape(block_rows, block_rows_shape(rows), block_rows.padded_shape)  # the tile as rows
         self._validate_rows(block_rows, block_rows_shape(rows), label="GR rows block input")

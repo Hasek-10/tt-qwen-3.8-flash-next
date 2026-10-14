@@ -577,9 +577,14 @@ def test_layer_and_model_lane_bodies_are_the_generic_walk_over_lanes() -> None:
     # The lane GR reads and the final mixer rows walk branch-major <-> flat rows through views (the same tile pages
     # for 1..32 rows: no permute or relayout kernel in the lane body); the rows forms keep the permutes by default.
     assert source.count("read_rows(residual, flat_views=True)") == 2
-    for function in (gr_module.Qwen38TTNNGatedResidual.read_rows, mixer_module.Qwen38TTNNFinalMixer.rows):
+    # (The GR read's slab adds its tile walks and row gamma: one permute and six views under the slab forms.)
+    for function, views, permutes in (
+        (gr_module.Qwen38TTNNGatedResidual.read_rows, 8, 3),
+        (mixer_module.Qwen38TTNNFinalMixer.rows, 2, 2),
+    ):
         calls = _calls(function)
-        assert calls.count("ttnn.experimental.view") == 2 and calls.count("ttnn.permute") == 2, function.__qualname__
+        assert calls.count("ttnn.experimental.view") == views, function.__qualname__
+        assert calls.count("ttnn.permute") == permutes, function.__qualname__
         assert inspect.signature(function).parameters["flat_views"].default is False, function.__qualname__
     assert "state.moe.forward(mlp_input, packed_experts[0], packed_experts[1])" in source
     assert "state.ple.token_contexts = (None,) * lanes" in source  # the caller owns the n-gram contexts

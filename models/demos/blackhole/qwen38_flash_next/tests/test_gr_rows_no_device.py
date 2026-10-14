@@ -263,7 +263,8 @@ def test_flat_views_read_rows_is_the_permute_form_bitwise(fake, rows: int) -> No
 
 def test_rows_bodies_walk_the_layout_by_permutes_or_flat_views_and_touch_no_host() -> None:
     read_calls = _calls(_method("read_rows"))
-    assert read_calls.count("ttnn.permute") == 2 and read_calls.count("ttnn.experimental.view") == 2
+    # two permutes + two views for the chunks; the slab's tile walks and row gamma (prefill glue) one permute + six views
+    assert read_calls.count("ttnn.permute") == 3 and read_calls.count("ttnn.experimental.view") == 8
     assert read_calls.count("ttnn.reshape") == 5  # stats, flat rows, token-major rows, the two row restores
     assert read_calls.count("ttnn.linear") == 2 and read_calls.count("ttnn.experimental.fast_reduce_nc") == 2
     assert read_calls.count("ttnn.experimental.all_gather_async") == 1 and "ttnn.all_reduce" not in read_calls

@@ -50,9 +50,10 @@ def _policy(*names: str) -> prefill_glue.PrefillGluePolicy:
 
 
 def test_default_policy_is_the_bitwise_set_today_is_none_and_a_list_is_exact(monkeypatch) -> None:
-    # Unset or empty: the two forms measured bitwise the previous slab body (2026-09-25) run.
+    # Unset or empty: the forms measured bitwise the previous slab body (2026-09-25, the GR read forms 2026-10-14) run.
     default = prefill_glue.PrefillGluePolicy.from_environ({})
-    assert default.names == prefill_glue.DEFAULT_ON == {"gr_gather_generic", "qsa_mask_hoist"}
+    expected = {"gr_gather_generic", "qsa_mask_hoist", "gr_tile_walks", "gr_gamma_rows", "gr_gate_act"}
+    assert default.names == prefill_glue.DEFAULT_ON == expected
     assert prefill_glue.PrefillGluePolicy.from_environ({ENV: " "}).names == prefill_glue.DEFAULT_ON
     assert all(prefill_glue.FORMS[name][0] == prefill_glue.BITWISE for name in prefill_glue.DEFAULT_ON)
     assert {cls for cls, _ in prefill_glue.FORMS.values()} == {prefill_glue.BITWISE, prefill_glue.TOLERANCE}
@@ -155,6 +156,13 @@ def test_default_forms_keep_the_chains_and_the_switch_texts() -> None:
     assert "chunks_per_sync=10 if tuned else 1" in read and "num_workers_per_link=2 if tuned else 1" in read
     assert read.index("ttnn.reduce_scatter(") < read.index("ttnn.experimental.all_gather_async(")
     assert read.index("ttnn.experimental.all_gather_async(") < read.index("ttnn.experimental.fast_reduce_nc(")
+    # The GR read's tile walks, row gamma and gate activation sit beside today's slices + concats, row-broadcast
+    # gamma and separate sigmoid.
+    assert 'walks = slab and self.glue.enabled("gr_tile_walks")' in read and "ttnn.concat(branches, dim=1" in read
+    assert "ttnn.permute(unit_tiles, (1, 0, 2, 3)" in read and "ttnn.concat(branches, dim=3" in read
+    assert 'slab and self.norm_scale_rows_flat is not None and self.glue.enabled("gr_gamma_rows")' in read
+    assert "self.norm_scale_flat," in read and "self.norm_scale_rows_flat," in read
+    assert 'slab and self.glue.enabled("gr_gate_act")' in read and "ttnn.sigmoid(up_flat" in read
     select = inspect.getsource(qsa_module.Qwen38TTNNQSA._sparse_indices_slab)
     assert 'self.glue.enabled("qsa_scores_rs_ag")' in select and "ttnn.reduce_scatter(" in select
     assert "ttnn.all_gather(local_ids, dim=2" in select and "if scores_rs_ag:" in select
