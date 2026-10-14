@@ -601,10 +601,6 @@ class Qwen38TTNNMoE:
         self.routed_calls = self.rows // self.routed_tokens
         if self.slab_one_call:
             admit_slab_moe_switches()  # a refused ring count ends the construction, not the first slab forward
-        if self.slab_one_call and self.rows % SLAB_REDUCE_BLOCK_ROWS:
-            raise ValueError(
-                f"the one-call slab reduces in {SLAB_REDUCE_BLOCK_ROWS}-row blocks; {self.rows} rows is not a multiple"
-            )
         # The one-tile router tail (rows <= 32): the fused program (ttnn/fused/router_tail) by default, the composed
         # chain under QWEN38_FUSED_OFF=router_tail; the long chunk and the slab keep their inline chain until the
         # four-tile form is proven in the model.
@@ -624,6 +620,11 @@ class Qwen38TTNNMoE:
         self.slab_combine_fused = (
             self.slab_one_call and fused.resolve("moe_combine") is fused.kernel("moe_combine").fused
         )
+        if self.slab_one_call and not self.slab_combine_fused and self.rows % SLAB_REDUCE_BLOCK_ROWS:
+            raise ValueError(
+                f"the one-call slab reduces in {SLAB_REDUCE_BLOCK_ROWS}-row blocks without the fused combine; "
+                f"{self.rows} rows is not a multiple"
+            )
         if self.shared_expert_fused and weights.shared_gate_up_scalar is None:
             raise ValueError("the fused shared expert needs weights loaded with it on (shared_gate_up_scalar is None)")
         # The MoE dense composite (ttnn/fused/moe_dense): the fused top-k, the fused shared expert's eltwise and down
