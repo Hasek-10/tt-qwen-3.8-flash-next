@@ -12,6 +12,7 @@ software RNE to bf16, 0 * x = 0), pack bf16; ``ttnn.add`` = FPU (the binding's d
 ``add_tiles(residual, update)`` in the 16-bit dest, pack.  Tolerance class BITWISE.  Rows 1..32 = one tile row (decode,
 lanes, the MTP verify body, the 32-row chunk); the 128-row chunk keeps the chain.  One output tile per core (80 cores,
 one core rectangle) unless ``QWEN38_FUSED_GR_WRITE_CORES`` groups the tiles column-major onto fewer cores.
+``slab_write``: the same two programs per output tile over a prefill slab's row tiles (prefill glue gr_slab_write).
 """
 
 from __future__ import annotations
@@ -39,6 +40,12 @@ NAMED = dict(CBS, hidden_tiles=HIDDEN_TILES, branches=BRANCHES)
 READER_ARGS = ("block_addr", "residual_addr", "injection_addr", "first_unit", "units")
 WRITER_ARGS = ("out_addr", "first_unit", "units")
 COMPUTE_ARGS = ("units",)
+# The prefill slab's write (glue gr_slab_write): the same per-tile programs over every row tile; the writer is
+# gr_read's slab walk writer.
+SLAB_KERNELS = {name: fp.kernel_source(NAME, f"slab_{name}.cpp") for name in ("reader", "compute")}
+SLAB_WRITER = fp.kernel_source("gr_read", "slab_writer.cpp")
+SLAB_READER_ARGS = (*READER_ARGS, "slab_units")
+SLAB_COMPUTE_ARGS = ("first_unit", "units")
 
 
 def _expect(tensor, shape: tuple[int, ...], label: str) -> None:
@@ -173,6 +180,85 @@ def write_rows_fused(module, block_rows, state):
     output = gr_write(block_rows, state.residual, state.injection)
     module.mesh_contract.validate_tensor(output, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
     return output
+
+
+def slab_write(block_rows, residual, injection, *, control: bool = False):
+    """``write_rows`` over a prefill slab (glue gr_slab_write): the new residual ``[1, 4, rows, 640]`` bf16 TILE from
+    the block rows ``[1, 1, rows, 640]``, the residual and the injection ``[1, 1, rows, 4]``, whole row tiles.  Unit u
+    = (row tile u // 20, column tile u % 20): each core takes consecutive units, reads the block tile once for the
+    four branch tiles and the injection tile once per row tile and branch (``kernels/slab_reader.cpp``), and runs
+    ``kernels/compute.cpp``'s two programs per output tile (``kernels/slab_compute.cpp``).  ``control``: the product
+    stored without its RNE (the single-chip replica's negative control)."""
+
+    rows = int(residual.shape[2])
+    if rows % fp.TILE or tuple(residual.padded_shape) != tuple(residual.shape):
+        raise ValueError(f"gr_write slab rows must be whole row tiles, got {rows} padded {residual.padded_shape}")
+    _expect(residual, (1, BRANCHES, rows, LOCAL_HIDDEN), "residual")
+    _expect(block_rows, (1, 1, rows, LOCAL_HIDDEN), "block rows")
+    _expect(injection, (1, 1, rows, BRANCHES), "injection")
+    mesh = residual.device()
+    output = fp.allocate((1, BRANCHES, rows, LOCAL_HIDDEN), ttnn.bfloat16, ttnn.TILE_LAYOUT, mesh)
+    slab_units = rows // fp.TILE * HIDDEN_TILES
+    work = fp.split_work(slab_units, mesh)
+    grid = fp.core_rectangle(work, mesh)
+    tile = fp.TILE_BYTES[ttnn.bfloat16]
+    pages = dict(cb_block=CB_PAGES, cb_res=2 * BRANCHES, cb_coef=2 * BRANCHES, cb_upd=BRANCHES, cb_out=2 * BRANCHES)
+    cbs = [fp.cb_descriptor(index, ttnn.bfloat16, tile, pages[name], grid) for name, index in CBS]
+    reader = fp.reader_kernel(
+        SLAB_KERNELS["reader"],
+        grid,
+        fp.accessor_args(block_rows) + fp.accessor_args(residual) + fp.accessor_args(injection),
+        [
+            (
+                w.core,
+                [
+                    block_rows.buffer_address(),
+                    residual.buffer_address(),
+                    injection.buffer_address(),
+                    w.start,
+                    w.count,
+                    slab_units,
+                ],
+            )
+            for w in work
+        ],
+        named=NAMED,
+    )
+    compute = fp.compute_kernel(
+        SLAB_KERNELS["compute"],
+        grid,
+        [],
+        [(w.core, [w.start, w.count]) for w in work],
+        defines=[("CONTROL", "1")] if control else (),
+        named=NAMED,
+        fp32_dest=False,
+    )
+    # unit u's branch b tile is page b * slab_units + u: outer over the units, inner over the branches
+    writer = fp.writer_kernel(
+        SLAB_WRITER,
+        grid,
+        [CB_INDEX["cb_out"], *fp.accessor_args(output)],
+        [(w.core, [output.buffer_address(), w.count, BRANCHES, w.start, slab_units, 1, BRANCHES]) for w in work],
+    )
+    # the block rows and the residual once, the injection once per row tile a core touches and branch, the residual
+    # out; the multiply and the add per element of the four branches
+    row_runs = sum((w.start + w.count - 1) // HIDDEN_TILES - w.start // HIDDEN_TILES + 1 for w in work)
+    meta = fp.program_meta(
+        NAME,
+        "slab_write",
+        rows,
+        reads=(block_rows, residual),
+        writes=(output,),
+        dram_bytes=row_runs * BRANCHES * tile,
+        flops=2 * rows * BRANCHES * LOCAL_HIDDEN,
+        cores=len(work),
+        outputs=((output, 3),),
+    )
+    return fp.run_program(
+        [block_rows, residual, injection, output],
+        fp.program_descriptor([reader, compute, writer], cbs=cbs),
+        meta=meta,
+    )
 
 
 @functools.lru_cache(maxsize=None)

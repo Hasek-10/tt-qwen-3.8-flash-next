@@ -70,6 +70,10 @@ FORMS: dict[str, tuple[str, str]] = {
     # same tiles, and each normalized tile is written to its flat page (in place of rms_norm_pre, rms_norm_post, the
     # tile permute and the gamma multiply) (a default).
     "gr_slab_front": (BITWISE, "gr.read_rows"),
+    # The gated-residual write as one fused program (ttnn/fused/gr_write's slab write): every output tile runs the
+    # coefficient multiply's and the residual add's LLK sequence, the injection's columns patched into the broadcast
+    # column by the reader (in place of the coefficient permute, the multiply and the add).
+    "gr_slab_write": (BITWISE, "gr.write_rows"),
     # The GDN chunk kernel's flat q/k form: the raw conv q/k rows go to the kernel, which maps value heads to key
     # heads at read time and l2-normalizes in fp32 with the scale folded in.
     "gdn_qk_flat": (TOLERANCE, "gdn.allocate_rows_state"),

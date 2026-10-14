@@ -179,6 +179,11 @@ def test_default_forms_keep_the_chains_and_the_switch_texts() -> None:
     assert "fused_gr_read.slab_stats(residual_rows)" in read and "ttnn.rms_norm_pre_all_gather(" in read
     assert "fused_gr_read.slab_normalize(residual_rows, gathered_stats, self.weights.norm_scale_rows)" in read
     assert "ttnn.rms_norm_post_all_gather(" in read and read.count("ttnn.all_gather(stats, dim=3") == 1
+    # The GR write's slab form (one fused program) sits before the permute + multiply + add chain it replaces.
+    write = inspect.getsource(gr_module.Qwen38TTNNGatedResidual.write_rows)
+    assert 'slab and self.glue.enabled("gr_slab_write")' in write
+    assert "fused_gr_write.slab_write(block_rows, state.residual, state.injection)" in write
+    assert write.index("fused_gr_write.slab_write(") < write.index("ttnn.permute(state.injection, (0, 3, 2, 1)")
     select = inspect.getsource(qsa_module.Qwen38TTNNQSA._sparse_indices_slab)
     assert 'self.glue.enabled("qsa_scores_rs_ag")' in select and "ttnn.reduce_scatter(" in select
     assert "ttnn.all_gather(local_ids, dim=2" in select and "if scores_rs_ag:" in select
