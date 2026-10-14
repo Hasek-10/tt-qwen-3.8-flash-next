@@ -8,6 +8,7 @@ matmul config, and the source pins that keep the slab's forms apart from the 32/
 
 from __future__ import annotations
 
+import argparse
 import inspect
 import itertools
 import math
@@ -367,6 +368,23 @@ def test_slab_moe_switches_are_admitted_before_the_device(monkeypatch) -> None:
     assert "raise SystemExit(str(error)) from error" in main[admit : admit + 200]
     init = inspect.getsource(moe_module.Qwen38TTNNMoE.__init__)
     assert "if self.slab_one_call:\n            admit_slab_moe_switches()" in init
+
+
+def test_prefill_slab_argument_takes_powers_of_two() -> None:
+    """--prefill-slab refuses at parsing a slab row count that is not a power of two in 256..4096: the padded KV
+    update writes whole slabs into the power-of-two KV cache (a 1536-row slab passes is_slab_rows)."""
+    from models.demos.blackhole.qwen38_flash_next.tools import qwen38_chat_server as server_module
+    from models.demos.blackhole.qwen38_flash_next.tools import qwen38_chat_session as session_module
+
+    for rows in (256, 512, 1024, 2048, 4096):
+        assert session_module.is_served_slab_rows(rows) and server_module.slab_rows_argument(str(rows)) == rows
+    for rows in (384, 1536, 3072):
+        assert is_slab_rows(rows) and not session_module.is_served_slab_rows(rows)
+    for text in ("1536", "384", "128", "8192", "2048.0"):
+        with pytest.raises(argparse.ArgumentTypeError):  # allow-pytest.raises: pure contract test
+            server_module.slab_rows_argument(text)
+    action = next(action for action in server_module._parser()._actions if action.dest == "prefill_slab")
+    assert action.type is server_module.slab_rows_argument
 
 
 def test_prefill_matmul_config_covers_the_rows_and_columns_with_whole_subblocks() -> None:
