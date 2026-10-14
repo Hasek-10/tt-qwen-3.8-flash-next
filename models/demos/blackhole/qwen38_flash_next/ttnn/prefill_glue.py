@@ -9,17 +9,19 @@ a collective's configuration, a per-slab hoist, a payload cut.  Every form is re
 identical to the previous slab body run by default (``DEFAULT_ON``: the generic gather of the gated-residual partials
 and the per-slab QSA block-mask hoist; 2026-09-25 on the 4-chip line, a 32k context: pins 12/12, the oracle column
 identical at every scored position, 60.3 ms less per 2048-row slab; the gated-residual read's tile walks, row gamma
-and gate activation, 2026-10-14, 65.2 ms less).  ``QWEN38_PREFILL_GLUE=today`` restores the
-previous slab body, and ``QWEN38_PREFILL_GLUE=<name>[,<name>...]`` runs exactly the named forms (the measurement's
-arms: a list that wants a default form names it).  A name that is not registered raises, as does an exclusive pair or
-``today`` beside a name.  The model resolves the policy once at construction (``policy()``) and keeps it through
-trace capture.
+and gate activation, 2026-10-14, 65.2 ms less), and so does a tolerance form that met the prefill quality bar (the
+gated-residual partials' reduce-scatter + all-gather, 2026-10-14, 14.9 ms less).  ``QWEN38_PREFILL_GLUE=today``
+restores the previous slab body, and ``QWEN38_PREFILL_GLUE=<name>[,<name>...]`` runs exactly the named forms (the
+measurement's arms: a list that wants a default form names it).  A name that is not registered raises, as does an
+exclusive pair or ``today`` beside a name.  The model resolves the policy once at construction (``policy()``) and
+keeps it through trace capture.
 
 Classes.  BITWISE: the same per-element arithmetic and reduction order as the previous form (data movement, integer
 work, or the same ops once instead of per layer); the slab's outputs are the previous form's bit for bit.  TOLERANCE:
 a summation order or a rounding point moves (a reduce-scatter summing in hop order in place of a device-order reduce,
 a normalization moved into a kernel), judged by the long-window KL / top-1 against the CPU oracle and, for a
-discrete choice, by the selected block sets.  Only BITWISE forms may be in ``DEFAULT_ON``.
+discrete choice, by the selected block sets.  A TOLERANCE form may be in ``DEFAULT_ON`` only once it has met the
+prefill quality bar (``docs/PREFILL.md``) and ``MET_QUALITY_BAR`` names it.
 """
 
 from __future__ import annotations
@@ -48,7 +50,8 @@ FORMS: dict[str, tuple[str, str]] = {
     # The QSA block scores summed by a reduce-scatter over the block's rows, top-k per device, the block ids gathered
     # (in place of the all-broadcast + local sum of every device's scores).
     "qsa_scores_rs_ag": (TOLERANCE, "qsa._sparse_indices_slab"),
-    # The gated-residual partials summed by a reduce-scatter + all-gather in place of the gather + device-order reduce.
+    # The gated-residual partials summed by a reduce-scatter + all-gather in place of the gather + device-order reduce
+    # (a default: it met the quality bar).
     "gr_partial_rs_ag": (TOLERANCE, "gr.read_rows"),
     # The gated-residual read's branch-major <-> flat walks as tile moves: the RMS unit to the flat rows by one tile
     # permute (in place of four slices + a concat), and the gated flat rows summed over the branches through a
@@ -73,20 +76,28 @@ EXCLUSIVE: tuple[frozenset[str], ...] = (frozenset({"gr_gather_generic", "gr_gat
 # hoist -26.5, additive), 1283 -> 1334 prompt tokens per second, TTFT at 32k 27.57 -> 26.64 s.  The three GR read
 # forms (2026-10-14, the 4-chip line at 32k): greedy-32 and the 32 top-20 logprob rows identical to the previous body,
 # GR read + write 166.8 -> 101.6 ms of kernel time per 2048-row slab, 3138 -> 3477 prompt tokens per second.
+# gr_partial_rs_ag (tolerance, MET_QUALITY_BAR) supersedes the generic gather on the slab.
 DEFAULT_ON: frozenset[str] = frozenset(
-    {"gr_gather_generic", "qsa_mask_hoist", "gr_tile_walks", "gr_gamma_rows", "gr_gate_act"}
+    {"gr_gather_generic", "qsa_mask_hoist", "gr_tile_walks", "gr_gamma_rows", "gr_gate_act", "gr_partial_rs_ag"}
 )
+# The tolerance forms that met the prefill quality bar, the only tolerance forms DEFAULT_ON may name (docs/PREFILL.md,
+# "Glue forms": the reference corpus's long windows through the slab against the CPU oracle, and the measured result).
+MET_QUALITY_BAR: frozenset[str] = frozenset({"gr_partial_rs_ag"})
 
 
 def _check_default_on() -> None:
-    """Every default form is registered and BITWISE; a tolerance form never runs unnamed."""
+    """Every default form is registered and BITWISE, or TOLERANCE and in ``MET_QUALITY_BAR``; any other tolerance
+    form never runs unnamed."""
 
     unknown = sorted(DEFAULT_ON - set(FORMS))
     if unknown:
         raise ValueError(f"DEFAULT_ON names unregistered prefill glue forms {unknown}; registered: {sorted(FORMS)}")
-    tolerance = sorted(name for name in DEFAULT_ON if FORMS[name][0] != BITWISE)
-    if tolerance:
-        raise ValueError(f"DEFAULT_ON prefill glue forms must be bitwise; {tolerance} are not")
+    unproven = sorted(name for name in DEFAULT_ON if FORMS[name][0] != BITWISE and name not in MET_QUALITY_BAR)
+    if unproven:
+        raise ValueError(
+            f"DEFAULT_ON prefill glue forms must be bitwise or have met the prefill quality bar (MET_QUALITY_BAR); "
+            f"{unproven} are neither"
+        )
     for pair in EXCLUSIVE:
         if pair <= DEFAULT_ON:
             raise ValueError(f"DEFAULT_ON names the exclusive prefill glue forms {sorted(pair)}")
