@@ -56,9 +56,11 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     CHUNK_PREFILL_MIN_ROWS,
     RESIDUE_CLASSES,
     SEED_TOKEN_ID,
+    SERVED_SLAB_ROWS_RULE,
     WARM_CHUNK_TOKEN_IDS,
     Qwen38ChatChainError,
     Qwen38TracedChain,
+    is_served_slab_rows,
 )
 from models.demos.blackhole.qwen38_flash_next.tools.runtime_admission import (
     RuntimeAdmissionError,
@@ -66,12 +68,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.runtime_admission import (
     sha256_of,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.builder import RESIDENT_QSA_CACHE_CAPACITIES, Qwen38ResidentContext
-from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
-    DEFAULT_SLAB_ROWS,
-    MESH_SHAPE,
-    TP_SIZE,
-    is_slab_rows,
-)
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import DEFAULT_SLAB_ROWS, MESH_SHAPE, TP_SIZE
 
 OPTIMIZATIONS = (None, "performance", "accuracy")  # the plugin's tt.optimizations values; no effect on this chain
 # The warmup smoke's prompt: one full 32-row chunk, a 7-row padded tail, the hand-off, one forced step, one gather.
@@ -245,7 +242,7 @@ def _sample_full_row(scaled: torch.Tensor, top_k: int, top_p: float, generator: 
 
 def prefill_form(environ: Mapping[str, str] | None = None) -> tuple[bool, int | None]:
     """The prefill form the chain is opened with, as ``(long_chunks, slab_rows)``, from the environment (``os.environ``
-    by default).  ``QWEN38_PREFILL_SLAB`` is the slab's row count, a multiple of 128 in 256..4096 (default 2048, the
+    by default).  ``QWEN38_PREFILL_SLAB`` is the slab's row count, a power of two in 256..4096 (default 2048, the
     measured form); ``0`` or ``off`` serves without the slab.  A slab implies the 128-row chunks; without one,
     ``QWEN38_LONG_CHUNKS=1`` turns the 128-row chunks on alone.  Any other value is refused by name."""
 
@@ -258,10 +255,10 @@ def prefill_form(environ: Mapping[str, str] | None = None) -> tuple[bool, int | 
         slab_rows = None
     else:
         rows = int(value) if value.isascii() and value.isdigit() else None
-        if rows is None or not is_slab_rows(rows):
+        if rows is None or not is_served_slab_rows(rows):
             raise ValueError(
-                f"{PREFILL_SLAB_VARIABLE} must be the slab's rows, a multiple of 128 in 256..4096, or 0 / off for no "
-                f"slab, got {raw!r}"
+                f"{PREFILL_SLAB_VARIABLE} must be the slab's rows, {SERVED_SLAB_ROWS_RULE}, or 0 / off for no slab, "
+                f"got {raw!r}"
             )
         slab_rows = rows
     long_chunks = slab_rows is not None or environ.get(LONG_CHUNKS_VARIABLE, "").strip() == "1"
