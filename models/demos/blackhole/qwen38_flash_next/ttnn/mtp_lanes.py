@@ -1022,13 +1022,23 @@ def import_gdn_lane(
     _deallocate(owner)
 
 
-def write_kv_slab_lane(cache, staging, lane: int, allocated_context: int, *, label: str) -> None:
-    """``staging`` (a lane's ``[1, 1, C, 2*HEAD_DIM]`` KV slab on device) into lane ``lane`` of the lane cache
-    (``[1, 1, B*C + scratch, 2*HEAD_DIM]``) as ``update_padded_kv_cache`` writes of :func:`kv_scratch_rows` rows each
-    at row ``u*C + start`` (the pager's re-admission write, chunked to the cache's block-cyclic invariant)."""
+def write_kv_slab_lane(
+    cache, staging, lane: int, allocated_context: int, *, label: str, rows: int | None = None
+) -> None:
+    """``staging`` (a lane's ``[1, 1, C, 2*HEAD_DIM]`` KV slab on device: a pager's staging, or the generic state's own
+    cache) into lane ``lane`` of the lane cache (``[1, 1, B*C + scratch, 2*HEAD_DIM]``) as ``update_padded_kv_cache``
+    writes of :func:`kv_scratch_rows` rows each at row ``u*C + start`` (the pager's re-admission write, chunked to the
+    cache's block-cyclic invariant).  ``rows`` bounds the writes to the chunks holding rows ``0 .. rows - 1`` (an
+    admission at position ``rows``: the lane's rows past it are never read before the lane writes them); None writes
+    the whole slab."""
 
     chunk = kv_scratch_rows(allocated_context)
-    for start in range(0, allocated_context, chunk):
+    end = allocated_context
+    if rows is not None:
+        if isinstance(rows, bool) or type(rows) is not int or not 0 <= rows <= allocated_context:
+            raise ValueError(f"{label}: KV rows must be an int in [0, {allocated_context}], got {rows!r}")
+        end = max(chunk, -(-rows // chunk) * chunk)
+    for start in range(0, end, chunk):
         part = staging
         if chunk != allocated_context:
             part = ttnn.slice(
@@ -1047,20 +1057,28 @@ def import_qsa_lane(
     state,
     verify_state,
     pager: Qwen38TTNNLanePager,
-    slot: Qwen38LaneHostSlot,
+    slot: Qwen38LaneHostSlot | None,
     index: int,
     *,
     position: int,
     lane: int,
     allocated_context: int,
+    kv_rows: int | None = None,
 ) -> None:
-    """Lane ``lane`` of a QSA layer from image ``index``: the KV slab at row ``u*C`` (the pager's re-admission write
-    through its staging), the compressed blocks (``fill_cache`` at batch u) and the raw history rows 0..2 <- ring slots
-    ``(P - 3 .. P - 1) % 4`` (``sync_verify_raw_history_from_ring`` landing in batch u)."""
+    """Lane ``lane`` of a QSA layer from image ``index``: the KV slab at row ``u*C`` (the pager's re-admission write:
+    from the host slot through the pager's staging, or with ``slot`` None straight from the pager's layout, the
+    generic state's own cache on device; ``kv_rows`` bounds it, ``write_kv_slab_lane``), the compressed blocks
+    (``fill_cache`` at batch u) and the raw history rows 0..2 <- ring slots ``(P - 3 .. P - 1) % 4``
+    (``sync_verify_raw_history_from_ring`` landing in batch u)."""
 
-    staging = pager.kv_stagings[index % KV_STAGINGS]
-    ttnn.copy_host_to_device_tensor(slot.tensors["kv"][index], staging)
-    write_kv_slab_lane(state.packed_kv_cache, staging, lane, allocated_context, label=f"QSA layer image {index}")
+    if slot is None:
+        source = pager.layout.kv[index]
+    else:
+        source = pager.kv_stagings[index % KV_STAGINGS]
+        ttnn.copy_host_to_device_tensor(slot.tensors["kv"][index], source)
+    write_kv_slab_lane(
+        state.packed_kv_cache, source, lane, allocated_context, label=f"QSA layer image {index}", rows=kv_rows
+    )
     part = _slice0(pager.packs["compressed"], index)
     _fill_lane(state.compressed_index_cache, part, lane, label=f"QSA layer image {index} compressed blocks")
     _deallocate(part)
@@ -1115,20 +1133,24 @@ def import_lane_state(
     position: int,
     ple_context: tuple[int, int] | None,
     gdn_phases: Sequence[int],
-    backbone_slot: Qwen38LaneHostSlot,
+    backbone_slot: Qwen38LaneHostSlot | None,
     backbone_pager: Qwen38TTNNLanePager,
-    alignment_slot: Qwen38LaneHostSlot,
+    alignment_slot: Qwen38LaneHostSlot | None,
     alignment_pager: Qwen38TTNNLanePager,
     rope_shift: int = 0,
+    kv_rows: int | None = None,
 ) -> None:
     """Admit a prefilled sequence into lane ``lane`` from its 1-lane images: the pager's host slot of the generic
     state (``model.generic_lane_layout``) and of the alignment layer's generic state, evicted after the prompt's
-    prefill at host-known ``position``; ``gdn_phases`` are the generic GDN states' ring phases at that moment (in
-    GDN-layer order).  Device -> device through the pagers' pack buffers, every family landing in lane u alone; the
-    phase-bound families are converted at P into the MTP-lane families (the B=1 seed forms of ``mtp_v2`` per lane).
-    Then the lane's position, rotary shift (``rope_shift``: the prompt's ``mrope`` shift, 0 for text) and n-gram
-    context.  Eager, never traced; the caller writes the lane's accept count (-1: the next commit keeps everything)
-    and active flag, and warms every (lane) variant before the captures."""
+    prefill at host-known ``position``, or with both slots None the states themselves, packed on device right here
+    (nothing crosses to the host; the caller runs no trace replay between its prefill's end and this import);
+    ``gdn_phases`` are the generic GDN states' ring phases at that moment (in GDN-layer order).  Device -> device
+    through the pagers' pack buffers, every family landing in lane u alone; the phase-bound families are converted at
+    P into the MTP-lane families (the B=1 seed forms of ``mtp_v2`` per lane).  ``kv_rows`` bounds the KV slabs to the
+    import chunks below it (the admission passes its position); None moves them whole.  Then the lane's position,
+    rotary shift (``rope_shift``: the prompt's ``mrope`` shift, 0 for text) and n-gram context.  Eager, never traced;
+    the caller writes the lane's accept count (-1: the next commit keeps everything) and active flag, and warms every
+    (lane) variant of the form it serves before the captures."""
 
     _validate_lane_verify_state(model, verify)
     if isinstance(lane, bool) or type(lane) is not int or not 0 <= lane < verify.lanes:
@@ -1139,8 +1161,13 @@ def import_lane_state(
     gdn_layers = [layer for layer in model.layers if isinstance(layer.attention, Qwen38TTNNGDN)]
     if len(gdn_phases) != len(gdn_layers):
         raise ValueError(f"gdn_phases needs one ring phase per GDN layer ({len(gdn_layers)}), got {len(gdn_phases)}")
+    if (backbone_slot is None) != (alignment_slot is None):
+        raise ValueError("the backbone and the alignment images come from the same place: both slots or neither")
     context = model.allocated_context
-    load_lane_image(backbone_pager, backbone_slot)
+    if backbone_slot is None:
+        backbone_pager.pack(0)
+    else:
+        load_lane_image(backbone_pager, backbone_slot)
     conv_tiles = ttnn.to_layout(backbone_pager.packs["conv"], ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
     gdn_index = qsa_index = 0
     for layer, layer_state in zip(model.layers, verify.layers):
@@ -1165,12 +1192,16 @@ def import_lane_state(
                 position=position,
                 lane=lane,
                 allocated_context=context,
+                kv_rows=kv_rows,
             )
             qsa_index += 1
         if layer_state.ple is not None:
             import_ple_lane(layer_state.ple, backbone_pager, lane=lane, context=ple_context)
     _deallocate(conv_tiles)
-    load_lane_image(alignment_pager, alignment_slot)
+    if alignment_slot is None:
+        alignment_pager.pack(0)
+    else:
+        load_lane_image(alignment_pager, alignment_slot)
     alignment = verify.alignment
     import_qsa_lane(
         alignment.layer_state.attention_state,
@@ -1181,6 +1212,7 @@ def import_lane_state(
         position=position,
         lane=lane,
         allocated_context=context,
+        kv_rows=kv_rows,
     )
     verify.positions.write_lane(lane, position, rope_shift)
     verify.pass_contexts[lane] = (ple_context,) * (verify.rows + 1)

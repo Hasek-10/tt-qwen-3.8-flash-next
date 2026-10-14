@@ -187,10 +187,12 @@ wrap for the whole process; that switch is gone.
 Scheduling: a request that finds a free lane is admitted at the next pass boundary; the B+1th waits in the FIFO
 (`usage.queue_wait_seconds` counts from its arrival to its admission) and up to `--queue-limit` (4) wait behind the B
 lanes, the next gets HTTP 503 with `Retry-After`.  An admission prefills the prompt on the single-stream chain (the same
-chunked prefill: 128-row chunks where the prompt allows, 32-row chunks for the remainder), evicts that state into a
-host slot and imports it into the lane.  The device runs one thing at a time, so that work is what the other lanes wait
-for; since 2026-09-29 it runs in SEGMENTS -- the chunk groups of the prefill (one per 128 prompt rows), the forced last
-step, the eviction, the import -- and between two segments the driver runs one pass for the decoding lanes whenever the
+chunked prefill: 128-row chunks where the prompt allows, 32-row chunks for the remainder) and imports that state into
+the lane on device: packed and moved in one segment, the KV slabs only as far as the prompt reaches (the 4,096-row
+import chunks below its position), nothing crossing to the host (until 2026-10-13 the state went through a host slot
+whole, 0.32 s of a 2,400-token prompt's 0.51 s admission).  The device runs one thing at a time, so that work is what
+the other lanes wait for; since 2026-09-29 it runs in SEGMENTS -- the chunk groups of the prefill (one per 128 prompt
+rows), a conversation checkpoint's save (below), the forced last step, the import -- and between two segments the driver runs one pass for the decoding lanes whenever the
 admission work since their last pass reached `--lanes-stall-budget` (seconds; the default 0.5 is the measured
 setting of the 2026-09-29 sweep in `docs/NUMERICS.md`, "Served lanes"; `0` runs a pass at every segment; `off` runs
 every admission whole, the form of 2026-09-28).  The trade-off, measured: the device work is the same, so the interleave
@@ -203,7 +205,8 @@ within noise across the settings.  `off` is for an operator who wants the burst 
 freezes of the other streams.  One admission per boundary while any lane decodes; while none does the waiting requests are
 admitted back to back, the first whole and the next ones interleaved with the first one's passes.  Every request's
 response carries the record: `qwen38.lanes` (`lane`, `admission_seconds` = the admission's segments with its `tower`
-(an image prompt) / `prefill` / `evict` / `import` parts, `admission_wall_seconds` = the admission with the interleaved
+(an image prompt) / `prefill` / `resume` / `checkpoint` / `import` parts, `prefill_reuse` the plan below, `checkpoint`
+the position a checkpoint was saved at, `admission_wall_seconds` = the admission with the interleaved
 passes inside, `interleaved_passes`, `stalled_seconds` = the other requests' admission segments this one waited for,
 charged per segment (a request that ends inside an interleaved pass carries the segments before it; never the passes it
 got), `passes`, `committed_tokens`, `finish_detail`, `forced_think_ends`) beside the usual `qwen38` fields;
@@ -231,14 +234,30 @@ buffers; the caches are positional and stay) and prefills the rest; a later admi
 snapshot's ids and the one after them (the MTP layer's last prefix row read it) restores the snapshot and prefills only
 the rest.  The snapshot lives until an admission that does not start with it prefills from position 0, and an image
 prompt always does.  Agents that share a system prompt and tools pay for them once: `qwen38.prefix_reused` is the
-prompt ids not prefilled (`prefill_tokens` the rest), `snapshot_schedule` is `forced-tail` for an admission that
+prompt ids not prefilled (`prefill_tokens` the rest; `usage.prompt_tokens_details.cached_tokens` repeats it in
+OpenAI's form, on every route), `snapshot_schedule` is `forced-tail` for an admission that
 restored or captured (equal to a fresh prefill to rounding: the split moves the slab and chunk groupings,
 `docs/PREFILL.md`; a restore repeats the capturing admission's arithmetic exactly), `snapshot_captured` is `chunked`
 on the admission that took it, and `/health.lanes` counts `prefix_reused_admissions` and `prefix_reused_tokens`.
 The lanes' startup pin runs without it (every record from position 0, as the single stream's replay); the reuse then
 has its own pin: the `json` record fresh, captured and restored, the restore equal to the capture token for token
 and both 96/96 against the CPU record (`prefix-reuse.json`, `READY.lanes.prefix_reuse_pin`; refused under
-`--require-json-96`).  Image parts are served on the lanes as on
+`--require-json-96`).  `--lanes-conversations N` (opt-in, 1..64, with or without the snapshot) keeps conversations on
+the server between their turns: a request with tools or a past assistant turn (an agent loop, a chat in progress)
+saves its prompt's state into one of N host checkpoints on its way through the prefill (`ttnn/lanes.py`,
+`Qwen38TTNNStateCheckpoints`: the pack families and the KV rows below the position; at the last 32-row boundary that
+leaves the prefill's tail a chunk, and only past the shared snapshot by 256 ids or more), and the conversation's next
+turn, whose render repeats those ids, resumes it: the checkpoint written back, the position set, only the turn's new
+ids prefilled (the reply, the tool results, the generation prompt).  A turn resumes rather than restores when its
+checkpoint reaches 256 ids past the snapshot (the host round trip, tens of milliseconds, against the chunks it saves);
+a conversation's new checkpoint replaces its own, a new conversation the least recently used.  The resumed state is the
+saved one bitwise (data movement only), so the resumed admission repeats the saving one's arithmetic from the
+checkpoint on (`snapshot_schedule` `forced-tail` against a fresh prefill, as above).  Host memory: about 0.2 GB per
+conversation plus 0.2 GB per 4,096 prompt ids it holds (the first chunk of every slot allocated at start).  The start
+runs a round trip through slot 0 over the whole context, checked bitwise, and its own pin after the snapshot's: the
+`json` record saved then resumed, the two streams equal token for token and 96/96 against the CPU record
+(`conversation-reuse.json`, `READY.lanes.conversation_pin`; refused under `--require-json-96`); `/health.lanes`
+counts `resumed_admissions` and `checkpoints_saved`.  Image parts are served on the lanes as on
 the single stream (2026-09-29): the tower runs inside the lane admission as its first segment
 (`qwen38.lanes.admission.tower`; the decoding lanes' pass may run between it and the chunks), the prompt prefills
 through the chunk driver with its positions and feature rows, and the lane takes the prompt's rotary shift; a lane's

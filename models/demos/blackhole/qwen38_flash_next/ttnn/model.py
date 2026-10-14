@@ -2209,6 +2209,26 @@ class Qwen38TTNNTextModel:
         for ple_state in snapshot.ple_states:
             ple_state.token_context = None
 
+    def set_generic_position(
+        self, state: Qwen38TTNNTextModelGenericState, position: int, *, rope_shift: int = 0
+    ) -> None:
+        """The host-tracked half of a generic state whose buffers were written back by a pager (a lanes conversation
+        checkpoint restored): the device position, the GDN ring phases at ``position mod 4`` and the PLE host context
+        cleared, as :meth:`restore_generic_snapshot` leaves them."""
+
+        self._validate_generic_state(state)
+        if isinstance(position, bool) or type(position) is not int or not 0 <= position <= self.allocated_context:
+            raise ValueError(f"generic position must be an int in [0,{self.allocated_context}], got {position!r}")
+        try:
+            state.position.reset(position, rope_shift)
+        except BaseException as error:
+            self._mark_poisoned("set_generic_position", 0, error)
+        for layer_state in state.layers:
+            if isinstance(layer_state.attention, gdn_module.Qwen38TTNNGDNState):
+                layer_state.attention.conv_phase = position % gdn_module.CONV_KERNEL_SIZE
+            if layer_state.ple is not None:
+                layer_state.ple.token_context = None
+
     def release_generic_snapshot(self, snapshot: Qwen38TTNNTextModelGenericSnapshot) -> None:
         self._validate_generic_snapshot(snapshot)
         _deallocate_unique(*(target for _, _, target in snapshot.pairs))

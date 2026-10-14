@@ -449,8 +449,11 @@ def test_scheduler_and_session_modules_split_the_device_from_the_rules() -> None
         "between_chunks=None if between is None else between_chunks,",
         "event_rows=None if between is None else ADMISSION_EVENT_ROWS,",
         'between("prefilled", len(ids), len(ids))',
-        'between("evicted", len(ids), len(ids))',
-        '"prefill": (prefilled - started) / 1e9 - spent,',
+        'spent += float(between("checkpoint", stop, len(ids)))',
+        '"prefill": (prefilled - started) / 1e9 - spent - seconds_resume - seconds_checkpoint',
+        # the import reads the chain's state on device, the KV bounded by the position
+        "backbone_slot=None,",
+        "kv_rows=position,",
         # an image prompt: the tower segment first, the vision inputs through the chunk driver, the shift at import
         "vision, vision_record = self.tower(ids, ticket.vision_positions, ticket.images)",
         'between("tower", len(ids), len(ids))',
@@ -463,14 +466,18 @@ def test_scheduler_and_session_modules_split_the_device_from_the_rules() -> None
     assert lanes_module.ADMISSION_EVENT_ROWS == 128 and lanes_module.ADMISSION_SEGMENTS == (
         "tower",
         "chunks",
+        "checkpoint",
         "prefilled",
-        "evicted",
     )
+    # nothing of an admission crosses to the host: no host slot, no eviction
+    admit = session_source[session_source.index("    def admit(") : session_source.index("    def _resume(")]
+    assert ".evict(" not in admit and "load_lane_image" not in admit
     # the chunk driver takes the vision inputs as the single stream passes them (positional), the prompt's own on the
     # prefill after any reused or captured text prefix (an image prompt never reuses)
     assert "                chunk_vision,\n                between_chunks=" in session_source
     assert "prefill_chunks(suffix[:-1], suffix[-1], vision)" in session_source
-    assert "if self.prefix_reuse and vision is None and session.prefill_mode == " in session_source
+    assert 'text = vision is None and session.prefill_mode == "chunked"' in session_source
+    assert "if text and (self.prefix_reuse or self.checkpoints):" in session_source
     # the scheduler's between: a pass once the admission work since the last pass reached the budget
     assert (
         "if budget is None or self.active_count == 0 or now - self.lanes_progressed_at < budget:" in scheduler_source

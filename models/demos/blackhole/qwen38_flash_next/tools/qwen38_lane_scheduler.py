@@ -345,6 +345,9 @@ class Qwen38LaneTicket:
     images: list = field(default_factory=list)
     vision_positions: Any = None
     vision: dict[str, Any] | None = None
+    # A conversation likely to come back (a request with tools or a past assistant turn): the admission saves a
+    # checkpoint of its prompt for the next turn to resume (``--lanes-conversations``; ignored without it).
+    checkpoint: bool = False
     tokens: "queue.SimpleQueue[tuple[int | None, str | None]]" = field(default_factory=queue.SimpleQueue)
     done: threading.Event = field(default_factory=threading.Event)
     lane: int | None = None
@@ -431,6 +434,9 @@ class Qwen38LaneScheduler:
         # ``prefill["prefix_reused"]``; 0 without prompt reuse).
         self.prefix_reused_admissions = 0
         self.prefix_reused_tokens = 0
+        # Of those, the admissions that resumed a conversation checkpoint; the checkpoints the admissions saved.
+        self.resumed_admissions = 0
+        self.checkpoints_saved = 0
         self.requests_done = 0
         self.stalled_seconds_total = 0.0
         self.last_progress: float = clock()  # the last completed device call (a pass, an admission)
@@ -504,6 +510,8 @@ class Qwen38LaneScheduler:
                 "admissions": self.admissions,
                 "prefix_reused_admissions": self.prefix_reused_admissions,
                 "prefix_reused_tokens": self.prefix_reused_tokens,
+                "resumed_admissions": self.resumed_admissions,
+                "checkpoints_saved": self.checkpoints_saved,
                 "requests_done": self.requests_done,
                 "stalled_seconds_total": round(self.stalled_seconds_total, 3),
                 "last_pass_seconds": None if self.last_pass_seconds is None else round(self.last_pass_seconds, 4),
@@ -574,6 +582,8 @@ class Qwen38LaneScheduler:
         reused = int(admitted.prefill.get("prefix_reused") or 0)
         self.prefix_reused_admissions += 1 if reused else 0
         self.prefix_reused_tokens += reused
+        self.resumed_admissions += 1 if admitted.prefill.get("reuse") == "resumed" else 0
+        self.checkpoints_saved += 1 if admitted.prefill.get("checkpoint") else 0
         self.last_progress = ticket.admitted_at
         # The device's segment seconds (the passes excluded) over the yield-point intervals by wall share: each lane
         # carries the intervals it was active for, so a lane whose request ended inside an interleaved pass is

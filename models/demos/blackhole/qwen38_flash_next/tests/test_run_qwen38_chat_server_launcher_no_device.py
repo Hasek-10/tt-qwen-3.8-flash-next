@@ -159,12 +159,18 @@ def test_lanes_reach_the_server_greedy(tmp_path) -> None:
     assert lanes[lanes.index("--lanes-stall-budget") + 1] == "off" and "--sampling" not in lanes
     assert "--lanes-prefix-reuse" not in lanes and "--lanes-prefix-reuse" not in single
     assert "--lanes-prefix-reuse" in server_args("--mtp", "4", "--lanes", "6", "--lanes-prefix-reuse")
+    conversations = server_args("--mtp", "4", "--lanes", "6", "--lanes-conversations", "8")
+    assert conversations[conversations.index("--lanes-conversations") + 1] == "8"
+    assert "--lanes-conversations" not in lanes
     for extra, refusal in (
         (("--mtp", "4", "--lanes", "1"), "--lanes takes 2..8, got 1"),
         (("--mtp", "4", "--lanes", "9"), "--lanes takes 2..8, got 9"),
         (("--lanes", "4"), "--lanes needs --mtp"),
         (("--mtp", "4", "--lanes-stall-budget", "0.25"), "--lanes-stall-budget needs --lanes"),
         (("--mtp", "4", "--lanes-prefix-reuse"), "--lanes-prefix-reuse needs --lanes"),
+        (("--mtp", "4", "--lanes-conversations", "8"), "--lanes-conversations needs --lanes"),
+        (("--mtp", "4", "--lanes", "4", "--lanes-conversations", "65"), "--lanes-conversations takes 1..64, got 65"),
+        (("--mtp", "4", "--lanes", "4", "--lanes-conversations", "0"), "--lanes-conversations takes 1..64, got 0"),
     ):
         run = run_launcher(tmp_path, *common, *extra, "--validate-only")
         assert run.returncode == 2 and refusal in run.stderr and run.stdout == "", (extra, run.stderr)
@@ -174,6 +180,7 @@ def test_help_lists_the_lanes_and_ends_at_the_comment_block() -> None:
     run = run_launcher(MODEL_DIR, "--help")
     assert run.returncode == 2
     assert "--lanes B" in run.stderr and "--lanes-stall-budget S" in run.stderr and "--lanes-prefix-reuse" in run.stderr
+    assert "--lanes-conversations N" in run.stderr
     assert "combines with --mtp" in run.stderr and "not with --mtp" not in run.stderr
     assert run.stderr.rstrip().endswith("the model's own ttnn/ package never shadows ttnn.")
 

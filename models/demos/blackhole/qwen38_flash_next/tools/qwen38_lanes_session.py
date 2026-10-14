@@ -29,6 +29,11 @@ Greedy only (the lane body resolves by argmax; the sampled lanes form is a later
 (``gdn_rows_scan``) serves the lanes through its lanes form (its prefix states are allocated with the lane verify state,
 its dispatch is the registry's), so the referee chain and the lanes run the served default set, bitwise alike.
 
+The admission's import reads the traced chain's state on device (``mtp_lanes.import_lane_state`` with no host slot:
+the state packed and moved lane-ward in one segment, nothing crossing to the host), and its KV slabs only as far as
+the prompt reaches (the import chunks below the position: a 2,400-token prompt moves one 4,096-row chunk per QSA layer
+instead of the whole context).
+
 Prompt reuse (``prefix_reuse``, the server's ``--lanes-prefix-reuse``): between admissions nothing touches the traced
 chain's state, so its caches still hold the last admitted prompt.  An admission whose prompt shares at least
 ``reuse_min_tokens`` ids with that one prefills the shared part from position 0, takes the chain's prompt snapshot
@@ -38,13 +43,27 @@ a system prompt and tools then pay for them once.  The split sits on a 32-row ch
 includes the token after it (the MTP layer's last prefix row reads it), so a restore runs no 1-row step and repeats the
 capturing admission's arithmetic exactly; against a fresh prefill of the same prompt it is the single stream's
 ``forced-tail`` class (the slab and chunk groupings differ: equal to rounding, ``docs/PREFILL.md``).
+
+Conversation checkpoints (``conversations``, the server's ``--lanes-conversations N``): an admission whose ticket asks
+for one (a request with tools or a past assistant turn: an agent loop or a chat in progress) also saves the chain's
+whole state into one of ``N`` host checkpoints on its way through the prompt, at the last 32-row boundary that leaves
+the prefill's tail a chunk (``ttnn/lanes.Qwen38TTNNStateCheckpoints``: the pack families and the KV rows below the
+position).  The next turn of that conversation renders the same ids up to there and on, so its admission resumes:
+the checkpoint written back, the position set, only the turn's new ids prefilled (the reply, the tool results, the
+generation prompt).  A checkpoint must reach ``resume_margin`` ids past the shared-prefix snapshot to be preferred
+over it (the host round trip against a few chunk replays); the least recently used one is replaced, and a
+conversation's own older checkpoint first.  The restored state is the saved one bitwise, so a resumed admission
+repeats the saving admission's arithmetic from the checkpoint on.
 """
 
 from __future__ import annotations
 
+import itertools
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Sequence
+
+import torch
 
 import ttnn
 from ttnn.unsafe_allocation_tracker import UnsafeAllocationTracker
@@ -63,9 +82,9 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_lane_scheduler import
 from models.demos.blackhole.qwen38_flash_next.ttnn import gdn as gdn_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_lanes, mtp_v2
 from models.demos.blackhole.qwen38_flash_next.ttnn.lanes import (
-    Qwen38LaneHostPool,
     Qwen38LaneLayout,
     Qwen38TTNNLanePager,
+    Qwen38TTNNStateCheckpoints,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.layer import PLE_CHECKPOINT_LAYER
 
@@ -79,13 +98,18 @@ WARM_TOKEN_ID = 1  # any exact vocabulary id for the warm passes' rows
 # point) per 128-row chunk, or per four 32-row chunks, so the decoding lanes' passes can run between chunk groups.
 ADMISSION_EVENT_ROWS = LONG_CHUNK_ROWS
 # The admission's segments as ``between`` names them: an image prompt's images through the tower, the chunk groups
-# of the prefill, the forced last step and the row read, the eviction into the host slot; the import into the lane
-# ends the admission.
-ADMISSION_SEGMENTS = ("tower", "chunks", "prefilled", "evicted")
+# of the prefill, a conversation checkpoint saved on the way, the forced last step and the row read; the import into
+# the lane (the state packed and moved on device) ends the admission.
+ADMISSION_SEGMENTS = ("tower", "chunks", "checkpoint", "prefilled")
 # Prompt reuse: the fewest shared ids worth a snapshot (four 32-row chunks; a capture costs its admission one more
 # hand-off), and how an admission met the chain (``reuse_plan``).
 REUSE_MIN_TOKENS = 128
-REUSE_PLANS = ("fresh", "captured", "restored")
+REUSE_PLANS = ("fresh", "captured", "restored", "resumed")
+# Conversation checkpoints: the shortest prompt worth one, and how far past the shared-prefix snapshot a checkpoint
+# must reach to be resumed instead (its host round trip, about 40 ms for a few-thousand-token conversation, against
+# about 20 ms of chunk replays per 128 rows).
+CHECKPOINT_MIN_TOKENS = 512
+RESUME_MARGIN_TOKENS = 256
 
 
 class Qwen38LanesSessionError(RuntimeError):
@@ -106,6 +130,27 @@ class Qwen38LanePrefix:
         return len(self.key) - 1
 
 
+@dataclass(frozen=True)
+class Qwen38LaneCheckpoint(Qwen38LanePrefix):
+    """A conversation checkpoint: the chain's whole state after ``key[:-1]`` in host slot ``slot`` (the prefix's key
+    rule: its last id is the one the MTP layer's last row read), ``used`` its least-recently-used stamp."""
+
+    slot: int
+    used: int
+
+
+@dataclass(frozen=True)
+class Qwen38LanePlan:
+    """How an admission meets the chain (:func:`reuse_plan`): ``kind`` in REUSE_PLANS, ``start`` the position its
+    prefill starts from (the snapshot's or the checkpoint's; 0 for a fresh or capturing admission), ``capture`` where a
+    capturing admission takes the snapshot, ``checkpoint`` the one it resumes."""
+
+    kind: str
+    start: int = 0
+    capture: int | None = None
+    checkpoint: Qwen38LaneCheckpoint | None = None
+
+
 def shared_prefix(a: Sequence[int], b: Sequence[int]) -> int:
     """The count of leading ids ``a`` and ``b`` share."""
 
@@ -113,20 +158,61 @@ def shared_prefix(a: Sequence[int], b: Sequence[int]) -> int:
     return next((index for index in range(count) if a[index] != b[index]), count)
 
 
-def reuse_plan(
-    ids: Sequence[int], resident: Sequence[int], prefix: Qwen38LanePrefix | None, *, min_tokens: int
-) -> tuple[str, int]:
-    """How an admission of ``ids`` meets the chain: ``("restored", P)`` when ``ids`` start with the snapshot's key
-    (restore it, prefill ``ids[P:]``); ``("captured", L)`` when ``ids`` share more than ``min_tokens`` ids with
-    ``resident``, the prompt the chain's caches hold (prefill ``ids[:L]`` from position 0, snapshot there, prefill the
-    rest; L is the last multiple of 32 below the shared ids, so the snapshot's key is shared too); else
-    ``("fresh", 0)``."""
+def _extends(ids: Sequence[int], key: Sequence[int]) -> bool:
+    return len(ids) >= len(key) and tuple(ids[: len(key)]) == tuple(key)
 
-    if prefix is not None and tuple(ids[: len(prefix.key)]) == prefix.key:
-        return "restored", prefix.position
+
+def reuse_plan(
+    ids: Sequence[int],
+    resident: Sequence[int],
+    prefix: Qwen38LanePrefix | None,
+    *,
+    min_tokens: int,
+    checkpoints: Sequence[Qwen38LaneCheckpoint] = (),
+    margin: int = RESUME_MARGIN_TOKENS,
+) -> Qwen38LanePlan:
+    """How an admission of ``ids`` meets the chain: ``resumed`` from the longest checkpoint ``ids`` start with when it
+    reaches ``margin`` ids past the snapshot (or past position 0 without one); else ``restored`` from the snapshot
+    when ``ids`` start with its key (prefill ``ids[P:]``); else ``captured`` when ``ids`` share more than
+    ``min_tokens`` ids with ``resident``, the prompt the chain's caches hold (prefill ``ids[:L]`` from position 0,
+    snapshot there, prefill the rest; L is the last multiple of 32 below the shared ids, so the snapshot's key is
+    shared too); else ``fresh``."""
+
+    restorable = prefix.position if prefix is not None and _extends(ids, prefix.key) else None
+    resumable = max((c for c in checkpoints if _extends(ids, c.key)), key=lambda c: c.position, default=None)
+    if resumable is not None and resumable.position >= (restorable or 0) + margin:
+        return Qwen38LanePlan("resumed", resumable.position, checkpoint=resumable)
+    if restorable is not None:
+        return Qwen38LanePlan("restored", restorable)
     common = shared_prefix(ids, resident)
     split = (common - 1) // CHUNK_ROWS * CHUNK_ROWS if common else 0
-    return ("captured", split) if split >= min_tokens else ("fresh", 0)
+    return Qwen38LanePlan("captured", capture=split) if split >= min_tokens else Qwen38LanePlan("fresh")
+
+
+def checkpoint_position(length: int, start: int, *, floor: int) -> int | None:
+    """Where an admission of ``length`` ids saves its checkpoint: the last multiple of 32 that leaves at least
+    CHUNK_PREFILL_MIN_ROWS ids before the last one, so the rest of the prompt's prefill is a chunk and the key stops
+    short of the generation prompt (the next turn renders that spot as the past assistant turn: ``<think>\n`` there,
+    ``<think>\n\n</think>`` or the turn's reasoning next time), past the admission's ``start``; None below ``floor``
+    (or when no such position is past ``start``)."""
+
+    last = length - 1
+    position = last // CHUNK_ROWS * CHUNK_ROWS
+    if last - position < CHUNK_PREFILL_MIN_ROWS:
+        position -= CHUNK_ROWS
+    return position if position >= max(floor, start + CHUNK_ROWS) else None
+
+
+def _reuse_counts() -> dict[str, int]:
+    """The reuse counters: admissions by plan, the prompt ids restored or resumed, the checkpoints saved."""
+
+    return {**dict.fromkeys(REUSE_PLANS, 0), "restored_tokens": 0, "resumed_tokens": 0, "checkpoints_saved": 0}
+
+
+def _device_rows(tensor) -> list[torch.Tensor]:
+    """Every device's local of ``tensor`` on the host (the startup round trip's comparison)."""
+
+    return [ttnn.to_torch(local) for local in ttnn.get_device_tensors(tensor)]
 
 
 def _dram_view(mesh) -> dict[str, int]:
@@ -159,7 +245,16 @@ class Qwen38LanesSession:
     reuse_min_tokens: int = REUSE_MIN_TOKENS
     resident: tuple[int, ...] = ()
     prefix: Qwen38LanePrefix | None = None
-    reuse: dict[str, int] = field(default_factory=lambda: {**dict.fromkeys(REUSE_PLANS, 0), "restored_tokens": 0})
+    reuse: dict[str, int] = field(default_factory=lambda: _reuse_counts())
+    # Conversation checkpoints (module docstring): ``conversations`` host slots (0: none, nothing allocated), set
+    # before ``prepare``; the stores are allocated there, the records name what each slot holds.
+    conversations: int = 0
+    checkpoint_min_tokens: int = CHECKPOINT_MIN_TOKENS
+    resume_margin: int = RESUME_MARGIN_TOKENS
+    checkpoints: list[Qwen38LaneCheckpoint] = field(default_factory=list)
+    backbone_checkpoints: Any = None
+    alignment_checkpoints: Any = None
+    _stamps: Any = field(default_factory=itertools.count, repr=False)
     rows: int = field(init=False)
     chain: Any = None
     session: Any = None
@@ -167,8 +262,6 @@ class Qwen38LanesSession:
     mesh: Any = None
     backbone_pager: Any = None
     alignment_pager: Any = None
-    backbone_pool: Any = None
-    alignment_pool: Any = None
     verify: Any = None
     draft: Any = None
     traces: Any = None
@@ -187,9 +280,10 @@ class Qwen38LanesSession:
     # -- the warm hook: allocation and compile before any capture ------------------------------
 
     def prepare(self, chain) -> None:
-        """The traced chain's warm hook (after its warm pass, before its captures, misses allowed): the pagers and
-        host slots, the lane verify and draft states, the warm imports at every residue into every lane, the eager
-        lane passes.  Nothing of the chain's own state is changed."""
+        """The traced chain's warm hook (after its warm pass, before its captures, misses allowed): the pagers, the
+        conversation checkpoints' host slots and their round trip (``conversations``), the lane verify and draft
+        states, the warm imports at every residue into every lane (from the chain's state on device, the form an
+        admission runs), the eager lane passes.  Nothing of the chain's own state is changed."""
 
         if chain.mtp is None:
             raise Qwen38LanesSessionError("the lanes need an MTP chain (--mtp)")
@@ -225,10 +319,12 @@ class Qwen38LanesSession:
                 raise Qwen38LanesSessionError(f"{name} layout tensors {unallocated} are not allocated")
         self.backbone_pager = Qwen38TTNNLanePager(mesh, contract, backbone_layout)
         self.alignment_pager = Qwen38TTNNLanePager(mesh, contract, alignment_layout)
-        self.backbone_pool = Qwen38LaneHostPool(mesh, backbone_layout, 1)
-        self.alignment_pool = Qwen38LaneHostPool(mesh, alignment_layout, 1)
         ttnn.synchronize_device(mesh)
         self.dram["after_pagers"] = _dram_view(mesh)
+        if self.conversations:
+            checkpoints_started = self.clock_ns()
+            self._prepare_checkpoints(context)
+            self.warmup_ms["checkpoints"] = (self.clock_ns() - checkpoints_started) / 1e6
         self.verify = mtp_lanes.allocate_lane_verify_state(
             model,
             lanes=self.lanes,
@@ -240,10 +336,10 @@ class Qwen38LanesSession:
         ttnn.synchronize_device(mesh)
         self.dram["after_states"] = _dram_view(mesh)
         self.warmup_ms["allocate"] = (self.clock_ns() - started) / 1e6
-        # -- the warm imports: the generic state as the warm pass left it, at four consecutive positions into every lane
+        # -- the warm imports: the generic state as the warm pass left it, at four consecutive positions into every
+        # lane, read on device as an admission reads it (every import chunk: an admission writes those below its
+        # position)
         started = self.clock_ns()
-        self.backbone_pager.evict(0, self.backbone_pool.slots[0])
-        self.alignment_pager.evict(0, self.alignment_pool.slots[0])
         base = int(chain.state.position.read())
         gdn_layers = sum(1 for layer in model.layers if isinstance(layer.attention, gdn_module.Qwen38TTNNGDN))
         for shift in range(IMPORT_RESIDUES):
@@ -256,9 +352,9 @@ class Qwen38LanesSession:
                     position=position,
                     ple_context=None,
                     gdn_phases=[position % gdn_module.CONV_KERNEL_SIZE] * gdn_layers,
-                    backbone_slot=self.backbone_pool.slots[0],
+                    backbone_slot=None,
                     backbone_pager=self.backbone_pager,
-                    alignment_slot=self.alignment_pool.slots[0],
+                    alignment_slot=None,
                     alignment_pager=self.alignment_pager,
                 )
         ttnn.synchronize_device(mesh)
@@ -313,6 +409,44 @@ class Qwen38LanesSession:
         self.program_cache_entries["after_prepare"] = resident_decode.program_cache_count(mesh)
         self.dram["after_prepare"] = _dram_view(mesh)
         self.marker("after-lanes-prepare")
+
+    def _prepare_checkpoints(self, context: int) -> None:
+        """The conversation checkpoints' host slots and one round trip through slot 0 over the whole context (every
+        KV chunk's slice and write compiles here, under the open miss guard), checked bitwise on the backbone's first
+        KV cache and recurrent state and on the alignment layer's cache; slot 0's chunks are freed after."""
+
+        chunk_rows = mtp_lanes.kv_scratch_rows(context)
+        self.backbone_checkpoints = Qwen38TTNNStateCheckpoints(
+            self.backbone_pager, self.conversations, chunk_rows=chunk_rows
+        )
+        self.alignment_checkpoints = Qwen38TTNNStateCheckpoints(
+            self.alignment_pager, self.conversations, chunk_rows=chunk_rows
+        )
+        watched = {
+            "backbone kv[0]": self.backbone_pager.layout.kv[0],
+            "alignment kv[0]": self.alignment_pager.layout.kv[0],
+        }
+        if self.backbone_pager.layout.recurrent:
+            watched["backbone recurrent[0]"] = self.backbone_pager.layout.recurrent[0]
+        ttnn.synchronize_device(self.mesh)
+        before = {label: _device_rows(tensor) for label, tensor in watched.items()}
+        for store in (self.backbone_checkpoints, self.alignment_checkpoints):
+            store.save(0, context)
+            store.restore(0, context)
+            store.release(0)
+        ttnn.synchronize_device(self.mesh)
+        for label, tensor in watched.items():
+            for device, (expected, actual) in enumerate(zip(before[label], _device_rows(tensor), strict=True)):
+                bits = torch.int16 if expected.dtype == torch.bfloat16 else torch.int32
+                if not torch.equal(expected.view(bits), actual.view(bits)):
+                    raise Qwen38LanesSessionError(
+                        f"checkpoint round trip: {label} on device {device} differs after the restore: max abs "
+                        f"{float((actual.float() - expected.float()).abs().max())}"
+                    )
+        # Every slot's first chunk now: a conversation's first save allocates nothing on the serving path.
+        for store in (self.backbone_checkpoints, self.alignment_checkpoints):
+            for slot in range(self.conversations):
+                store.reserve(slot, 1)
 
     # -- the captures after the chain's --------------------------------------------------------
 
@@ -399,21 +533,24 @@ class Qwen38LanesSession:
             "admission": dict(self.admission),
             "prefix_reuse": (
                 None
-                if not self.prefix_reuse
+                if not (self.prefix_reuse or self.conversations)
                 else {
+                    "snapshot": self.prefix_reuse,
                     "min_tokens": self.reuse_min_tokens,
                     "snapshot_position": None if self.prefix is None else self.prefix.position,
+                    "conversations": self.conversations,
+                    "checkpoint_positions": sorted(record.position for record in self.checkpoints),
                     **self.reuse,
                 }
             ),
         }
 
     def forget(self) -> None:
-        """Start the reuse over (the startup pins): no records, so the next admission prefills from position 0, and no
-        counts.  The chain's state is unchanged."""
+        """Start the reuse over (the startup pins): no records, so the next admission prefills from position 0 and
+        resumes nothing, and no counts.  The chain's state and the checkpoints' host slots are unchanged."""
 
-        self.resident, self.prefix = (), None
-        self.reuse = {**dict.fromkeys(REUSE_PLANS, 0), "restored_tokens": 0}
+        self.resident, self.prefix, self.checkpoints = (), None, []
+        self.reuse = _reuse_counts()
 
     # -- the device protocol (the driver thread) ------------------------------------------------
 
@@ -422,20 +559,21 @@ class Qwen38LanesSession:
     ) -> Qwen38LaneAdmitted:
         """The request's prompt prefilled on the traced chain (the session's own prefill section: the reset, the
         chunked prefill of all but the last token when the prompt admits it, the last token forced, the model's next
-        token read from the row), the generic and alignment states evicted into the host slots, the image imported
-        into ``lane``.  An image prompt (``ticket.images``) runs its images through the resident tower first (the
-        ``"tower"`` segment) and prefills through the chunk driver with its rotary positions and feature rows, as
-        the single stream does; the lane takes the prompt's rotary shift at the import (the decode shift the
-        single stream sets at its hand-off), 0 for text.  With ``prefix_reuse`` a text prompt meets the chain by
-        :func:`reuse_plan`: the snapshot restored instead of the reset, or the shared ids prefilled and the snapshot
-        taken before the rest; ``prefill["reuse"]`` names the plan and ``prefix_reused`` the ids not prefilled.
+        token read from the row), then imported into ``lane`` from the chain's state on device (nothing crosses to the
+        host; the KV slabs below the position only).  An image prompt (``ticket.images``) runs its images through the
+        resident tower first (the ``"tower"`` segment) and prefills through the chunk driver with its rotary positions
+        and feature rows, as the single stream does; the lane takes the prompt's rotary shift at the import (the
+        decode shift the single stream sets at its hand-off), 0 for text.  A text prompt meets the chain by
+        :func:`reuse_plan` (``prefix_reuse``, ``conversations``): the snapshot restored or a checkpoint resumed instead
+        of the reset, the snapshot taken and a checkpoint saved (``ticket.checkpoint``) on the way;
+        ``prefill["reuse"]`` names the plan and ``prefix_reused`` the ids not prefilled.
 
-        ``between`` is the scheduler's yield point between the admission's device segments: called after the
-        tower (``"tower"``), after every 128 prompt rows of the chunked prefill (``"chunks"``, with the rows consumed
-        and the rows of the prefill), after the forced last step and its row read (``"prefilled"``) and after the
-        eviction (``"evicted"``), each time with the device idle and every chunk input for the next segment prepared
-        but not uploaded; it returns the seconds it spent (the decoding lanes' passes), which the segment records
-        below exclude.  None: the admission runs whole (the single-stream event cadence)."""
+        ``between`` is the scheduler's yield point between the admission's device segments: called after the tower
+        (``"tower"``), after every 128 prompt rows of the chunked prefill (``"chunks"``, with the rows consumed and the
+        rows of the prefill), after a checkpoint's save (``"checkpoint"``) and after the forced last step and its row
+        read (``"prefilled"``), each time with the device idle and every chunk input for the next segment prepared but
+        not uploaded; it returns the seconds it spent (the decoding lanes' passes), which the segment records below
+        exclude.  None: the admission runs whole (the single-stream event cadence)."""
 
         session, chain, model = self.session, self.chain, self.model
         if session is None or self.lane_chain is None:
@@ -477,24 +615,52 @@ class Qwen38LanesSession:
                 raise Qwen38LanesSessionError(f"the chunked prefill stopped: {result.stopped!r}")
             chunked.append(result)
 
-        # Prompt reuse (module docstring): an image prompt always prefills from position 0, and so does every prompt
-        # of a chain without the chunk trace.  The records describe the chain's caches: they are dropped until this
+        # The plan (module docstring): an image prompt always prefills from position 0, and so does every prompt of a
+        # chain without the chunk trace.  The records describe the chain's caches: they are dropped until this
         # admission's prefill has ended.
-        plan, split = "fresh", 0
-        if self.prefix_reuse and vision is None and session.prefill_mode == "chunked":
-            plan, split = reuse_plan(ids, self.resident, self.prefix, min_tokens=self.reuse_min_tokens)
+        text = vision is None and session.prefill_mode == "chunked"
+        plan = Qwen38LanePlan("fresh")
+        if text and (self.prefix_reuse or self.checkpoints):
+            plan = reuse_plan(
+                ids,
+                self.resident,
+                self.prefix if self.prefix_reuse else None,
+                min_tokens=self.reuse_min_tokens if self.prefix_reuse else len(ids) + 1,
+                checkpoints=self.checkpoints,
+                margin=self.resume_margin,
+            )
         prefix, captured = self.prefix, None
         self.resident, self.prefix = (), None
-        if plan == "restored":
+        seconds_resume = seconds_checkpoint = 0.0
+        if plan.kind == "restored":
             session.snapshot = Qwen38PromptSnapshot(prefix.key[:-1], prefix.ple_context)
             session._restore_prompt_snapshot()  # the chain's state at the split: position, phases, n-gram context
+        elif plan.kind == "resumed":
+            seconds_resume = self._resume(plan.checkpoint)
         else:
             session.reset()
-        if plan == "captured":
-            prefill_chunks(ids[:split], ids[split], None)
-            chain.capture_prompt_snapshot(split)
-            captured = Qwen38LanePrefix(tuple(ids[: split + 1]), session.ple_context)
-        suffix = list(ids[split:])
+        # The stops on the way through the prompt (32-row boundaries, so every stretch between them is whole chunks):
+        # the snapshot a capturing admission takes, the checkpoint a conversation's admission saves.
+        save_at = None
+        if text and self.conversations and ticket.checkpoint:
+            # Past the snapshot this prompt will start with by a margin (else the snapshot serves its next turn).
+            anchor = plan.capture if plan.kind == "captured" else None
+            if anchor is None and prefix is not None and _extends(ids, prefix.key):
+                anchor = prefix.position
+            floor = max(self.checkpoint_min_tokens, -1 if anchor is None else anchor + self.resume_margin)
+            save_at = checkpoint_position(len(ids), plan.start, floor=floor)
+        at = plan.start
+        for stop in sorted({stop for stop in (plan.capture, save_at) if stop is not None}):
+            prefill_chunks(ids[at:stop], ids[stop], None)
+            if stop == plan.capture:
+                chain.capture_prompt_snapshot(stop)
+                captured = Qwen38LanePrefix(tuple(ids[: stop + 1]), session.ple_context)
+            if stop == save_at:
+                seconds_checkpoint = self._save_checkpoint(ids, stop)
+                if between is not None:
+                    spent += float(between("checkpoint", stop, len(ids)))
+            at = stop
+        suffix = list(ids[at:])
         if vision is not None and (
             session.prefill_mode != "chunked" or session.chunk_prefill_rows(len(suffix) - 1) < CHUNK_PREFILL_MIN_ROWS
         ):
@@ -512,25 +678,24 @@ class Qwen38LanesSession:
             raise Qwen38LanesSessionError(f"device position {position} after prefilling {len(ids)} tokens")
         if vision is None:
             self.resident = tuple(ids)
-            self.prefix = prefix if plan == "restored" else captured
-        if self.prefix_reuse:
-            self.reuse[plan] += 1
-            self.reuse["restored_tokens"] += split if plan == "restored" else 0
+            if plan.kind == "captured":
+                self.prefix = captured
+            elif prefix is not None and _extends(ids, prefix.key):
+                self.prefix = prefix  # the caches below it hold its ids (restored, or a checkpoint of them resumed)
+        if self.prefix_reuse or self.conversations:
+            self.reuse[plan.kind] += 1
+            if plan.kind in ("restored", "resumed"):
+                self.reuse[f"{plan.kind}_tokens"] += plan.start
         ple_context = session.ple_context
         prefilled = self.clock_ns()
         if between is not None:
             between("prefilled", len(ids), len(ids))
-        evict_started = self.clock_ns()
-        self.backbone_pager.evict(0, self.backbone_pool.slots[0])
-        self.alignment_pager.evict(0, self.alignment_pool.slots[0])
-        evicted = self.clock_ns()
-        if between is not None:
-            between("evicted", len(ids), len(ids))
         import_started = self.clock_ns()
         gdn_layers = sum(1 for layer in model.layers if isinstance(layer.attention, gdn_module.Qwen38TTNNGDN))
         # The lane's rotary shift: the prompt's (the chunk driver's hand-off set the same on the traced chain; the
         # prompt ends in text after its last image, so the shift is within the position's block start), 0 for text.
         rope_shift = 0 if vision is None else min(vision.positions.shift_at(position), position & ~3)
+        # From the chain's state on device, in this one segment: no trace replays between the pack and its use.
         mtp_lanes.import_lane_state(
             model,
             self.verify,
@@ -538,20 +703,22 @@ class Qwen38LanesSession:
             position=position,
             ple_context=ple_context,
             gdn_phases=[position % gdn_module.CONV_KERNEL_SIZE] * gdn_layers,
-            backbone_slot=self.backbone_pool.slots[0],
+            backbone_slot=None,
             backbone_pager=self.backbone_pager,
-            alignment_slot=self.alignment_pool.slots[0],
+            alignment_slot=None,
             alignment_pager=self.alignment_pager,
             rope_shift=rope_shift,
+            kv_rows=position,
         )
         ttnn.synchronize_device(self.mesh)
         imported = self.clock_ns()
         timings = [result.timing for result in chunked]
-        seconds = {
-            "prefill": (prefilled - started) / 1e9 - spent,
-            "evict": (evicted - evict_started) / 1e9,
-            "import": (imported - import_started) / 1e9,
-        }
+        seconds = {"prefill": (prefilled - started) / 1e9 - spent - seconds_resume - seconds_checkpoint}
+        if plan.kind == "resumed":
+            seconds["resume"] = seconds_resume
+        if save_at is not None:
+            seconds["checkpoint"] = seconds_checkpoint
+        seconds["import"] = (imported - import_started) / 1e9
         if vision is not None:
             seconds = {"tower": tower_seconds, **seconds}
         return Qwen38LaneAdmitted(
@@ -567,11 +734,61 @@ class Qwen38LanesSession:
                 "chunks": sum(timing.chunks for timing in timings),
                 "long_chunks": sum(timing.long_chunks for timing in timings),
                 "slabs": sum(timing.slabs for timing in timings),
-                "reuse": plan,
-                "prefix_reused": split if plan == "restored" else 0,
-                "prefix_captured": split if plan == "captured" else 0,
+                "reuse": plan.kind,
+                "prefix_reused": plan.start,
+                "prefix_captured": plan.capture or 0,
+                "checkpoint": save_at or 0,
             },
         )
+
+    def _resume(self, checkpoint: Qwen38LaneCheckpoint) -> float:
+        """``checkpoint`` written back into the chain's state (the backbone and the alignment layer), the position, ring
+        phases and n-gram context set, the session's record following it; the seconds it took."""
+
+        started = self.clock_ns()
+        position, session, chain = checkpoint.position, self.session, self.chain
+        self.backbone_checkpoints.restore(checkpoint.slot, position)
+        self.alignment_checkpoints.restore(checkpoint.slot, position)
+        self.model.set_generic_position(chain.state, position)
+        if chain.mtp is not None:
+            chain.mtp.step_written = False
+        ttnn.synchronize_device(self.mesh)
+        actual = int(chain.position())
+        if actual != position:
+            raise Qwen38LanesSessionError(
+                f"resumed checkpoint left the device position at {actual}, expected {position}"
+            )
+        session.committed = list(checkpoint.key[:-1])
+        session.ple_context = checkpoint.ple_context
+        session.committed_vision = ()
+        session.snapshot = None
+        session.last_finish = None
+        session.row_unconsumed = False
+        session.row_token = None
+        self.checkpoints = [
+            replace(record, used=next(self._stamps)) if record is checkpoint else record for record in self.checkpoints
+        ]
+        return (self.clock_ns() - started) / 1e9
+
+    def _save_checkpoint(self, ids: Sequence[int], position: int) -> float:
+        """The chain's state at ``position`` (the ids below it consumed) into a host slot: this conversation's own (a
+        checkpoint ``ids`` extend), else a free one, else the least recently used; the seconds it took."""
+
+        own = [record for record in self.checkpoints if _extends(ids, record.key)]
+        held = {record.slot for record in self.checkpoints}
+        if own:
+            slot = max(own, key=lambda record: record.position).slot
+        elif len(held) < self.conversations:
+            slot = min(set(range(self.conversations)) - held)
+        else:
+            slot = min(self.checkpoints, key=lambda record: record.used).slot
+        started = self.clock_ns()
+        self.backbone_checkpoints.save(slot, position)
+        self.alignment_checkpoints.save(slot, position)
+        record = Qwen38LaneCheckpoint(tuple(ids[: position + 1]), self.session.ple_context, slot, next(self._stamps))
+        self.checkpoints = [other for other in self.checkpoints if other.slot != slot] + [record]
+        self.reuse["checkpoints_saved"] += 1
+        return (self.clock_ns() - started) / 1e9
 
     def write_counts(self, counts: Sequence[int]) -> None:
         mtp_lanes.write_lane_accepted(self.model, self.verify, list(counts))

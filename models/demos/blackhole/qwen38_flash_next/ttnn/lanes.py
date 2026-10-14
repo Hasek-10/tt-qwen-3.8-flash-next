@@ -612,6 +612,15 @@ class Qwen38TTNNLanePager:
         else:
             self._unpack_body(lane)
 
+    def pack(self, lane) -> None:
+        """Lane ``lane``'s image into the pack buffers on device, nothing moved to the host: the device half of
+        :meth:`evict` for a consumer in the same segment (the lanes admission's import).  The packs are corruptible:
+        a trace replay between this pack and its consumer may overwrite them."""
+
+        lane = _exact_index(lane, self.layout.lanes, label="packed lane")
+        with ttnn.corruptible_allocation_scope(self.mesh_device):
+            self._run_pack(lane)
+
     def evict(self, lane, slot: Qwen38LaneHostSlot) -> Qwen38LaneMoveTiming:
         """Lane ``lane``'s image into ``slot``: the pack (trace replay or eager body), the six small transfers, the
         KV slabs.  The lane's device state is left as it is (a re-admission or a masked reset overwrites it)."""
@@ -707,6 +716,130 @@ class Qwen38TTNNLanePager:
             (done - trace_done) / 1e6,
             (done - started) / 1e6,
         )
+
+
+# ---------------------------------------------------------------- state checkpoints on the host
+
+
+class Qwen38TTNNStateCheckpoints:
+    """``slots`` checkpoints of a 1-lane layout (the lanes server's generic state, or its MTP alignment layer's) on
+    the host, the KV bounded by the checkpoint's position.  A checkpoint holds the pager's pack families whole (the
+    packs copied out, as :meth:`Qwen38TTNNLanePager.evict` copies them) and every KV cache's rows below the position
+    in ``chunk_rows``-row chunks (host chunks allocated on first use).  :meth:`restore` writes them back (the packs
+    unpacked into the layout, the chunks at their rows) and leaves the rows at and past the position as they are.
+    Every op is data movement, so the restored state is bitwise the saved one below the position; the position, the
+    GDN ring phases and the n-gram context are the caller's (``model.set_generic_position``).  Synchronous, eager,
+    between two segments of the caller's (the packs are corruptible: no trace replay inside a save or a restore)."""
+
+    def __init__(self, pager: Qwen38TTNNLanePager, slots: int, *, chunk_rows: int) -> None:
+        if pager.layout.lanes != 1:
+            raise ValueError(f"state checkpoints hold a 1-lane layout, got {pager.layout.lanes} lanes")
+        if isinstance(slots, bool) or type(slots) is not int or slots < 1:
+            raise ValueError(f"checkpoint slots must be a positive int, got {slots!r}")
+        context = pager.layout.allocated_context
+        if isinstance(chunk_rows, bool) or type(chunk_rows) is not int or chunk_rows < 1 or context % chunk_rows:
+            raise ValueError(f"checkpoint chunk rows must divide the context {context}, got {chunk_rows!r}")
+        self.pager, self.slots, self.chunk_rows = pager, slots, chunk_rows
+        mesh = pager.mesh_device
+        self.packs = tuple(
+            {name: family.allocate(mesh, device=False) for name, family in pager.families.items() if name != "kv"}
+            for _ in range(slots)
+        )
+        kv = pager.families.get("kv")
+        self.kv_family = (
+            None
+            if kv is None
+            else Qwen38LaneFamily("kv", (1, 1, chunk_rows, KV_WIDTH), kv.shard_dim, kv.placement, kv.dtype, kv.layout)
+        )
+        self.kv_chunks: dict[tuple[int, int, int], Any] = {}  # (slot, layer, chunk) -> host tensor
+
+    def chunks(self, rows: int) -> int:
+        """The KV chunks of a checkpoint at position ``rows``: the rows below it, rounded up to a whole chunk."""
+
+        context = self.pager.layout.allocated_context
+        if isinstance(rows, bool) or type(rows) is not int or not 0 < rows <= context:
+            raise ValueError(f"checkpoint rows must be an int in [1, {context}], got {rows!r}")
+        return -(-rows // self.chunk_rows)
+
+    def _host_chunk(self, slot: int, layer: int, chunk: int):
+        key = (slot, layer, chunk)
+        if key not in self.kv_chunks:
+            self.kv_chunks[key] = self.kv_family.allocate(self.pager.mesh_device, device=False)
+        return self.kv_chunks[key]
+
+    def reserve(self, slot: int, chunks: int) -> None:
+        """Slot ``slot``'s first ``chunks`` host KV chunks of every layer allocated now (a save past them allocates the
+        rest on first use, about 16 MB per chunk and layer on a 4-device mesh)."""
+
+        slot = _exact_index(slot, self.slots, label="checkpoint slot")
+        for layer in range(len(self.pager.layout.kv)):
+            for chunk in range(chunks):
+                self._host_chunk(slot, layer, chunk)
+
+    def release(self, slot: int) -> None:
+        """Slot ``slot``'s host KV chunks freed (a later save allocates what it needs again)."""
+
+        for key in [key for key in self.kv_chunks if key[0] == slot]:
+            del self.kv_chunks[key]
+
+    def save(self, slot: int, rows: int) -> float:
+        """The layout's state into ``slot``: the packs whole and the KV rows below ``rows``, one cache's chunks on
+        device at a time (the transient slices stay one layer's, whatever the context).  Returns the wall ms."""
+
+        slot, chunks, pager = _exact_index(slot, self.slots, label="checkpoint slot"), self.chunks(rows), self.pager
+        started = time.perf_counter_ns()
+        with ttnn.corruptible_allocation_scope(pager.mesh_device):
+            pager._run_pack(0)
+            pager._fence()
+            for name, pack in pager.packs.items():
+                ttnn.copy_device_to_host_tensor(pack, self.packs[slot][name], blocking=False, cq_id=pager.cq_id)
+            for layer, cache in enumerate(pager.layout.kv):
+                parts = []
+                for chunk in range(chunks):
+                    start = chunk * self.chunk_rows
+                    part = slice_owned(cache, (0, 0, start, 0), (1, 1, start + self.chunk_rows, KV_WIDTH))
+                    parts.append(part)
+                    host = self._host_chunk(slot, layer, chunk)
+                    ttnn.copy_device_to_host_tensor(part, host, blocking=False, cq_id=pager.cq_id)
+                pager._fence()
+                _deallocate(*parts)
+            pager._fence()  # the packs' copies, when the layout holds no KV
+        return (time.perf_counter_ns() - started) / 1e6
+
+    def restore(self, slot: int, rows: int) -> float:
+        """``slot``'s state back into the layout: the packs unpacked, the KV chunks below ``rows`` written at their
+        rows.  Returns the wall ms."""
+
+        slot, chunks, pager = _exact_index(slot, self.slots, label="checkpoint slot"), self.chunks(rows), self.pager
+        missing = [
+            (layer, chunk)
+            for layer in range(len(pager.layout.kv))
+            for chunk in range(chunks)
+            if (slot, layer, chunk) not in self.kv_chunks
+        ]
+        if missing:
+            raise RuntimeError(f"checkpoint slot {slot} holds no KV for (layer, chunk) {missing[:4]}")
+        started = time.perf_counter_ns()
+        with ttnn.corruptible_allocation_scope(pager.mesh_device):
+            for name, pack in pager.packs.items():
+                ttnn.copy_host_to_device_tensor(self.packs[slot][name], pack, cq_id=pager.cq_id)
+            pager._fence()
+            pager._run_unpack(0)
+            for layer, cache in enumerate(pager.layout.kv):
+                for chunk in range(chunks):
+                    part = ttnn.to_device(
+                        self.kv_chunks[(slot, layer, chunk)], pager.mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG
+                    )
+                    _landed(
+                        ttnn.experimental.deepseek_prefill.update_padded_kv_cache(
+                            cache, part, 0, 0, 1, chunk * self.chunk_rows, qsa_module.STAGING_AXIS
+                        ),
+                        cache,
+                        f"checkpoint kv[{layer}] chunk {chunk} write",
+                    )
+                    _deallocate(part)
+            pager._fence()
+        return (time.perf_counter_ns() - started) / 1e6
 
 
 # ---------------------------------------------------------------- the helper thread

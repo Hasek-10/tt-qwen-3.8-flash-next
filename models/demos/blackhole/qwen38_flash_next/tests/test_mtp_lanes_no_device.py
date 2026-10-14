@@ -26,6 +26,7 @@ single-lane calls -- the per-lane bitwise property the single-chip forms test me
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import itertools
 from pathlib import Path
@@ -79,6 +80,7 @@ from models.demos.blackhole.qwen38_flash_next.tests.test_mtp_v2_step5_verify_no_
     make_verify_fake,
 )
 from models.demos.blackhole.qwen38_flash_next.tools.mtp_v2_verify_reference import accept_select
+from models.demos.blackhole.qwen38_flash_next.ttnn import contracts as contracts_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import embedding as embedding_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import final_mixer as final_mixer_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import gdn as gdn_module
@@ -1312,6 +1314,183 @@ def test_qsa_lane_import_lands_the_kv_slab_the_blocks_and_the_raw_history_in_one
         )
         == 0
     )
+
+
+@pytest.mark.parametrize("rows,chunks", ((1, 1), (64, 1), (65, 2), (200, 4), (256, 4), (0, 1)))
+def test_a_bounded_kv_slab_writes_only_the_chunks_below_the_position(fake, rows, chunks):
+    """An admission at position P moves the import chunks holding rows 0 .. P - 1 and nothing past them: the lane's
+    rows beyond keep what they held (never read before the lane writes them)."""
+
+    _install_admission_ops(fake)
+    lanes, lane, context, scratch = 4, 2, 256, 64
+    cache = FakeTensor(
+        [torch.full((1, 1, lanes * context + scratch, 512), 3.0, dtype=torch.bfloat16) for _ in range(TP)],
+        BF16,
+        ROW_MAJOR,
+        1,
+    )
+    slab = FakeTensor([_bf16(1, 1, context, 512) for _ in range(TP)], BF16, ROW_MAJOR, 1)
+    original = mtp_lanes.kv_scratch_rows
+    mtp_lanes.kv_scratch_rows = lambda allocated_context: scratch  # the fake context's import chunk
+    try:
+        mtp_lanes.write_kv_slab_lane(cache, slab, lane, context, label="test", rows=rows)
+    finally:
+        mtp_lanes.kv_scratch_rows = original
+    written = chunks * scratch
+    for d in range(TP):
+        region = cache.torch_shards()[d][0, 0, lane * context : (lane + 1) * context]
+        assert torch.equal(region[:written], slab.torch_shards()[d][0, 0, :written])
+        assert torch.equal(region[written:], torch.full_like(region[written:], 3.0))
+    with pytest.raises(ValueError, match="KV rows must be an int"):
+        mtp_lanes.write_kv_slab_lane(cache, slab, lane, context, label="test", rows=context + 1)
+
+
+@pytest.mark.parametrize("position", (5, 100))
+def test_qsa_lane_import_from_the_device_reads_the_generic_cache_itself(fake, position):
+    """With no host slot the KV slab comes straight from the pager's layout (the generic state's own cache): the same
+    rows land in the lane as through a host slot, bounded by ``kv_rows``; nothing touches the host."""
+
+    _install_admission_ops(fake)
+    module = _qsa_module(fake.ttnn)
+    stream = _Stream(seed=500 + position)
+    generic, verify_b1 = module.allocate_generic_state(), module.allocate_verify_state()
+    _seed_caches(module, fake.ttnn, stream, generic, verify_b1, position)
+    pager = SimpleNamespace(
+        layout=SimpleNamespace(kv=(generic.packed_kv_cache,)),
+        packs={
+            "compressed": _pack(generic.compressed_index_cache.torch_shards(), BF16, TILE),
+            "ring": _pack(generic.raw_key_ring.torch_shards(), BF16, TILE),
+        },
+        kv_stagings=(),  # unused without a slot
+    )
+    lanes, lane = 4, 1
+    lane_state = module.allocate_lane_state(lanes, kv_scratch_rows=mtp_lanes.kv_scratch_rows(CONTEXT))
+    lane_verify = module.allocate_lane_verify_state(lanes)
+    for target in lane_state.packed_kv_cache.locals:
+        target.fill_(3.0)
+    mtp_lanes.import_qsa_lane(
+        lane_state,
+        lane_verify,
+        pager,
+        None,
+        0,
+        position=position,
+        lane=lane,
+        allocated_context=CONTEXT,
+        kv_rows=position,
+    )
+    chunk = mtp_lanes.kv_scratch_rows(CONTEXT)
+    written = -(-position // chunk) * chunk
+    for d in range(TP):
+        cache = lane_state.packed_kv_cache.torch_shards()[d][0, 0]
+        region = cache[lane * CONTEXT : (lane + 1) * CONTEXT]
+        assert torch.equal(region[:written], generic.packed_kv_cache.torch_shards()[d][0, 0, :written])
+        assert torch.equal(region[written:], torch.full_like(region[written:], 3.0))
+    assert generic.packed_kv_cache.alive  # the source is the state, never released
+
+
+def _checkpoint_pager(fake, context: int, layers: int):
+    """A 1-lane pager over fake tensors: ``layers`` KV caches and one recurrent family packed / unpacked whole."""
+
+    torch.manual_seed(context + layers)
+    caches = tuple(
+        FakeTensor([_bf16(1, 1, context, 512) for _ in range(TP)], BF16, ROW_MAJOR, 1) for _ in range(layers)
+    )
+    recurrent = FakeTensor([torch.randn(1, 12, 128, 128) for _ in range(TP)], FP32, TILE, 1)
+    pack = FakeTensor([torch.zeros(1, 12, 128, 128) for _ in range(TP)], FP32, TILE, 1)
+
+    def run_pack(lane):
+        for target, source in zip(pack.locals, recurrent.locals):
+            target.copy_(source)
+
+    def run_unpack(lane):
+        for target, source in zip(recurrent.locals, pack.locals):
+            target.copy_(source)
+
+    kv_family = lanes_module.Qwen38LaneFamily(
+        "kv", (1, 1, context, 512), 1, contracts_module.TensorPlacement.KV_PAIR_GROUPED, BF16, ROW_MAJOR, layers
+    )
+    recurrent_family = SimpleNamespace(
+        allocate=lambda mesh, device: FakeTensor([torch.zeros(1, 12, 128, 128) for _ in range(TP)], FP32, TILE, 1)
+    )
+    return SimpleNamespace(
+        layout=SimpleNamespace(lanes=1, allocated_context=context, kv=caches),
+        families={"kv": kv_family, "recurrent": recurrent_family},
+        packs={"recurrent": pack},
+        mesh_device="mesh",
+        cq_id=0,
+        _run_pack=run_pack,
+        _run_unpack=run_unpack,
+        _fence=lambda: None,
+        recurrent=recurrent,
+    )
+
+
+def _install_host_copies(fake, monkeypatch) -> None:
+    def to_host(device, host, blocking=True, cq_id=0):
+        for target, source in zip(host.locals, device.torch_shards()):
+            target.copy_(source)
+
+    def to_device(host, device, cq_id=0):
+        for target, source in zip(device.locals, host.torch_shards()):
+            target.copy_(source)
+
+    fake.ttnn.copy_device_to_host_tensor = to_host
+    fake.ttnn.copy_host_to_device_tensor = to_device
+    fake.ttnn.to_device = lambda host, mesh, memory_config=None: FakeTensor(
+        [x.clone() for x in host.torch_shards()], host.dtype, host.layout
+    )
+    fake.ttnn.corruptible_allocation_scope = lambda mesh: contextlib.nullcontext()
+    monkeypatch.setattr(
+        lanes_module.Qwen38LaneFamily,
+        "allocate",
+        lambda self, mesh, device: FakeTensor(
+            [torch.zeros(self.local_shape, dtype=self.dtype.torch) for _ in range(TP)], self.dtype, self.layout
+        ),
+    )
+
+
+@pytest.mark.parametrize("context,chunk_rows,rows", ((256, 64, 100), (256, 64, 256), (128, 128, 5)))
+def test_state_checkpoints_restore_the_packs_and_the_kv_rows_below_the_position_bitwise(
+    fake, monkeypatch, context, chunk_rows, rows
+):
+    """A conversation checkpoint: the packs whole and every cache's rows below the position in chunks to the host;
+    after other prompts overwrote the state, the restore brings back exactly those (the chunks rounding the position
+    up) and leaves the rest; a slot without the chunks refuses; the whole-context chunk is an owned copy, never the
+    cache."""
+
+    _install_admission_ops(fake)
+    _install_host_copies(fake, monkeypatch)
+    pager = _checkpoint_pager(fake, context, layers=2)
+    store = lanes_module.Qwen38TTNNStateCheckpoints(pager, 3, chunk_rows=chunk_rows)
+    saved_kv = [[x.clone() for x in cache.torch_shards()] for cache in pager.layout.kv]
+    saved_recurrent = [x.clone() for x in pager.recurrent.locals]
+    store.save(2, rows)
+    assert all(cache.alive for cache in pager.layout.kv)
+    chunks = -(-rows // chunk_rows)
+    assert sorted(key for key in store.kv_chunks if key[0] == 2) == [(2, l, c) for l in range(2) for c in range(chunks)]
+    for cache in pager.layout.kv:  # other prompts' prefills
+        for local in cache.locals:
+            local.fill_(7.0)
+    for local in pager.recurrent.locals:
+        local.fill_(9.0)
+    store.restore(2, rows)
+    covered = chunks * chunk_rows
+    for cache, expected in zip(pager.layout.kv, saved_kv):
+        for actual, before in zip(cache.torch_shards(), expected):
+            assert torch.equal(actual[0, 0, :covered], before[0, 0, :covered])
+            assert torch.equal(actual[0, 0, covered:], torch.full_like(actual[0, 0, covered:], 7.0))
+    assert all(torch.equal(a, b) for a, b in zip(pager.recurrent.locals, saved_recurrent))
+    with pytest.raises(RuntimeError, match="holds no KV"):
+        store.restore(1, rows)
+    with pytest.raises(ValueError, match="checkpoint rows"):
+        store.save(0, context + 1)
+    store.reserve(1, 2)
+    assert sum(1 for key in store.kv_chunks if key[0] == 1) == 2 * 2
+    store.release(1)
+    assert not any(key[0] == 1 for key in store.kv_chunks)
+    with pytest.raises(ValueError, match="1-lane layout"):
+        lanes_module.Qwen38TTNNStateCheckpoints(SimpleNamespace(layout=SimpleNamespace(lanes=2)), 1, chunk_rows=64)
 
 
 @pytest.mark.parametrize("lane,context", ((0, None), (2, (11, 7)), (3, (95859, 2))))

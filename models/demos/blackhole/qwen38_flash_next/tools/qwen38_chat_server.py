@@ -147,6 +147,9 @@ HEARTBEAT_SECONDS = 30.0
 # A socket write that makes no progress for this long (a streaming reader that stopped reading) raises, so the device
 # loop ends the request as "disconnected" instead of blocking in sendall with the device held.
 SOCKET_TIMEOUT_SECONDS = 60.0
+# --lanes-conversations: the most conversation checkpoints the host keeps (each about 0.2 GB plus 0.2 GB per 4,096
+# prompt tokens on the 4-device mesh).
+LANES_CONVERSATIONS_MAX = 64
 # The stop signal waits this long for the request in flight to end at its next poll and release the device before
 # the chain is released; the launchers' timeout --kill-after is 60 s.
 DRAIN_SECONDS = 30.0
@@ -501,11 +504,15 @@ def parse_chat_request(
     }
 
 
-def _usage(prompt_tokens: int, completion_tokens: int, queue_wait: float) -> dict[str, Any]:
+def _usage(prompt_tokens: int, completion_tokens: int, queue_wait: float, cached_tokens: int = 0) -> dict[str, Any]:
+    """OpenAI's usage object; ``cached_tokens`` (``prompt_tokens_details``, OpenAI's form of a prompt cache hit) are
+    the prompt ids the request did not prefill (``prefix_reused``: a restored snapshot or a resumed checkpoint)."""
+
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
+        "prompt_tokens_details": {"cached_tokens": cached_tokens},
         "queue_wait_seconds": round(queue_wait, 4),
     }
 
@@ -1426,7 +1433,9 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 _log("evidence_write_failed", request_id=request_id, error=f"{type(error).__name__}: {error}")
             except OSError:
                 pass
-        usage = _usage(completion.prompt_tokens, len(completion.token_ids), queue_wait)
+        usage = _usage(
+            completion.prompt_tokens, len(completion.token_ids), queue_wait, int(extension.get("prefix_reused") or 0)
+        )
         if completion.finish_reason == "disconnected":
             _log(
                 "client_disconnected",
@@ -1495,6 +1504,10 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
         next pass boundary (the ticket's cancel).  No device call on this thread."""
 
         scheduler = self.server.lanes
+        # A conversation likely to come back for another turn: an agent's (tools) or a chat in progress.
+        conversation = bool(request["tools"]) or any(
+            message.get("role") == "assistant" for message in request["messages"]
+        )
         ticket = Qwen38LaneTicket(
             request_id=request_id,
             prompt_ids=list(prompt_ids),
@@ -1505,6 +1518,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             # admission (the "tower" segment) and prefills with the feature rows; the lane takes the prompt's shift.
             images=list(request.get("images") or ()),
             vision_positions=request.get("vision_positions"),
+            checkpoint=conversation,
         )
         try:
             scheduler.submit(ticket)
@@ -1681,9 +1695,11 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 "forced_think_end_inside_pass": 0 if ticket.stream is None else ticket.stream.forced_inside,
                 "forced_think_end_on_last_token": 0 if ticket.stream is None else ticket.stream.forced_last,
                 "admitted_after_seconds": round(admitted - ticket.submitted, 4),
+                "prefill_reuse": ticket.prefill.get("reuse"),
+                "checkpoint": ticket.prefill.get("checkpoint") or None,
             },
         }
-        usage = _usage(len(prompt_ids), consumed, ticket.queue_wait)
+        usage = _usage(len(prompt_ids), consumed, ticket.queue_wait, reused)
         try:
             append_phase_record(
                 self.server.ledger,
@@ -2211,14 +2227,13 @@ def replay_prefix_reuse(
     it repeats the capture's arithmetic) and both must match the CPU record 96/96; whether they equal the
     single-stream replay is reported (the split's numerics class).  ``require_gate`` refuses a miss."""
 
-    from models.demos.blackhole.qwen38_flash_next.tools.qwen38_lanes_session import REUSE_PLANS
-
+    plans = ("fresh", "captured", "restored")
     expected = record["generated_token_ids"][:continuation]
     prompt = list(record["prompt_token_ids"])
     if len(prompt) - 1 < CHUNK_ROWS:
         return {"schema": "qwen38-chat-server-prefix-reuse/v1", "skipped": f"{len(prompt)}-token prompt"}
     scheduler = Qwen38LaneScheduler(
-        lanes=lanes, drafts=drafts, queue_limit=len(REUSE_PLANS), stall_budget_seconds=stall_budget_seconds
+        lanes=lanes, drafts=drafts, queue_limit=len(plans), stall_budget_seconds=stall_budget_seconds
     )
     min_tokens = lanes_session.reuse_min_tokens
     lanes_session.forget()
@@ -2234,7 +2249,7 @@ def replay_prefix_reuse(
                     think_budget=None,
                 )
             )
-            for plan in REUSE_PLANS
+            for plan in plans
         }
         scheduler.run(lanes_session, forever=False)
     finally:
@@ -2276,6 +2291,92 @@ def replay_prefix_reuse(
         "pass": passed,
         "plans_ran": plans_ran,
         "restore_equals_capture": restore_exact,
+        "gate_pass": gate_pass,
+        "rows": rows,
+    }
+
+
+def replay_conversation_reuse(
+    lanes_session: Any,
+    record: Mapping[str, Any],
+    *,
+    lanes: int,
+    drafts: int,
+    require_gate: bool,
+    continuation: int = ACCEPTANCE_CONTINUATION,
+    stall_budget_seconds: float | None = DEFAULT_STALL_BUDGET_SECONDS,
+) -> dict[str, Any]:
+    """The conversation checkpoints' startup pin (``--lanes-conversations``): the gate record twice through the
+    scheduler from clean records, each a conversation's turn (a checkpoint asked for), the thresholds at one chunk so
+    the record's prompt reaches them.  The first admission prefills fresh and saves a checkpoint on its way; the second
+    resumes it (the host round trip back into the chain) and prefills the rest.  The resumed stream must equal the
+    saving one token for token (the restored state is the saved one bitwise) and both must match the CPU record 96/96;
+    ``require_gate`` refuses a miss."""
+
+    from models.demos.blackhole.qwen38_flash_next.tools.qwen38_lanes_session import checkpoint_position
+
+    expected = record["generated_token_ids"][:continuation]
+    prompt = list(record["prompt_token_ids"])
+    if checkpoint_position(len(prompt), 0, floor=CHUNK_ROWS) is None:
+        return {"schema": "qwen38-chat-server-conversation-reuse/v1", "skipped": f"{len(prompt)}-token prompt"}
+    turns = ("saved", "resumed")
+    scheduler = Qwen38LaneScheduler(
+        lanes=lanes, drafts=drafts, queue_limit=len(turns), stall_budget_seconds=stall_budget_seconds
+    )
+    thresholds = (lanes_session.checkpoint_min_tokens, lanes_session.resume_margin)
+    lanes_session.forget()
+    lanes_session.checkpoint_min_tokens, lanes_session.resume_margin = CHUNK_ROWS, 0
+    try:
+        tickets = {
+            turn: scheduler.submit(
+                Qwen38LaneTicket(
+                    request_id=f"lanes-conversation-{turn}",
+                    prompt_ids=prompt,
+                    max_tokens=len(expected),
+                    stop_ids=(),
+                    think_budget=None,
+                    checkpoint=True,
+                )
+            )
+            for turn in turns
+        }
+        scheduler.run(lanes_session, forever=False)
+    finally:
+        lanes_session.checkpoint_min_tokens, lanes_session.resume_margin = thresholds
+        lanes_session.forget()  # serving starts from clean records and counts
+    rows = {}
+    for turn, ticket in tickets.items():
+        if not ticket.done.is_set():
+            raise Qwen38ChatChainError(f"lanes conversation reuse: ticket {ticket.request_id} did not finish")
+        actual = _drain_ticket(ticket)
+        rows[turn] = {
+            "plan": ticket.prefill.get("reuse"),
+            "prefix_reused": ticket.prefill.get("prefix_reused"),
+            "checkpoint": ticket.prefill.get("checkpoint"),
+            "divergence_index": _divergence(actual, expected),
+            "admission": {name: round(value, 4) for name, value in ticket.admission_segments.items()},
+            "device_token_ids": actual,
+        }
+        _log("conversation_reuse_pin", **{key: value for key, value in rows[turn].items() if key != "device_token_ids"})
+    saved, resumed = rows["saved"], rows["resumed"]
+    plans_ran = saved["plan"] == "fresh" and bool(saved["checkpoint"]) and resumed["plan"] == "resumed"
+    resume_exact = rows["resumed"]["device_token_ids"] == rows["saved"]["device_token_ids"]
+    gate_pass = all(row["divergence_index"] is None for row in rows.values())
+    passed = plans_ran and resume_exact and gate_pass and len(expected) == continuation
+    if require_gate and not passed:
+        raise Qwen38ChatChainError(
+            f"lanes conversation pin on {record['prompt']}: plans {[row['plan'] for row in rows.values()]}, the resumed "
+            f"stream {'equals' if resume_exact else 'differs from'} the saving one, CPU divergence "
+            f"{ {turn: row['divergence_index'] for turn, row in rows.items()} }"
+        )
+    return {
+        "schema": "qwen38-chat-server-conversation-reuse/v1",
+        "prompt": record["prompt"],
+        "prompt_tokens": len(prompt),
+        "continuation": continuation,
+        "pass": passed,
+        "plans_ran": plans_ran,
+        "resume_equals_save": resume_exact,
         "gate_pass": gate_pass,
         "rows": rows,
     }
@@ -2524,6 +2625,16 @@ def _parser() -> argparse.ArgumentParser:
         "tools) prefills them once; the chain's prompt snapshot is taken there and later prompts that start with them "
         "restore it and prefill the rest (pinned at start on the json record; docs/SERVER.md)",
     )
+    parser.add_argument(
+        "--lanes-conversations",
+        type=int,
+        default=0,
+        metavar="N",
+        help="--lanes only: keep up to N conversations' prompt state in host memory (0, the default: none; 1..64): a "
+        "request with tools or a past assistant turn saves a checkpoint of its prompt, and the conversation's next "
+        "turn resumes it and prefills only its new tokens (about 0.2 GB of host memory per conversation plus 0.2 GB "
+        "per 4,096 tokens; pinned at start on the json record; docs/SERVER.md)",
+    )
     return parser
 
 
@@ -2585,6 +2696,12 @@ def main() -> int:
         raise SystemExit("--lanes-prefix-reuse needs --lanes (the single stream keeps its own prompt-end snapshot)")
     if args.lanes_prefix_reuse and args.prefill_mode != "chunked":
         raise SystemExit("--lanes-prefix-reuse needs --prefill-mode chunked (the reuse splits the chunked prefill)")
+    if not 0 <= args.lanes_conversations <= LANES_CONVERSATIONS_MAX:
+        raise SystemExit(f"--lanes-conversations takes 0..{LANES_CONVERSATIONS_MAX}, got {args.lanes_conversations}")
+    if args.lanes_conversations and lanes_switch is None:
+        raise SystemExit("--lanes-conversations needs --lanes (the checkpoints are the lanes admission's)")
+    if args.lanes_conversations and args.prefill_mode != "chunked":
+        raise SystemExit("--lanes-conversations needs --prefill-mode chunked (a checkpoint splits the chunked prefill)")
     # The 128-row chunks are the served default of the chunked prefill (bitwise the 32-row chunks; the 560-token chat
     # prompt prefills in 0.81 s against 1.19 s in 32-row chunks alone, docs/PREFILL.md): the flag is accepted, the
     # teacher-forced mode has no chunk trace to extend.
@@ -2761,6 +2878,7 @@ def main() -> int:
                 "rows": lanes_switch["rows"],
                 "greedy_only": True,
                 "prefix_reuse": args.lanes_prefix_reuse,
+                "conversations": args.lanes_conversations,
                 "admission": None,
             }
         ),
@@ -2803,7 +2921,12 @@ def main() -> int:
     if lanes_switch is not None:
         from models.demos.blackhole.qwen38_flash_next.tools.qwen38_lanes_session import Qwen38LanesSession
 
-        lanes_session = Qwen38LanesSession(lanes=lanes_switch["lanes"], drafts=lanes_switch["drafts"], marker=marker)
+        lanes_session = Qwen38LanesSession(
+            lanes=lanes_switch["lanes"],
+            drafts=lanes_switch["drafts"],
+            marker=marker,
+            conversations=args.lanes_conversations,
+        )
         scheduler = Qwen38LaneScheduler(
             lanes=lanes_switch["lanes"],
             drafts=lanes_switch["drafts"],
@@ -3103,6 +3226,20 @@ def main() -> int:
                     json.dumps(report["prefix_reuse"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
                 )
                 marker("after-lanes-prefix-reuse-pin")
+            if args.lanes_conversations and gate_record is not None:
+                marker("before-lanes-conversation-pin")
+                report["conversation_reuse"] = replay_conversation_reuse(
+                    lanes_session,
+                    gate_record,
+                    stall_budget_seconds=args.lanes_stall_budget,
+                    lanes=lanes_switch["lanes"],
+                    drafts=lanes_switch["drafts"],
+                    require_gate=args.require_json_96,
+                )
+                (evidence / "conversation-reuse.json").write_text(
+                    json.dumps(report["conversation_reuse"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                marker("after-lanes-conversation-pin")
         if args.agreement_reference is not None:
             marker("before-agreement-records")
             report["agreement"] = record_agreement(
@@ -3210,6 +3347,14 @@ def main() -> int:
                             else {
                                 key: report["prefix_reuse"].get(key)
                                 for key in ("pass", "restore_equals_capture", "gate_pass", "skipped")
+                            }
+                        ),
+                        "conversation_pin": (
+                            None
+                            if "conversation_reuse" not in report
+                            else {
+                                key: report["conversation_reuse"].get(key)
+                                for key in ("pass", "resume_equals_save", "gate_pass", "skipped")
                             }
                         ),
                     }
