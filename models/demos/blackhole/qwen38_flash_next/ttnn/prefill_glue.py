@@ -9,12 +9,12 @@ a collective's configuration, a per-slab hoist, a payload cut.  Every form is re
 identical to the previous slab body run by default (``DEFAULT_ON``: the generic gather of the gated-residual partials
 and the per-slab QSA block-mask hoist; 2026-09-25 on the 4-chip line, a 32k context: pins 12/12, the oracle column
 identical at every scored position, 60.3 ms less per 2048-row slab; the gated-residual read's tile walks, row gamma
-and gate activation, 2026-10-14, 65.2 ms less), and so does a tolerance form that met the prefill quality bar (the
-gated-residual partials' reduce-scatter + all-gather, 2026-10-14, 14.9 ms less).  ``QWEN38_PREFILL_GLUE=today``
-restores the previous slab body, and ``QWEN38_PREFILL_GLUE=<name>[,<name>...]`` runs exactly the named forms (the
-measurement's arms: a list that wants a default form names it).  A name that is not registered raises, as does an
-exclusive pair or ``today`` beside a name.  The model resolves the policy once at construction (``policy()``) and
-keeps it through trace capture.
+and gate activation, 2026-10-14, 65.2 ms less; its front as two fused programs, 2026-10-14, 14.3 ms less), and so
+does a tolerance form that met the prefill quality bar (the gated-residual partials' reduce-scatter + all-gather,
+2026-10-14, 14.9 ms less).  ``QWEN38_PREFILL_GLUE=today`` restores the previous slab body, and
+``QWEN38_PREFILL_GLUE=<name>[,<name>...]`` runs exactly the named forms (the measurement's arms: a list that wants a
+default form names it).  A name that is not registered raises, as does an exclusive pair or ``today`` beside a name.
+The model resolves the policy once at construction (``policy()``) and keeps it through trace capture.
 
 Classes.  BITWISE: the same per-element arithmetic and reduction order as the previous form (data movement, integer
 work, or the same ops once instead of per layer); the slab's outputs are the previous form's bit for bit.  TOLERANCE:
@@ -65,6 +65,11 @@ FORMS: dict[str, tuple[str, str]] = {
     # The gated-residual read's sigmoid as the gate multiply's input activation (packed to bf16 before the multiply,
     # as the separate sigmoid; the injection's form) (a default).
     "gr_gate_act": (BITWISE, "gr.read_rows"),
+    # The gated-residual read's front as two fused programs around the stats gather (ttnn/fused/gr_read's slab stats
+    # and normalize): every row block runs rms_norm_pre's, rms_norm_post's and the row gamma's LLK sequence on the
+    # same tiles, and each normalized tile is written to its flat page (in place of rms_norm_pre, rms_norm_post, the
+    # tile permute and the gamma multiply) (a default).
+    "gr_slab_front": (BITWISE, "gr.read_rows"),
     # The GDN chunk kernel's flat q/k form: the raw conv q/k rows go to the kernel, which maps value heads to key
     # heads at read time and l2-normalizes in fp32 with the scale folded in.
     "gdn_qk_flat": (TOLERANCE, "gdn.allocate_rows_state"),
@@ -75,10 +80,20 @@ EXCLUSIVE: tuple[frozenset[str], ...] = (frozenset({"gr_gather_generic", "gr_gat
 # previous body's at all 160 positions), 1584.6 -> 1524.3 ms of kernel time per 2048-row slab (the gather -34.0, the
 # hoist -26.5, additive), 1283 -> 1334 prompt tokens per second, TTFT at 32k 27.57 -> 26.64 s.  The three GR read
 # forms (2026-10-14, the 4-chip line at 32k): greedy-32 and the 32 top-20 logprob rows identical to the previous body,
-# GR read + write 166.8 -> 101.6 ms of kernel time per 2048-row slab, 3138 -> 3477 prompt tokens per second.
+# GR read + write 166.8 -> 101.6 ms of kernel time per 2048-row slab, 3138 -> 3477 prompt tokens per second.  The GR
+# read front (2026-10-14, the 4-chip line at 32k, against the five forms above): greedy-32 and the 32 top-20 logprob
+# rows identical, GR read 79.8 -> 65.5 ms of kernel time per 2048-row slab, a 31,524-token prompt 8,687 -> 8,469 ms.
 # gr_partial_rs_ag (tolerance, MET_QUALITY_BAR) supersedes the generic gather on the slab.
 DEFAULT_ON: frozenset[str] = frozenset(
-    {"gr_gather_generic", "qsa_mask_hoist", "gr_tile_walks", "gr_gamma_rows", "gr_gate_act", "gr_partial_rs_ag"}
+    {
+        "gr_gather_generic",
+        "qsa_mask_hoist",
+        "gr_tile_walks",
+        "gr_gamma_rows",
+        "gr_gate_act",
+        "gr_slab_front",
+        "gr_partial_rs_ag",
+    }
 )
 # The tolerance forms that met the prefill quality bar, the only tolerance forms DEFAULT_ON may name (docs/PREFILL.md,
 # "Glue forms": the reference corpus's long windows through the slab against the CPU oracle, and the measured result).
