@@ -90,6 +90,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     Qwen38ChatChainError,
     Qwen38ChatSession,
     construct_chain,
+    is_served_slab_rows,
     lanes_capacity_admission,
     mtp_capacity_admission,
     mtp_verify_forms,
@@ -115,7 +116,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.builder import (
     RESIDENT_QSA_CACHE_CAPACITIES,
     Qwen38ResidentContext,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import CHUNK_ROWS, is_slab_rows
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import CHUNK_ROWS
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gdn_rows_scan as gdn_rows_scan_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.moe import (
     MOE_CHUNK_ROWS_FORM,
@@ -1759,13 +1760,13 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 for delta in final_deltas:
                     wire.event(chunk({"delta": delta, "finish_reason": None}))
                 wire.event(
-                        chunk(
-                            {"delta": {}, "finish_reason": finish_reason},
-                            usage=usage,
-                            qwen38=extension,
-                            timings=_timings(usage, extension),
-                        )
+                    chunk(
+                        {"delta": {}, "finish_reason": finish_reason},
+                        usage=usage,
+                        qwen38=extension,
+                        timings=_timings(usage, extension),
                     )
+                )
                 wire.write(b"data: [DONE]\n\n")
             else:
                 self._send_json(
@@ -2509,10 +2510,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--prefill-slab",
-        type=int,
+        type=slab_rows_argument,
         default=None,
         metavar="ROWS",
-        help="chunked prefill only: also capture a prefill slab of ROWS rows (a multiple of 128 in 256..4096; every "
+        help="chunked prefill only: also capture a prefill slab of ROWS rows (a power of two in 256..4096; every "
         "dense linear as one matmul, the GDN state carried through the slab in one kernel call) and run slabs ahead "
         "of the 128-row chunks; implies --long-chunks; tolerance-class against the chunk bodies (docs/PREFILL.md)",
     )
@@ -2662,10 +2663,24 @@ def stall_budget_argument(text: str) -> float | None:
     return value
 
 
+def slab_rows_argument(text: str) -> int:
+    """``--prefill-slab``: a power of two in 256..4096 (the slab's padded KV update writes whole slabs into the
+    power-of-two KV cache)."""
+
+    try:
+        rows = int(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"a row count, got {text!r}") from error
+    if not is_served_slab_rows(rows):
+        raise argparse.ArgumentTypeError(
+            f"a power of two in 256..4096 (the slab's padded KV update writes whole slabs into the power-of-two KV "
+            f"cache), got {rows}"
+        )
+    return rows
+
+
 def main() -> int:
     args = _parser().parse_args()
-    if args.prefill_slab is not None and not is_slab_rows(args.prefill_slab):
-        raise SystemExit(f"--prefill-slab takes a multiple of 128 in 256..4096, got {args.prefill_slab}")
     if args.prefill_tail_slabs and (
         args.mtp is not None or not tail_slab_rows_admitted(args.prefill_tail_slabs, slab_rows=args.prefill_slab)
     ):
