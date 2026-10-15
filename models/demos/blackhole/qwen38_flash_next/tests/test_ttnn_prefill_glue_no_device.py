@@ -50,11 +50,17 @@ def _policy(*names: str) -> prefill_glue.PrefillGluePolicy:
 
 
 def test_default_policy_is_the_measured_set_today_is_none_and_a_list_is_exact(monkeypatch) -> None:
-    # Unset or empty: the forms measured bitwise the previous slab body (2026-09-25; the GR read forms and the GR read
-    # front 2026-10-14) and the tolerance form that met the prefill quality bar (gr_partial_rs_ag, 2026-10-14) run.
+    # Unset or empty: the forms measured bitwise the previous slab body (2026-09-25; the GR read forms, the GR read
+    # front and the GR slab write 2026-10-14) and the tolerance form that met the prefill quality bar
+    # (gr_partial_rs_ag, 2026-10-14) run.
     default = prefill_glue.PrefillGluePolicy.from_environ({})
     previous = {"gr_gather_generic", "qsa_mask_hoist", "gr_tile_walks", "gr_gamma_rows", "gr_gate_act", "gr_slab_front"}
-    assert default.names == prefill_glue.DEFAULT_ON == previous | {"gr_partial_rs_ag"}
+    assert default.names == prefill_glue.DEFAULT_ON == previous | {"gr_partial_rs_ag", "gr_slab_write"}
+    # The GR slab write's hold (2026-10-14) named its arms: off = the defaults before it, on = off + gr_slab_write.
+    # Unset runs exactly the on arm.
+    hold_off = "gr_gamma_rows,gr_gate_act,gr_gather_generic,gr_partial_rs_ag,gr_slab_front,gr_tile_walks,qsa_mask_hoist"
+    assert default == prefill_glue.PrefillGluePolicy.from_environ({ENV: hold_off + ",gr_slab_write"})
+    assert default.names - prefill_glue.PrefillGluePolicy.from_environ({ENV: hold_off}).names == {"gr_slab_write"}
     assert prefill_glue.PrefillGluePolicy.from_environ({ENV: " "}).names == prefill_glue.DEFAULT_ON
     tolerance_on = {name for name in prefill_glue.DEFAULT_ON if prefill_glue.FORMS[name][0] != prefill_glue.BITWISE}
     assert tolerance_on == prefill_glue.MET_QUALITY_BAR == {"gr_partial_rs_ag"}

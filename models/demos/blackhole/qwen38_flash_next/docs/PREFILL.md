@@ -316,7 +316,10 @@ never see one).  Bitwise forms keep every output element's arithmetic and reduct
 summation order or a rounding point and are judged like the slab itself (`NUMERICS.md`, the long windows against the
 references).
 
-The bitwise forms run by default.  The first two (the gather and the hoist below) measured on the 4-chip line (1x4
+With `QWEN38_PREFILL_GLUE` unset, eight forms run: the bitwise `gr_gather_generic`, `qsa_mask_hoist`,
+`gr_tile_walks`, `gr_gamma_rows`, `gr_gate_act`, `gr_slab_front` and `gr_slab_write` (every bitwise form but
+`gr_gather_tuned`, which is exclusive with the generic gather) and `gr_partial_rs_ag`, the tolerance form that met the
+quality bar below.  The first two (the gather and the hoist below) measured on the 4-chip line (1x4
 p150, a 32k context, `--prefill-slab 2048`, 2026-09-25) against the previous slab body in the same process form: the
 acceptance pins 12/12 identical; the device column of the agreement corpus's two long windows identical at all 160
 scored positions (KL 0.0, top-1 1.0 between the two columns; both 0.9812 / 0.0225 top-1 / KL against the HF reference);
@@ -353,14 +356,15 @@ refuses to start.
   on the 4-chip line at 32k (2026-10-14) against the five bitwise defaults of the day: greedy-32 and the 32 top-20
   logprob rows identical; the read's front 30.1 -> 15.8 ms of kernel time per 2048-row slab (GR read 79.8 -> 65.5
   ms), a 31,524-token prompt 8,687 -> 8,469 ms.
-- `gr_slab_write` (bitwise, off): the gated-residual write as one fused program (`ttnn/fused/gr_write`'s
+- `gr_slab_write` (bitwise, default): the gated-residual write as one fused program (`ttnn/fused/gr_write`'s
   `slab_write`), in place of the coefficient permute, the multiply and the residual add.  Each core takes consecutive
   (row tile, column tile) units and reads a unit's block tile once for its four branch tiles and a row tile's
   injection tile once per branch, with branch b's column patched into the broadcast column; every branch tile runs the
   multiply's SFPU and the add's FPU sequence in the 16-bit dest.  Measured on one chip at 2048 rows (2026-10-14): the
   chain's output bit for bit on three activation seeds (also at 512 and 256 rows), 149.0 -> 77.9 us of device kernel
-  time per write (96 writes per slab).  The in-model bars (greedy-32 and lp32 identical, GR write kernel time, the
-  natural32k prompt) are not measured yet.
+  time per write (96 writes per slab).  On the 4-chip line at 32k (2026-10-14) against the other seven defaults:
+  greedy-32 and the 32 top-20 logprob rows identical; the GR write 14.5 -> 7.6 ms of kernel time per 2048-row slab, a
+  31,524-token prompt 8,322 -> 8,206 ms.
 - `qsa_scores_rs_ag` (tolerance, off): each 512-row score block's four device partials are masked on every device,
   summed by a `reduce_scatter` over the block's rows, ranked per device on its 128 rows and the block ids gathered, in
   place of broadcasting every device's scores to every device and summing locally.  A third of the score payload
