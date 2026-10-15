@@ -383,8 +383,9 @@ through the slab path at start-up (`--agreement-reference`, `--agreement-parts l
 the mean truncated KL against the CPU oracle (oracle-bf4) rises by 0.002 at most; top-1 agreement with it drops by
 0.5 percentage points at most (one new miss in 160 is 0.625).  `gr_partial_rs_ag` met it on 2026-10-14 (1x4 p150
 line, 32k context, against the five bitwise defaults): pins 12/12, KL 0.0202 -> 0.0098, top-1 0.9875 -> 0.9875;
-14.9 ms less kernel time per 2048-row slab, a 31,524-token prompt 8,968 -> 8,720 ms.  `qsa_scores_rs_ag` missed it in
-the same hold (top-1 0.9875 -> 0.9812: one new miss) and stays off.
+a 31,524-token prompt 8,686 -> 8,528 ms (-158 ms) with the model's 8192 B fabric packets.  The first hold, before the
+8192 B packets, measured the same quality, 14.9 ms less kernel time per 2048-row slab and 8,968 -> 8,720 ms (-248 ms);
+`qsa_scores_rs_ag` missed the bar in that hold (top-1 0.9875 -> 0.9812: one new miss) and stays off.
 
 `gdn_prefill_rows` (bitwise, on by default; `QWEN38_FUSED_OFF=gdn_prefill_rows` restores the chain and
 `QWEN38_FUSED=gdn_prefill_rows` names it explicitly; a fused kernel, not a glue form) replaces the slab's whole GDN glue --
