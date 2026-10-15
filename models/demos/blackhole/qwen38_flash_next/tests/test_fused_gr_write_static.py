@@ -225,9 +225,9 @@ def _in_order(text: str, statements) -> bool:
     return True
 
 
-def test_slab_write_is_a_bitwise_glue_form_off_by_default():
+def test_slab_write_is_a_bitwise_glue_form_on_by_default():
     assert prefill_glue.FORMS["gr_slab_write"] == (prefill_glue.BITWISE, "gr.write_rows")
-    assert "gr_slab_write" not in prefill_glue.DEFAULT_ON
+    assert "gr_slab_write" in prefill_glue.DEFAULT_ON
 
 
 def test_slab_compute_runs_the_chains_two_programs_on_every_branch_tile():

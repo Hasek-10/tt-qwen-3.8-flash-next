@@ -9,12 +9,13 @@ a collective's configuration, a per-slab hoist, a payload cut.  Every form is re
 identical to the previous slab body run by default (``DEFAULT_ON``: the generic gather of the gated-residual partials
 and the per-slab QSA block-mask hoist; 2026-09-25 on the 4-chip line, a 32k context: pins 12/12, the oracle column
 identical at every scored position, 60.3 ms less per 2048-row slab; the gated-residual read's tile walks, row gamma
-and gate activation, 2026-10-14, 65.2 ms less; its front as two fused programs, 2026-10-14, 14.3 ms less), and so
-does a tolerance form that met the prefill quality bar (the gated-residual partials' reduce-scatter + all-gather,
-2026-10-14, 14.9 ms less).  ``QWEN38_PREFILL_GLUE=today`` restores the previous slab body, and
-``QWEN38_PREFILL_GLUE=<name>[,<name>...]`` runs exactly the named forms (the measurement's arms: a list that wants a
-default form names it).  A name that is not registered raises, as does an exclusive pair or ``today`` beside a name.
-The model resolves the policy once at construction (``policy()``) and keeps it through trace capture.
+and gate activation, 2026-10-14, 65.2 ms less; its front as two fused programs, 2026-10-14, 14.3 ms less; its
+write as one fused program, 2026-10-14, 6.9 ms less), and so does a tolerance form that met the prefill quality bar
+(the gated-residual partials' reduce-scatter + all-gather, 2026-10-14, 14.9 ms less).  ``QWEN38_PREFILL_GLUE=today``
+restores the previous slab body, and ``QWEN38_PREFILL_GLUE=<name>[,<name>...]`` runs exactly the named forms (the
+measurement's arms: a list that wants a default form names it).  A name that is not registered raises, as does an
+exclusive pair or ``today`` beside a name.  The model resolves the policy once at construction (``policy()``) and
+keeps it through trace capture.
 
 Classes.  BITWISE: the same per-element arithmetic and reduction order as the previous form (data movement, integer
 work, or the same ops once instead of per layer); the slab's outputs are the previous form's bit for bit.  TOLERANCE:
@@ -72,7 +73,7 @@ FORMS: dict[str, tuple[str, str]] = {
     "gr_slab_front": (BITWISE, "gr.read_rows"),
     # The gated-residual write as one fused program (ttnn/fused/gr_write's slab write): every output tile runs the
     # coefficient multiply's and the residual add's LLK sequence, the injection's columns patched into the broadcast
-    # column by the reader (in place of the coefficient permute, the multiply and the add).
+    # column by the reader (in place of the coefficient permute, the multiply and the add) (a default).
     "gr_slab_write": (BITWISE, "gr.write_rows"),
     # The GDN chunk kernel's flat q/k form: the raw conv q/k rows go to the kernel, which maps value heads to key
     # heads at read time and l2-normalizes in fp32 with the scale folded in.
@@ -87,7 +88,9 @@ EXCLUSIVE: tuple[frozenset[str], ...] = (frozenset({"gr_gather_generic", "gr_gat
 # GR read + write 166.8 -> 101.6 ms of kernel time per 2048-row slab, 3138 -> 3477 prompt tokens per second.  The GR
 # read front (2026-10-14, the 4-chip line at 32k, against the five forms above): greedy-32 and the 32 top-20 logprob
 # rows identical, GR read 79.8 -> 65.5 ms of kernel time per 2048-row slab, a 31,524-token prompt 8,687 -> 8,469 ms.
-# gr_partial_rs_ag (tolerance, MET_QUALITY_BAR) supersedes the generic gather on the slab.
+# The GR slab write (2026-10-14, the 4-chip line at 32k, against the other seven defaults): greedy-32 and the 32
+# top-20 logprob rows identical, GR write 14.5 -> 7.6 ms of kernel time per 2048-row slab, a 31,524-token prompt
+# 8,322 -> 8,206 ms.  gr_partial_rs_ag (tolerance, MET_QUALITY_BAR) supersedes the generic gather on the slab.
 DEFAULT_ON: frozenset[str] = frozenset(
     {
         "gr_gather_generic",
@@ -96,6 +99,7 @@ DEFAULT_ON: frozenset[str] = frozenset(
         "gr_gamma_rows",
         "gr_gate_act",
         "gr_slab_front",
+        "gr_slab_write",
         "gr_partial_rs_ag",
     }
 )
