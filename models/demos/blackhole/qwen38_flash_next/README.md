@@ -15,6 +15,8 @@ No prebuilt archive, no pinned binary, no host-specific configuration.
 | 4x p150 in one host, ethernet line | `p150-line` | the numbers below were measured on it; no fresh-clone run is recorded (section 9, `docs/PROOFS.md`) |
 | QuietBox 2, 2x p300c (4 dies) | `qb2` | verified 2026-09-19 (acceptance identical to the 4x p150 boxes), 2026-09-23 (the compact expert layout) and 2026-09-29 (two DRAM readers per bank on its mixed-harvest dies: the 4x p150 rows, 68.7 tok/s on the 560-token chat prompt with `--mtp 4`); section 7, `docs/PROOFS.md` |
 
+Serving six agents at once on a QuietBox 2 (`--lanes 6` with prompt and conversation reuse): [docs/QUIETBOX2.md](docs/QUIETBOX2.md), on the `perf/lanes-upstream-oct15` branch.
+
 ## Performance (4x p150)
 
 | path | measured | notes |

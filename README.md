@@ -1,3 +1,9 @@
+> [!NOTE]
+> **This fork serves Qwen3.8-Flash-Next to six agents at once from one Tenstorrent QuietBox 2.** It is
+> [sjettTT/tt-qwen-3.8-flash-next](https://github.com/sjettTT/tt-qwen-3.8-flash-next) with prompt and
+> conversation reuse on the batched decode lanes. What changed, the benchmarks and how to run it:
+> [models/demos/blackhole/qwen38_flash_next/docs/QUIETBOX2.md](models/demos/blackhole/qwen38_flash_next/docs/QUIETBOX2.md).
+
 [![tt-metal CI](https://github.com/tenstorrent/tt-metal/actions/workflows/sanity-tests.yaml/badge.svg)](https://github.com/tenstorrent/tt-metal/actions/workflows/sanity-tests.yaml)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/tenstorrent/tt-metal)
 
